@@ -203,8 +203,14 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 }
 
 - (void)tryLoadBundledPE {
-    // Validation phase: prefer the bundled GDI test program so it always runs
-    // regardless of what's sitting in Documents.
+    // Diagnostic phase: prefer the CPU conformance probe if present, then the
+    // GDI test, before falling back to whatever is in Documents.
+    NSString *probePath = [[NSBundle mainBundle] pathForResource:@"WGProbe" ofType:@"exe"];
+    if (probePath) {
+        WG_LOGI("App", "Loading CPU probe: WGProbe.exe (all-pass mask = 0x1FFFF)");
+        [self loadAndRunPE:probePath];
+        return;
+    }
     NSString *testPath = [[NSBundle mainBundle] pathForResource:@"WGTest" ofType:@"exe"];
     if (testPath) {
         WG_LOGI("App", "Loading bundled GDI test: WGTest.exe");

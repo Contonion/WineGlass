@@ -28,6 +28,7 @@
 		D27D524AA6A09BDB50A924EE /* WGSceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 4133B5F24164662A9E7B2BF0 /* WGSceneDelegate.m */; };
 		DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */ = {isa = PBXBuildFile; fileRef = BD62DFB283E953060FB6F2B4 /* wg_selftest.c */; };
 		DE48CAB52C304F62F5C45C8D /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 84466C30852AB61143363D30 /* main.m */; };
+		F8F591A5CD0077C1AC32B9CD /* WGProbe.exe in Resources */ = {isa = PBXBuildFile; fileRef = 0E4A66F82214CBC0323BDB79 /* WGProbe.exe */; };
 		FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */ = {isa = PBXBuildFile; fileRef = B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */; };
 /* End PBXBuildFile section */
 
@@ -35,6 +36,7 @@
 		0163ED821E449B867D15803F /* wg_blink_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_blink_bridge.c; sourceTree = "<group>"; };
 		03190A8CA61C6EEB2E21D3A5 /* wg_engine.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_engine.c; sourceTree = "<group>"; };
 		042AC091820A57501F4AF53C /* WGMetalView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGMetalView.m; sourceTree = "<group>"; };
+		0E4A66F82214CBC0323BDB79 /* WGProbe.exe */ = {isa = PBXFileReference; path = WGProbe.exe; sourceTree = "<group>"; };
 		226AD25F32031E477E58E6E4 /* WGAppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGAppDelegate.m; sourceTree = "<group>"; };
 		3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_gdi.c; sourceTree = "<group>"; };
 		405864B3D661FEFA0748A820 /* wg_pe_loader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_pe_loader.c; sourceTree = "<group>"; };
@@ -51,10 +53,10 @@
 		B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_files.c; sourceTree = "<group>"; };
 		BD62DFB283E953060FB6F2B4 /* wg_selftest.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_selftest.c; sourceTree = "<group>"; };
 		C2E7451659F90F1881744FD7 /* wg_log.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_log.c; sourceTree = "<group>"; };
-		D24B8F67C6D93249E2806856 /* WGTest.exe */ = {isa = PBXFileReference; lastKnownFileType = file; path = WGTest.exe; sourceTree = "<group>"; };
+		D24B8F67C6D93249E2806856 /* WGTest.exe */ = {isa = PBXFileReference; path = WGTest.exe; sourceTree = "<group>"; };
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_nsis_extract.c; sourceTree = "<group>"; };
 		FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_interp.c; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -116,6 +118,7 @@
 		6FF563893F10E16D1469B5B4 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				0E4A66F82214CBC0323BDB79 /* WGProbe.exe */,
 				D24B8F67C6D93249E2806856 /* WGTest.exe */,
 			);
 			path = Resources;
@@ -200,6 +203,8 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+				};
 			};
 			buildConfigurationList = 7DE0709D061D20CD4C9316ED /* Build configuration list for PBXProject "WineGlass" */;
 			developmentRegion = en;
@@ -225,6 +230,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F8F591A5CD0077C1AC32B9CD /* WGProbe.exe in Resources */,
 				A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -333,7 +339,6 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/WineGlass.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = DB78DUWP98;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/Core",
@@ -350,11 +355,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Vendor/blink/lib";
-				OTHER_CFLAGS = (
-					"-DTARGET_OS_IOS=1",
-					"-D_DARWIN_C_SOURCE",
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/blink/lib",
 				);
+				OTHER_CFLAGS = "-DTARGET_OS_IOS=1 -D_DARWIN_C_SOURCE";
 				OTHER_LDFLAGS = (
 					"-lbz2",
 					"-lz",
@@ -378,7 +382,6 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_ENTITLEMENTS = Sources/App/WineGlass.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = DB78DUWP98;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/Core",
@@ -395,11 +398,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Vendor/blink/lib";
-				OTHER_CFLAGS = (
-					"-DTARGET_OS_IOS=1",
-					"-D_DARWIN_C_SOURCE",
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/blink/lib",
 				);
+				OTHER_CFLAGS = "-DTARGET_OS_IOS=1 -D_DARWIN_C_SOURCE";
 				OTHER_LDFLAGS = (
 					"-lbz2",
 					"-lz",
