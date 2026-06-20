@@ -47,6 +47,10 @@ typedef enum {
 
 static uint32_t s_last_error = 0;
 static bool s_nsis_data_patched = false;
+// Guest heap pointer for GlobalAlloc/etc. Reset per program load so behavior
+// is deterministic (not dependent on prior runs in the same app session).
+#define WG_GUEST_HEAP_BASE 0x20000000u
+static uint32_t s_heap_ptr = WG_GUEST_HEAP_BASE;
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
 static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
@@ -893,7 +897,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "FindFirstFileW") == 0) {
             ret_val = 0xFFFFFFFF; // INVALID_HANDLE_VALUE
         } else if (strcmp(fn, "GlobalAlloc") == 0) {
-            static uint32_t s_heap_ptr = 0x10000000;
             uint32_t size = args[1];
             if (size == 0) size = 4096;
             // Only reject truly insane sizes (>512MB) as corrupt. NSIS
@@ -1118,6 +1121,11 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     // Clear any windows left over from a previous program so the UI doesn't
     // get stuck behind a lingering window.
     wg_wm_reset();
+
+    // Reset the guest heap so every run has an identical, deterministic layout.
+    s_heap_ptr = WG_GUEST_HEAP_BASE;
+    s_nsis_data_patched = false;
+    s_last_error = 0;
 
     // Set the exe path for file I/O mapping
     wg_files_set_exe_path(path);
