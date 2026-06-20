@@ -136,6 +136,11 @@ static WGFileEntry *find_file(uint32_t handle) {
 bool wg_files_read(uint32_t handle, void *buf, uint32_t bytes, uint32_t *bytes_read) {
     WGFileEntry *f = find_file(handle);
     if (!f) return false;
+    if (!f->fp) {
+        memset(buf, 0, bytes);
+        if (bytes_read) *bytes_read = bytes;
+        return true;
+    }
     size_t n = fread(buf, 1, bytes, f->fp);
     if (bytes_read) *bytes_read = (uint32_t)n;
     return true;
@@ -144,6 +149,10 @@ bool wg_files_read(uint32_t handle, void *buf, uint32_t bytes, uint32_t *bytes_r
 bool wg_files_write(uint32_t handle, const void *buf, uint32_t bytes, uint32_t *bytes_written) {
     WGFileEntry *f = find_file(handle);
     if (!f) return false;
+    if (!f->fp) {
+        if (bytes_written) *bytes_written = bytes;
+        return true;
+    }
     size_t n = fwrite(buf, 1, bytes, f->fp);
     if (bytes_written) *bytes_written = (uint32_t)n;
     return true;
@@ -152,6 +161,7 @@ bool wg_files_write(uint32_t handle, const void *buf, uint32_t bytes, uint32_t *
 uint32_t wg_files_get_size(uint32_t handle) {
     WGFileEntry *f = find_file(handle);
     if (!f) return 0xFFFFFFFF;
+    if (!f->fp) return 0;
     long pos = ftell(f->fp);
     fseek(f->fp, 0, SEEK_END);
     long size = ftell(f->fp);
@@ -241,6 +251,19 @@ void wg_files_prepopulate_nsis_data(const char *exe_path, const char *tmp_path) 
 
     WG_LOGI("Files", "Pre-populated NSIS data: %ld bytes at offset %ld -> %s",
             file_data_size, file_data_offset, tmp_path);
+}
+
+uint32_t wg_files_create_null(void) {
+    for (int i = 0; i < WG_MAX_FILE_HANDLES; i++) {
+        if (!s_files[i].in_use) {
+            s_files[i].fp = NULL; // null = discard writes, return success
+            s_files[i].handle = s_next_handle++;
+            s_files[i].in_use = true;
+            strncpy(s_files[i].path, "/dev/null", sizeof(s_files[i].path));
+            return s_files[i].handle;
+        }
+    }
+    return 0xFFFFFFFF;
 }
 
 bool wg_files_close(uint32_t handle) {

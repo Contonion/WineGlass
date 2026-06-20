@@ -22,7 +22,9 @@ uint32_t wg_files_get_size(uint32_t handle);
 uint32_t wg_files_set_pointer(uint32_t handle, int32_t distance, uint32_t method);
 bool     wg_files_close(uint32_t handle);
 
-// Pre-populate a temp data file with the NSIS data section from the exe
 void wg_files_prepopulate_nsis_data(const char *exe_path, const char *tmp_path);
+
+// Create a null handle that silently discards writes
+uint32_t wg_files_create_null(void);
 
 #endif

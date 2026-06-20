@@ -620,6 +620,46 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0xFFFFFFFF;
             }
             WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
+
+            // For BMP/image files in plugin dirs, write a valid dummy BMP
+            // and return a null handle that discards decompression writes.
+            // This bypasses the broken LZMA decompression for image resources.
+            if (ret_val != 0xFFFFFFFF && real && strstr(apath, ".bmp")) {
+                wg_files_close((uint32_t)ret_val);
+                FILE *bf = fopen(real, "wb");
+                if (bf) {
+                    int w = 150, h = 57;
+                    int row_bytes = (w * 3 + 3) & ~3;
+                    int img_size = row_bytes * h;
+                    int file_size = 54 + img_size;
+                    uint8_t hdr[54] = {0};
+                    hdr[0]='B'; hdr[1]='M';
+                    memcpy(hdr+2, &file_size, 4);
+                    int off=54; memcpy(hdr+10, &off, 4);
+                    int hs=40; memcpy(hdr+14, &hs, 4);
+                    memcpy(hdr+18, &w, 4); memcpy(hdr+22, &h, 4);
+                    short p=1; memcpy(hdr+26, &p, 2);
+                    short b=24; memcpy(hdr+28, &b, 2);
+                    memcpy(hdr+34, &img_size, 4);
+                    fwrite(hdr, 1, 54, bf);
+                    uint8_t row[452];
+                    memset(row, 0, sizeof(row));
+                    for (int y = 0; y < h; y++) {
+                        for (int x = 0; x < w; x++) {
+                            row[x*3+0] = 180;
+                            row[x*3+1] = (uint8_t)(120+y);
+                            row[x*3+2] = (uint8_t)(30+y);
+                        }
+                        fwrite(row, 1, row_bytes, bf);
+                    }
+                    fclose(bf);
+                    WG_LOGI(TAG, "Created banner BMP: %s", apath);
+                }
+                // Return a null handle — NSIS will "write" decompressed data
+                // to it but it gets silently discarded
+                ret_val = wg_files_create_null();
+                WG_LOGI(TAG, "BMP extraction bypassed, null handle 0x%X", (uint32_t)ret_val);
+            }
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
