@@ -708,10 +708,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGI(TAG, "GetFileSize(0x%X) -> %u", args[0], (uint32_t)ret_val);
         } else if (strcmp(fn, "SetFilePointer") == 0) {
             // Detect when NSIS finishes its truncated copy and patch the .tmp
-            // Track seeks on the data .tmp to know extraction offsets
+            // Track seeks on the data .tmp to know extraction offsets.
+            // Only capture large seeks (>1000) — small ones (0, 4) are header reads.
             if (s_nsis_data_tmp_handle != 0 && args[0] == s_nsis_data_tmp_handle &&
-                args[3] == 0 && (int32_t)args[1] > 0) {
+                args[3] == 0 && (int32_t)args[1] > 1000) {
                 s_nsis_last_data_seek = (uint32_t)args[1];
+                WG_LOGI(TAG, "NSIS data seek: offset=%u", s_nsis_last_data_seek);
             }
 
             // Track seeks on the EXE file (not .tmp) to find raw data offset.
