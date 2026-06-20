@@ -1,0 +1,25 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.moved-aside
+
+# Build artifacts
+Tests/test_runner
+Tests/test_pe_exec
+Tests/*.dSYM/
+*.o
+*.a
+
+# Vendor binaries (too large for git)
+Vendor/blink/lib/*.a
+Vendor/blink/lib/*.o
+
+# OS
+.DS_Store

@@ -1,0 +1,225 @@
+// Bridge to blink's x86-64 emulation engine.
+
+#include "wg_blink_bridge.h"
+#include "wg_log.h"
+#include <stdlib.h>
+#include <setjmp.h>
+
+#define TAG "Blink"
+
+// Forward declarations — symbols in blink.a (wg_blink_impl.o)
+typedef struct WGBlinkVM WGBlinkVM;
+extern WGBlinkVM *WGBlinkVM_Create(void);
+extern WGBlinkVM *WGBlinkVM_Create32(void);
+extern void WGBlinkVM_Destroy(WGBlinkVM *vm);
+extern int WGBlinkVM_LoadCode(WGBlinkVM *vm, unsigned long long addr,
+                               const void *code, unsigned int size,
+                               unsigned long long entry_rip);
+extern int WGBlinkVM_Step(WGBlinkVM *vm);
+extern int WGBlinkVM_Run(WGBlinkVM *vm, int max_insns);
+extern unsigned long long WGBlinkVM_GetReg(WGBlinkVM *vm, int idx);
+extern void WGBlinkVM_SetReg(WGBlinkVM *vm, int idx, unsigned long long val);
+extern unsigned long long WGBlinkVM_GetRIP(WGBlinkVM *vm);
+extern void WGBlinkVM_SetRIP(WGBlinkVM *vm, unsigned long long rip);
+extern int WGBlinkVM_WriteMem(WGBlinkVM *vm, unsigned long long addr,
+                               const void *buf, unsigned int len);
+extern int WGBlinkVM_ReadMem(WGBlinkVM *vm, unsigned long long addr,
+                              void *buf, unsigned int len);
+extern int WGBlinkVM_SetupStack(WGBlinkVM *vm, unsigned long long entry_rip);
+extern void WGBlinkVM_SwitchTo32(WGBlinkVM *vm);
+
+// From wg_blink_stubs.c — our Abort() override recovery point
+extern void wg_blink_set_abort_recovery(sigjmp_buf *buf);
+
+struct WGBlinkInstance {
+    WGBlinkVM *vm;
+};
+
+WGBlinkInstance *wg_blink_create(void) {
+    WGBlinkInstance *inst = calloc(1, sizeof(WGBlinkInstance));
+    if (!inst) return NULL;
+
+    // Set up recovery point — if blink's init hits an assertion
+    // (which calls our overridden Abort()), we longjmp back here.
+    sigjmp_buf recovery;
+    wg_blink_set_abort_recovery(&recovery);
+
+    int aborted = sigsetjmp(recovery, 0);
+    if (aborted) {
+        wg_blink_set_abort_recovery(NULL);
+        WG_LOGE(TAG, "Blink init failed (Abort caught) — falling back to builtin interpreter");
+        free(inst);
+        return NULL;
+    }
+
+    inst->vm = WGBlinkVM_Create();
+    wg_blink_set_abort_recovery(NULL);
+
+    if (!inst->vm) {
+        WG_LOGE(TAG, "Failed to create blink VM");
+        free(inst);
+        return NULL;
+    }
+
+    WG_LOGI(TAG, "Blink x86-64 VM created (JIT: %s)", wg_blink_has_jit() ? "YES" : "NO");
+    return inst;
+}
+
+WGBlinkInstance *wg_blink_create32(void) {
+    WGBlinkInstance *inst = calloc(1, sizeof(WGBlinkInstance));
+    if (!inst) return NULL;
+
+    sigjmp_buf recovery;
+    wg_blink_set_abort_recovery(&recovery);
+    int aborted = sigsetjmp(recovery, 0);
+    if (aborted) {
+        wg_blink_set_abort_recovery(NULL);
+        WG_LOGE(TAG, "Blink 32-bit init failed");
+        free(inst);
+        return NULL;
+    }
+
+    inst->vm = WGBlinkVM_Create32();
+    wg_blink_set_abort_recovery(NULL);
+
+    if (!inst->vm) {
+        WG_LOGE(TAG, "Failed to create 32-bit blink VM");
+        free(inst);
+        return NULL;
+    }
+
+    WG_LOGI(TAG, "Blink x86 (32-bit) VM created (JIT: %s)", wg_blink_has_jit() ? "YES" : "NO");
+    return inst;
+}
+
+void wg_blink_destroy(WGBlinkInstance *inst) {
+    if (!inst) return;
+    free(inst);
+}
+
+bool wg_blink_load_binary(WGBlinkInstance *inst, const char *path) {
+    return false;
+}
+
+void wg_blink_switch_to_32bit(WGBlinkInstance *inst) {
+    if (!inst || !inst->vm) return;
+    WGBlinkVM_SwitchTo32(inst->vm);
+    WG_LOGI(TAG, "Switched to 32-bit compatibility mode");
+}
+
+bool wg_blink_setup_stack(WGBlinkInstance *inst, uint64_t entry_rip) {
+    if (!inst || !inst->vm) return false;
+
+    sigjmp_buf recovery;
+    wg_blink_set_abort_recovery(&recovery);
+    if (sigsetjmp(recovery, 0)) {
+        wg_blink_set_abort_recovery(NULL);
+        WG_LOGE(TAG, "Blink setup_stack aborted");
+        return false;
+    }
+
+    int ok = WGBlinkVM_SetupStack(inst->vm, entry_rip);
+    wg_blink_set_abort_recovery(NULL);
+    return ok != 0;
+}
+
+bool wg_blink_load_code(WGBlinkInstance *inst, uint64_t addr,
+                         const uint8_t *code, uint32_t size,
+                         uint64_t entry_rip) {
+    if (!inst || !inst->vm) return false;
+
+    sigjmp_buf recovery;
+    wg_blink_set_abort_recovery(&recovery);
+    if (sigsetjmp(recovery, 0)) {
+        wg_blink_set_abort_recovery(NULL);
+        WG_LOGE(TAG, "Blink load_code aborted");
+        return false;
+    }
+
+    int ok = WGBlinkVM_LoadCode(inst->vm, addr, code, size, entry_rip);
+    wg_blink_set_abort_recovery(NULL);
+
+    if (!ok) {
+        WG_LOGE(TAG, "Failed to load code at 0x%llx", (unsigned long long)addr);
+        return false;
+    }
+
+    WG_LOGI(TAG, "Loaded %u bytes at 0x%llx, entry 0x%llx",
+            size, (unsigned long long)addr, (unsigned long long)entry_rip);
+    return true;
+}
+
+WGBlinkResult wg_blink_step(WGBlinkInstance *inst) {
+    if (!inst || !inst->vm) return WG_BLINK_ERROR;
+    int r = WGBlinkVM_Step(inst->vm);
+    switch (r) {
+        case 0:  return WG_BLINK_OK;
+        case 1:  return WG_BLINK_HALT;
+        default: return WG_BLINK_ERROR;
+    }
+}
+
+WGBlinkResult wg_blink_run(WGBlinkInstance *inst, int max_instructions) {
+    if (!inst || !inst->vm) return WG_BLINK_ERROR;
+
+    sigjmp_buf recovery;
+    wg_blink_set_abort_recovery(&recovery);
+    if (sigsetjmp(recovery, 0)) {
+        wg_blink_set_abort_recovery(NULL);
+        WG_LOGE(TAG, "Blink execution aborted");
+        return WG_BLINK_ERROR;
+    }
+
+    int r = WGBlinkVM_Run(inst->vm, max_instructions);
+    wg_blink_set_abort_recovery(NULL);
+
+    switch (r) {
+        case 0:  return WG_BLINK_OK;
+        case 1:  return WG_BLINK_HALT;
+        default: return WG_BLINK_ERROR;
+    }
+}
+
+uint64_t wg_blink_get_reg(WGBlinkInstance *inst, int reg_index) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_GetReg(inst->vm, reg_index);
+}
+
+void wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val) {
+    if (!inst || !inst->vm) return;
+    WGBlinkVM_SetReg(inst->vm, reg_index, val);
+}
+
+uint64_t wg_blink_get_rip(WGBlinkInstance *inst) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_GetRIP(inst->vm);
+}
+
+void wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip) {
+    if (!inst || !inst->vm) return;
+    WGBlinkVM_SetRIP(inst->vm, rip);
+}
+
+bool wg_blink_write_mem(WGBlinkInstance *inst, uint64_t addr,
+                         const void *buf, uint32_t len) {
+    if (!inst || !inst->vm) return false;
+    return WGBlinkVM_WriteMem(inst->vm, addr, buf, len) != 0;
+}
+
+bool wg_blink_read_mem(WGBlinkInstance *inst, uint64_t addr,
+                        void *buf, uint32_t len) {
+    if (!inst || !inst->vm) return false;
+    return WGBlinkVM_ReadMem(inst->vm, addr, buf, len) != 0;
+}
+
+bool wg_blink_has_jit(void) {
+#if defined(__aarch64__) && defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+const char *wg_blink_version(void) {
+    return "blink x86-64 emulator (ARM64 JIT via MAP_JIT)";
+}

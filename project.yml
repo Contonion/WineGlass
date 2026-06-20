@@ -1,0 +1,54 @@
+name: WineGlass
+options:
+  bundleIdPrefix: com.wineglass
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+
+targets:
+  WineGlass:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - "**/*.h"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.wineglass.app
+        INFOPLIST_FILE: Sources/App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/App/WineGlass.entitlements
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/Sources/Core
+          - $(SRCROOT)/Sources/PE
+          - $(SRCROOT)/Sources/CPU
+          - $(SRCROOT)/Sources/Memory
+          - $(SRCROOT)/Sources/Win32
+          - $(SRCROOT)/Sources/Graphics
+          - $(SRCROOT)/Sources/App
+          - $(SRCROOT)/Vendor/blink/include
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor/blink/lib
+        OTHER_LDFLAGS:
+          - -lbz2
+          - -lz
+          - $(SRCROOT)/Vendor/blink/lib/wg_blink_impl.o
+          - $(SRCROOT)/Vendor/blink/lib/blink.a
+          - -Xlinker
+          - -undefined
+          - -Xlinker
+          - dynamic_lookup
+        OTHER_CFLAGS: "-DTARGET_OS_IOS=1 -D_DARWIN_C_SOURCE"
+        GCC_C_LANGUAGE_STANDARD: c11
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies: []
+    frameworks:
+      - Metal.framework
+      - MetalKit.framework
+      - QuartzCore.framework
+      - UIKit.framework
+      - GameController.framework
+      - CoreHaptics.framework
+    libraries: []

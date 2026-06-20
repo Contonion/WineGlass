@@ -1,0 +1,10 @@
+#import <UIKit/UIKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+
+@interface WGMetalView : UIView
+@property (nonatomic, readonly) CAMetalLayer *metalLayer;
+@end
+
+@interface WGViewController : UIViewController
+@end
