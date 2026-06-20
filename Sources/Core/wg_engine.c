@@ -624,56 +624,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0xFFFFFFFF;
             }
             WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
-
-            // Track the NSIS data .tmp file handle and pre-decompress
-            if (ret_val != 0xFFFFFFFF && real && strstr(apath, ".tmp") &&
-                !strstr(apath, ".tmp\\") && !strstr(apath, ".tmp/") &&
-                s_nsis_data_tmp_handle == 0 && args[4] == 2) {
-                s_nsis_data_tmp_handle = (uint32_t)ret_val;
-                strncpy(s_nsis_data_tmp_path, real, sizeof(s_nsis_data_tmp_path) - 1);
-                WG_LOGI(TAG, "NSIS data .tmp: handle=0x%X path=%s",
-                        s_nsis_data_tmp_handle, s_nsis_data_tmp_path);
-
-                // Decompress the entire outer LZMA stream natively
-                // This replaces NSIS's broken x86 decompressor
-                const char *exe_real = wg_files_map_path(0, engine->blink,
-                    (char*)"C:\\a.exe", 260);
-                if (exe_real) {
-                    // Close the handle, decompress, reopen
-                    wg_files_close(s_nsis_data_tmp_handle);
-                    if (wg_nsis_decompress_outer_stream(exe_real, real)) {
-                        WG_LOGI(TAG, "NSIS outer stream decompressed natively!");
-                    } else {
-                        WG_LOGW(TAG, "Native decompression failed, using x86");
-                    }
-                    // Reopen for read/write
-                    s_nsis_data_tmp_handle = wg_files_create(real, 0xC0000000, 4);
-                    ret_val = s_nsis_data_tmp_handle;
-                }
-            }
-
-            // For files in plugin dirs, try native LZMA extraction using
-            // Apple's Compression framework (bypasses x86 decompressor bugs)
-            if (ret_val != 0xFFFFFFFF && real &&
-                (strstr(apath, ".tmp\\") || strstr(apath, ".tmp/")) &&
-                s_nsis_data_tmp_path[0] && s_nsis_last_data_seek > 0) {
-
-                wg_files_close((uint32_t)ret_val);
-
-                WG_LOGI(TAG, "Native extract: %s from data@%u",
-                        apath, s_nsis_last_data_seek);
-                bool extracted = wg_nsis_extract_file(
-                    s_nsis_data_tmp_path, s_nsis_last_data_seek, real);
-
-                if (extracted) {
-                    WG_LOGI(TAG, "Native extraction OK!");
-                } else {
-                    WG_LOGW(TAG, "Native extraction failed");
-                }
-                // Return null handle either way — discard NSIS's own
-                // decompression output (ours is on disk or missing)
-                ret_val = wg_files_create_null();
-            }
+            // NOTE: NSIS uses a solid raw-LZMA stream that blink's x86
+            // decompressor decodes correctly (the dialog/strings/fonts all
+            // come from the decompressed header). We deliberately do NOT
+            // intercept extraction here — Apple's COMPRESSION_LZMA can't read
+            // NSIS's raw stream, and intercepting only discards blink's
+            // correct output. Let the guest do the decompression.
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
@@ -839,11 +795,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             static uint32_t s_heap_ptr = 0x10000000;
             uint32_t size = args[1];
             if (size == 0) size = 4096;
-            // Cap at 64MB to prevent corrupt size values
-            if (size > 16 * 1024 * 1024) {
+            // Only reject truly insane sizes (>512MB) as corrupt. NSIS
+            // legitimately allocates multi-MB buffers (e.g. 8MB LZMA dict).
+            if (size > 512u * 1024 * 1024) {
                 WG_LOGW(TAG, "GlobalAlloc FAILED: corrupt size %u", size);
                 ret_val = 0; // return NULL — let caller handle the error
-                // Skip the rest of the GlobalAlloc logic
                 goto skip_alloc;
             }
             size = (size + 0xFFF) & ~0xFFF;
