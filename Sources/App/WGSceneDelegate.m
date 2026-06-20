@@ -203,6 +203,15 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 }
 
 - (void)tryLoadBundledPE {
+    // Validation phase: prefer the bundled GDI test program so it always runs
+    // regardless of what's sitting in Documents.
+    NSString *testPath = [[NSBundle mainBundle] pathForResource:@"WGTest" ofType:@"exe"];
+    if (testPath) {
+        WG_LOGI("App", "Loading bundled GDI test: WGTest.exe");
+        [self loadAndRunPE:testPath];
+        return;
+    }
+
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docs = paths.firstObject;
     NSFileManager *fm = [NSFileManager defaultManager];

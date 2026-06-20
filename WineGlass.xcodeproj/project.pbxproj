@@ -21,6 +21,7 @@
 		7BD37F605CABC45939057EE7 /* wg_win32_windows.c in Sources */ = {isa = PBXBuildFile; fileRef = A695F4AD386205BBF3906750 /* wg_win32_windows.c */; };
 		7EBC8DAB1EA05C2EA1D4BB1B /* wg_dll_mapper.c in Sources */ = {isa = PBXBuildFile; fileRef = AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */; };
 		8F26D5DB3E0CACB7F1E65DB6 /* wg_x86_interp.c in Sources */ = {isa = PBXBuildFile; fileRef = FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */; };
+		A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */ = {isa = PBXBuildFile; fileRef = D24B8F67C6D93249E2806856 /* WGTest.exe */; };
 		B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */ = {isa = PBXBuildFile; fileRef = F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */; };
 		B99F42AC783F3C7CFE7C0261 /* wg_x86_decode.c in Sources */ = {isa = PBXBuildFile; fileRef = 42339EDAF6C08B393CB06629 /* wg_x86_decode.c */; };
 		D17D055B61A32A32FB4078E4 /* wg_blink_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = AAECFF2CEBDD5A2496FD3C25 /* wg_blink_stubs.c */; };
@@ -50,6 +51,7 @@
 		B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_files.c; sourceTree = "<group>"; };
 		BD62DFB283E953060FB6F2B4 /* wg_selftest.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_selftest.c; sourceTree = "<group>"; };
 		C2E7451659F90F1881744FD7 /* wg_log.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_log.c; sourceTree = "<group>"; };
+		D24B8F67C6D93249E2806856 /* WGTest.exe */ = {isa = PBXFileReference; path = WGTest.exe; sourceTree = "<group>"; };
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -105,9 +107,18 @@
 		5C80C8C4078F3D9B26557523 = {
 			isa = PBXGroup;
 			children = (
+				6FF563893F10E16D1469B5B4 /* Resources */,
 				9D603D72BC6C2B0584420B56 /* Sources */,
 				893C5D89D46BFE3C1AA22A84 /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		6FF563893F10E16D1469B5B4 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				D24B8F67C6D93249E2806856 /* WGTest.exe */,
+			);
+			path = Resources;
 			sourceTree = "<group>";
 		};
 		7D9CEDDFBF7C251922D7ED48 /* PE */ = {
@@ -168,6 +179,7 @@
 			buildConfigurationList = 3C4260661D3A0B09185E37F1 /* Build configuration list for PBXNativeTarget "WineGlass" */;
 			buildPhases = (
 				07CE8E38AC1796EE0B13879C /* Sources */,
+				0F3EB425F3B4DFA266E69169 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -209,6 +221,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		0F3EB425F3B4DFA266E69169 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		07CE8E38AC1796EE0B13879C /* Sources */ = {

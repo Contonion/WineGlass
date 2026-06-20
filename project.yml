@@ -13,6 +13,8 @@ targets:
       - path: Sources
         excludes:
           - "**/*.h"
+      - path: Resources
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.wineglass.app
