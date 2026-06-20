@@ -8,6 +8,7 @@
 #include "wg_blink_bridge.h"
 #include "wg_win32_windows.h"
 #include "wg_win32_files.h"
+#include "wg_nsis_extract.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -24,7 +25,10 @@ typedef enum {
 
 static uint32_t s_last_error = 0;
 static bool s_nsis_data_patched = false;
-static uint32_t s_nsis_exe_data_offset = 0; // exe position where raw data copy starts
+static uint32_t s_nsis_exe_data_offset = 0;
+static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
+static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
+static char s_nsis_data_tmp_path[1024] = {0};  // real path of data .tmp
 
 struct WGEngine {
     WGEngineState   state;
@@ -621,44 +625,37 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
 
-            // For BMP/image files in plugin dirs, write a valid dummy BMP
-            // and return a null handle that discards decompression writes.
-            // This bypasses the broken LZMA decompression for image resources.
-            if (ret_val != 0xFFFFFFFF && real && strstr(apath, ".bmp")) {
+            // Track the NSIS data .tmp file handle
+            if (ret_val != 0xFFFFFFFF && real && strstr(apath, ".tmp") &&
+                !strstr(apath, ".tmp\\") && !strstr(apath, ".tmp/") &&
+                s_nsis_data_tmp_handle == 0 && args[4] == 2) {
+                s_nsis_data_tmp_handle = (uint32_t)ret_val;
+                strncpy(s_nsis_data_tmp_path, real, sizeof(s_nsis_data_tmp_path) - 1);
+                WG_LOGI(TAG, "NSIS data .tmp: handle=0x%X path=%s",
+                        s_nsis_data_tmp_handle, s_nsis_data_tmp_path);
+            }
+
+            // For files in plugin dirs, try native LZMA extraction using
+            // Apple's Compression framework (bypasses x86 decompressor bugs)
+            if (ret_val != 0xFFFFFFFF && real &&
+                (strstr(apath, ".tmp\\") || strstr(apath, ".tmp/")) &&
+                s_nsis_data_tmp_path[0] && s_nsis_last_data_seek > 0) {
+
                 wg_files_close((uint32_t)ret_val);
-                FILE *bf = fopen(real, "wb");
-                if (bf) {
-                    int w = 150, h = 57;
-                    int row_bytes = (w * 3 + 3) & ~3;
-                    int img_size = row_bytes * h;
-                    int file_size = 54 + img_size;
-                    uint8_t hdr[54] = {0};
-                    hdr[0]='B'; hdr[1]='M';
-                    memcpy(hdr+2, &file_size, 4);
-                    int off=54; memcpy(hdr+10, &off, 4);
-                    int hs=40; memcpy(hdr+14, &hs, 4);
-                    memcpy(hdr+18, &w, 4); memcpy(hdr+22, &h, 4);
-                    short p=1; memcpy(hdr+26, &p, 2);
-                    short b=24; memcpy(hdr+28, &b, 2);
-                    memcpy(hdr+34, &img_size, 4);
-                    fwrite(hdr, 1, 54, bf);
-                    uint8_t row[452];
-                    memset(row, 0, sizeof(row));
-                    for (int y = 0; y < h; y++) {
-                        for (int x = 0; x < w; x++) {
-                            row[x*3+0] = 180;
-                            row[x*3+1] = (uint8_t)(120+y);
-                            row[x*3+2] = (uint8_t)(30+y);
-                        }
-                        fwrite(row, 1, row_bytes, bf);
-                    }
-                    fclose(bf);
-                    WG_LOGI(TAG, "Created banner BMP: %s", apath);
+
+                WG_LOGI(TAG, "Native extract: %s from data@%u",
+                        apath, s_nsis_last_data_seek);
+                bool extracted = wg_nsis_extract_file(
+                    s_nsis_data_tmp_path, s_nsis_last_data_seek, real);
+
+                if (extracted) {
+                    WG_LOGI(TAG, "Native extraction OK!");
+                } else {
+                    WG_LOGW(TAG, "Native extraction failed");
                 }
-                // Return a null handle — NSIS will "write" decompressed data
-                // to it but it gets silently discarded
+                // Return null handle either way — discard NSIS's own
+                // decompression output (ours is on disk or missing)
                 ret_val = wg_files_create_null();
-                WG_LOGI(TAG, "BMP extraction bypassed, null handle 0x%X", (uint32_t)ret_val);
             }
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
@@ -711,6 +708,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGI(TAG, "GetFileSize(0x%X) -> %u", args[0], (uint32_t)ret_val);
         } else if (strcmp(fn, "SetFilePointer") == 0) {
             // Detect when NSIS finishes its truncated copy and patch the .tmp
+            // Track seeks on the data .tmp to know extraction offsets
+            if (s_nsis_data_tmp_handle != 0 && args[0] == s_nsis_data_tmp_handle &&
+                args[3] == 0 && (int32_t)args[1] > 0) {
+                s_nsis_last_data_seek = (uint32_t)args[1];
+            }
+
             // Track seeks on the EXE file (not .tmp) to find raw data offset.
             // Only consider seeks on files larger than 1MB (that's the .exe).
             if (!s_nsis_data_patched && args[3] == 0 &&
