@@ -7,6 +7,122 @@
 
 #define TAG "NSISExtract"
 
+// Decompress the entire NSIS outer LZMA stream from the .exe and
+// write the decompressed data to the .tmp file. This replaces
+// NSIS's own x86 LZMA decompressor which has accuracy issues in
+// blink's 32-bit compatibility mode.
+bool wg_nsis_decompress_outer_stream(const char *exe_path,
+                                      const char *tmp_path) {
+    FILE *exe_fp = fopen(exe_path, "rb");
+    if (!exe_fp) return false;
+
+    fseek(exe_fp, 0, SEEK_END);
+    long exe_size = ftell(exe_fp);
+    fseek(exe_fp, 0, SEEK_SET);
+
+    uint8_t *exe_data = malloc(exe_size);
+    if (!exe_data) { fclose(exe_fp); return false; }
+    fread(exe_data, 1, exe_size, exe_fp);
+    fclose(exe_fp);
+
+    // Find NullsoftInst marker
+    long nsi = -1;
+    for (long i = 0; i < exe_size - 16; i++) {
+        if (memcmp(exe_data + i, "NullsoftInst", 12) == 0) {
+            nsi = i; break;
+        }
+    }
+    if (nsi < 0) {
+        WG_LOGE(TAG, "No NullsoftInst marker");
+        free(exe_data);
+        return false;
+    }
+
+    uint32_t hdr_len, arc_size;
+    memcpy(&hdr_len, exe_data + nsi + 12, 4);
+    memcpy(&arc_size, exe_data + nsi + 16, 4);
+    long data_start = nsi + 20;
+
+    WG_LOGI(TAG, "NSIS: hdr_len=%u, arc_size=%u, data_start=%ld",
+            hdr_len, arc_size, data_start);
+
+    // The compressed data starts at data_start
+    // It's one LZMA stream: first hdr_len bytes decompress to the header,
+    // then the rest decompresses to the file data (goes into .tmp)
+
+    // The entire archive (arc_size bytes) is the outer LZMA stream
+    long compressed_size = arc_size;
+    if (data_start + compressed_size > exe_size) {
+        compressed_size = exe_size - data_start;
+    }
+
+    // Decompress using Apple's framework
+    // The output could be up to 10x the compressed size
+    size_t dst_capacity = compressed_size * 10;
+    if (dst_capacity > 100 * 1024 * 1024) dst_capacity = 100 * 1024 * 1024;
+
+    uint8_t *dst_buf = malloc(dst_capacity);
+    if (!dst_buf) { free(exe_data); return false; }
+
+    uint8_t *src = exe_data + data_start;
+
+    // Try LZMA decompression
+    size_t decompressed = compression_decode_buffer(
+        dst_buf, dst_capacity,
+        src, compressed_size,
+        NULL, COMPRESSION_LZMA);
+
+    if (decompressed == 0 || decompressed >= dst_capacity) {
+        // Try skipping LZMA properties (5 bytes)
+        if (compressed_size > 5) {
+            decompressed = compression_decode_buffer(
+                dst_buf, dst_capacity,
+                src + 5, compressed_size - 5,
+                NULL, COMPRESSION_LZMA);
+        }
+    }
+
+    if (decompressed == 0 || decompressed >= dst_capacity) {
+        // Try ZLIB
+        decompressed = compression_decode_buffer(
+            dst_buf, dst_capacity,
+            src, compressed_size,
+            NULL, COMPRESSION_ZLIB);
+    }
+
+    free(exe_data);
+
+    if (decompressed == 0 || decompressed >= dst_capacity) {
+        WG_LOGE(TAG, "Outer stream decompression failed");
+        free(dst_buf);
+        return false;
+    }
+
+    WG_LOGI(TAG, "Outer stream: %ld compressed -> %zu decompressed",
+            compressed_size, decompressed);
+
+    // The decompressed data contains:
+    // [header: hdr_len bytes] [file data blocks]
+    // The .tmp should contain ONLY the file data blocks (after the header)
+    if (decompressed <= hdr_len) {
+        WG_LOGE(TAG, "Decompressed too small: %zu <= %u", decompressed, hdr_len);
+        free(dst_buf);
+        return false;
+    }
+
+    // Write file data portion to .tmp
+    FILE *tmp_fp = fopen(tmp_path, "wb");
+    if (!tmp_fp) { free(dst_buf); return false; }
+
+    size_t file_data_size = decompressed - hdr_len;
+    fwrite(dst_buf + hdr_len, 1, file_data_size, tmp_fp);
+    fclose(tmp_fp);
+
+    WG_LOGI(TAG, "Wrote %zu bytes of file data to %s", file_data_size, tmp_path);
+    free(dst_buf);
+    return true;
+}
+
 bool wg_nsis_extract_file(const char *data_tmp_path,
                            uint32_t data_offset,
                            const char *output_path) {

@@ -625,7 +625,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
 
-            // Track the NSIS data .tmp file handle
+            // Track the NSIS data .tmp file handle and pre-decompress
             if (ret_val != 0xFFFFFFFF && real && strstr(apath, ".tmp") &&
                 !strstr(apath, ".tmp\\") && !strstr(apath, ".tmp/") &&
                 s_nsis_data_tmp_handle == 0 && args[4] == 2) {
@@ -633,6 +633,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 strncpy(s_nsis_data_tmp_path, real, sizeof(s_nsis_data_tmp_path) - 1);
                 WG_LOGI(TAG, "NSIS data .tmp: handle=0x%X path=%s",
                         s_nsis_data_tmp_handle, s_nsis_data_tmp_path);
+
+                // Decompress the entire outer LZMA stream natively
+                // This replaces NSIS's broken x86 decompressor
+                const char *exe_real = wg_files_map_path(0, engine->blink,
+                    (char*)"C:\\a.exe", 260);
+                if (exe_real) {
+                    // Close the handle, decompress, reopen
+                    wg_files_close(s_nsis_data_tmp_handle);
+                    if (wg_nsis_decompress_outer_stream(exe_real, real)) {
+                        WG_LOGI(TAG, "NSIS outer stream decompressed natively!");
+                    } else {
+                        WG_LOGW(TAG, "Native decompression failed, using x86");
+                    }
+                    // Reopen for read/write
+                    s_nsis_data_tmp_handle = wg_files_create(real, 0xC0000000, 4);
+                    ret_val = s_nsis_data_tmp_handle;
+                }
             }
 
             // For files in plugin dirs, try native LZMA extraction using
@@ -727,7 +744,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
 
-            if (!s_nsis_data_patched && s_nsis_exe_data_offset > 0) {
+            if (false && !s_nsis_data_patched && s_nsis_exe_data_offset > 0) {
+                // DISABLED: old .tmp patching — now using full outer stream decompression
                 uint32_t current_size = wg_files_get_size(args[0]);
                 if (current_size > 200000 && current_size < 500000) {
                     WG_LOGI(TAG, "Patching .tmp: handle=0x%X, size=%u, exe_data_off=%u",
