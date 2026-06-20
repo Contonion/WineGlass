@@ -817,9 +817,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t size = args[1];
             if (size == 0) size = 4096;
             // Cap at 64MB to prevent corrupt size values
-            if (size > 64 * 1024 * 1024) {
-                WG_LOGW(TAG, "GlobalAlloc capped: requested %u, using 64MB", size);
-                size = 64 * 1024 * 1024;
+            if (size > 16 * 1024 * 1024) {
+                WG_LOGW(TAG, "GlobalAlloc FAILED: corrupt size %u", size);
+                ret_val = 0; // return NULL — let caller handle the error
+                // Skip the rest of the GlobalAlloc logic
+                goto skip_alloc;
             }
             size = (size + 0xFFF) & ~0xFFF;
             uint32_t addr = s_heap_ptr;
@@ -831,6 +833,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFF;
                 ret_val = addr;
             }
+            skip_alloc:;
         } else if (strcmp(fn, "GlobalLock") == 0) {
             ret_val = args[0]; // GMEM_FIXED: handle == pointer
         }
