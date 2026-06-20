@@ -126,7 +126,38 @@ Native iOS (Metal rendering, file I/O, UIKit)
 
 1. **CALL/RET test failure** (2 tests): TerminateSignal longjmp during RET-to-address-0 doesn't preserve register state for the instructions between CALL return and RET. Cosmetic — real programs use ExitProcess.
 
-2. **LZMA decompression in 32-bit mode**: Blink's 32-bit compatibility mode produces corrupt LZMA output. Workaround: native decompression via Apple Compression framework. Root cause is likely a subtle x86 instruction behavior difference (shifts, rotates, or memory access alignment).
+2. **LZMA decompression desync — THE core blocker (confirmed 2026-06-20)**:
+   - SteamSetup.exe uses a SOLID raw-LZMA stream (props `5d`, 8MB dict). The
+     stream is 100% standard: Python's `lzma.FORMAT_RAW` decodes it cleanly to
+     7,931,223 bytes (203,614 header + 7,727,609 file data).
+   - blink decodes the EARLY part correctly (the dialog, control IDs, strings,
+     fonts all come from the decompressed header and render fine) then desyncs
+     DETERMINISTICALLY — same wrong value (`GlobalAlloc(2174029109)`) every run.
+   - It is NOT JIT: blink.a was built with DISABLE_JIT (exports
+     `_JitlessDispatch`, no Jitter symbols). It runs the INTERPRETER. So the
+     desync is an interpreter accuracy bug on some instruction in LZMA's hot
+     loop, data-dependent, only hit by heavy decode work.
+   - Apple's `COMPRESSION_LZMA` only reads the .xz/.lzma CONTAINER, NOT a raw
+     NSIS stream — native bypass via libcompression is impossible. Would need
+     to bundle LzmaDec.c (LZMA SDK, public domain) for native decode.
+   - Output-redirection CANNOT fix it: NSIS reads its control values (block
+     sizes, file table) directly from the decoder's output, so a desynced
+     decoder makes NSIS take wrong branches regardless of what's written to
+     disk. The only real fixes are (a) fix blink's interpreter, or (b) fully
+     reimplement NSIS extraction natively (and skip running its x86 extractor).
+   - The previous "native extraction" interception was REMOVED — it returned
+     null handles that discarded blink's (correct, early) output and made
+     things worse.
+
+3. **VALIDATED 2026-06-20**: The window + GDI + Metal compositor + message-loop
+   pipeline works end-to-end on device. `Tests/gdi_test.c` (a controlled
+   straight-line 32-bit PE built with mingw-w64 i686) renders a window with
+   FillRect/TextOutW/LineTo content on the iPhone. This proves blink's 32-bit
+   interpreter is correct for straight-line code; only the heavy LZMA loop
+   desyncs. Build it with: `i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib
+   -fno-builtin -e _start_ -Wl,--subsystem,windows -o WGTest.exe gdi_test.c
+   -lkernel32 -luser32 -lgdi32`. It is bundled in the app (Resources/) and
+   loaded preferentially by tryLoadBundledPE during this validation phase.
 
 3. **System.dll loading**: NSIS extracts System.dll successfully (23KB) but can't LoadLibrary it (we return a fake module handle). System::Call functionality is stubbed.
 
