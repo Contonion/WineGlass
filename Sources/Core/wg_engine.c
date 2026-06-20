@@ -16,6 +16,27 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
+#include <time.h>
+
+// Recursively delete a directory and its contents (used to give NSIS a fresh
+// plugins temp dir when a stale one survives from a prior run).
+static void wg_rmtree(const char *path) {
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *e;
+        char child[1024];
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            struct stat st;
+            if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) wg_rmtree(child);
+            else unlink(child);
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
 
 #define TAG "Engine"
 
@@ -631,8 +652,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     ret_val = 1;
                     s_last_error = 0;
                 } else if (errno == EEXIST) {
-                    ret_val = 0;
-                    s_last_error = 183; // ERROR_ALREADY_EXISTS
+                    // NSIS needs a FRESH plugins dir (it creates one with a
+                    // restricted ACL and bails if it already exists). Stale
+                    // ns*.tmp dirs survive across runs, so clear and recreate.
+                    if (strstr(apath, ".tmp")) {
+                        wg_rmtree(real);
+                        if (mkdir(real, 0755) == 0) {
+                            ret_val = 1;
+                            s_last_error = 0;
+                            WG_LOGI(TAG, "CreateDirectoryW: cleared stale %s", apath);
+                        } else {
+                            ret_val = 0;
+                            s_last_error = 183;
+                        }
+                    } else {
+                        ret_val = 0;
+                        s_last_error = 183; // ERROR_ALREADY_EXISTS
+                    }
                 } else {
                     ret_val = 0;
                     s_last_error = 3; // ERROR_PATH_NOT_FOUND
@@ -657,7 +693,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 0; // no messages
         } else if (strcmp(fn, "GetTickCount") == 0) {
-            static uint32_t s_tick = 1000;
+            // Seed from a real clock so it varies across launches — NSIS
+            // derives its temp-dir names from this, and a fixed seed makes
+            // every run collide on the same stale directory.
+            static uint32_t s_tick = 0;
+            if (s_tick == 0) s_tick = (uint32_t)(time(NULL) * 1000u) | 1u;
             ret_val = s_tick;
             s_tick += 16;
         } else if (strcmp(fn, "GetCurrentProcess") == 0) {

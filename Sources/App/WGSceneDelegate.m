@@ -203,27 +203,9 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 }
 
 - (void)tryLoadBundledPE {
-    // Diagnostic phase: prefer the CPU conformance probe if present, then the
-    // GDI test, before falling back to whatever is in Documents.
-    NSString *memPath = [[NSBundle mainBundle] pathForResource:@"WGMem" ofType:@"exe"];
-    if (memPath) {
-        WG_LOGI("App", "Loading memory probe: WGMem.exe (all-pass = 0x800007FF)");
-        [self loadAndRunPE:memPath];
-        return;
-    }
-    NSString *probePath = [[NSBundle mainBundle] pathForResource:@"WGProbe" ofType:@"exe"];
-    if (probePath) {
-        WG_LOGI("App", "Loading CPU probe: WGProbe.exe (all-pass mask = 0x1FFFF)");
-        [self loadAndRunPE:probePath];
-        return;
-    }
-    NSString *testPath = [[NSBundle mainBundle] pathForResource:@"WGTest" ofType:@"exe"];
-    if (testPath) {
-        WG_LOGI("App", "Loading bundled GDI test: WGTest.exe");
-        [self loadAndRunPE:testPath];
-        return;
-    }
-
+    // Prefer a real .exe dropped in Documents (e.g. SteamSetup.exe). Fall back
+    // to the bundled GDI demo. (Diagnostic probes are still in the bundle and
+    // loadable via the file picker if needed.)
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docs = paths.firstObject;
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -236,6 +218,13 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
             [self loadAndRunPE:path];
             return;
         }
+    }
+
+    NSString *testPath = [[NSBundle mainBundle] pathForResource:@"WGTest" ofType:@"exe"];
+    if (testPath) {
+        WG_LOGI("App", "No Documents .exe — loading bundled GDI demo: WGTest.exe");
+        [self loadAndRunPE:testPath];
+        return;
     }
     WG_LOGI("App", "Tap 'Load .exe' to select a Windows executable");
 }
