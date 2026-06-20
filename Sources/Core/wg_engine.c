@@ -741,7 +741,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t nbytes = args[2];
             uint32_t bytes_read_addr = args[3];
             if (nbytes > 0x100000) nbytes = 0x100000;
+            uint32_t pos_before = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
             uint8_t *tmpbuf = malloc(nbytes);
+            uint32_t first4 = 0;
             if (tmpbuf) {
                 uint32_t nread = 0;
                 if (wg_files_read(handle, tmpbuf, nbytes, &nread)) {
@@ -749,16 +751,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     if (bytes_read_addr) {
                         wg_blink_write_mem(engine->blink, bytes_read_addr, &nread, 4);
                     }
+                    if (nread >= 4) memcpy(&first4, tmpbuf, 4);
                     ret_val = 1;
                 }
                 free(tmpbuf);
             }
-            // Log first few reads per handle
-            static int read_log_count = 0;
-            if (read_log_count < 30) {
-                WG_LOGI(TAG, "ReadFile(0x%X, dst=0x%X, %u bytes) -> %s",
-                        handle, buf_addr, nbytes, ret_val ? "OK" : "FAIL");
-                read_log_count++;
+            // Only log small "control" reads (size fields etc.) — the bulk
+            // decompression reads are large and would flood the log.
+            if (nbytes <= 64) {
+                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%u, n=%u) -> first4=0x%08X",
+                        handle, pos_before, nbytes, first4);
             }
         } else if (strcmp(fn, "WriteFile") == 0) {
             uint32_t handle = args[0];
@@ -858,6 +860,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = wg_files_set_pointer(args[0], (int32_t)args[1], args[3]);
+            WG_LOGI(TAG, "SetFilePointer(h=0x%X, dist=%d, method=%u) -> %u",
+                    args[0], (int32_t)args[1], args[3], (uint32_t)ret_val);
         } else if (strcmp(fn, "GetFileAttributesW") == 0) {
             uint16_t wpath[260] = {0};
             char apath[260] = {0};
