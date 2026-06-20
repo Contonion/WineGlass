@@ -773,12 +773,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "FindFirstFileW") == 0) {
             ret_val = 0xFFFFFFFF; // INVALID_HANDLE_VALUE
         } else if (strcmp(fn, "GlobalAlloc") == 0) {
-            // Allocate in guest address space
-            // Use a high address range (0x10000000+) to avoid conflicts
             static uint32_t s_heap_ptr = 0x10000000;
             uint32_t size = args[1];
             if (size == 0) size = 4096;
-            // Align to page boundary for large allocations
+            // Cap at 64MB to prevent corrupt size values
+            if (size > 64 * 1024 * 1024) {
+                WG_LOGW(TAG, "GlobalAlloc capped: requested %u, using 64MB", size);
+                size = 64 * 1024 * 1024;
+            }
             size = (size + 0xFFF) & ~0xFFF;
             uint32_t addr = s_heap_ptr;
             uint8_t *zeros = calloc(1, size);
@@ -786,7 +788,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_load_code(engine->blink, addr, zeros, size, 0);
                 free(zeros);
                 s_heap_ptr += size;
-                // Add a guard page gap between allocations
                 s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFF;
                 ret_val = addr;
             }
