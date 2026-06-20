@@ -21,15 +21,13 @@
 		7BD37F605CABC45939057EE7 /* wg_win32_windows.c in Sources */ = {isa = PBXBuildFile; fileRef = A695F4AD386205BBF3906750 /* wg_win32_windows.c */; };
 		7EBC8DAB1EA05C2EA1D4BB1B /* wg_dll_mapper.c in Sources */ = {isa = PBXBuildFile; fileRef = AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */; };
 		8F26D5DB3E0CACB7F1E65DB6 /* wg_x86_interp.c in Sources */ = {isa = PBXBuildFile; fileRef = FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */; };
-		95BFC4437BD39ACD7828952E /* WGMem.exe in Resources */ = {isa = PBXBuildFile; fileRef = 59C1E2319973FDF630CD24AB /* WGMem.exe */; };
-		A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */ = {isa = PBXBuildFile; fileRef = D24B8F67C6D93249E2806856 /* WGTest.exe */; };
 		B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */ = {isa = PBXBuildFile; fileRef = F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */; };
 		B99F42AC783F3C7CFE7C0261 /* wg_x86_decode.c in Sources */ = {isa = PBXBuildFile; fileRef = 42339EDAF6C08B393CB06629 /* wg_x86_decode.c */; };
+		C75A46AF361752976EC91DC8 /* .gitkeep in Resources */ = {isa = PBXBuildFile; fileRef = ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */; };
 		D17D055B61A32A32FB4078E4 /* wg_blink_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = AAECFF2CEBDD5A2496FD3C25 /* wg_blink_stubs.c */; };
 		D27D524AA6A09BDB50A924EE /* WGSceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 4133B5F24164662A9E7B2BF0 /* WGSceneDelegate.m */; };
 		DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */ = {isa = PBXBuildFile; fileRef = BD62DFB283E953060FB6F2B4 /* wg_selftest.c */; };
 		DE48CAB52C304F62F5C45C8D /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 84466C30852AB61143363D30 /* main.m */; };
-		F8F591A5CD0077C1AC32B9CD /* WGProbe.exe in Resources */ = {isa = PBXBuildFile; fileRef = 0E4A66F82214CBC0323BDB79 /* WGProbe.exe */; };
 		FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */ = {isa = PBXBuildFile; fileRef = B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */; };
 /* End PBXBuildFile section */
 
@@ -37,14 +35,12 @@
 		0163ED821E449B867D15803F /* wg_blink_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_blink_bridge.c; sourceTree = "<group>"; };
 		03190A8CA61C6EEB2E21D3A5 /* wg_engine.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_engine.c; sourceTree = "<group>"; };
 		042AC091820A57501F4AF53C /* WGMetalView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGMetalView.m; sourceTree = "<group>"; };
-		0E4A66F82214CBC0323BDB79 /* WGProbe.exe */ = {isa = PBXFileReference; path = WGProbe.exe; sourceTree = "<group>"; };
 		226AD25F32031E477E58E6E4 /* WGAppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGAppDelegate.m; sourceTree = "<group>"; };
 		3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_gdi.c; sourceTree = "<group>"; };
 		405864B3D661FEFA0748A820 /* wg_pe_loader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_pe_loader.c; sourceTree = "<group>"; };
 		4133B5F24164662A9E7B2BF0 /* WGSceneDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGSceneDelegate.m; sourceTree = "<group>"; };
 		41538A1F449EDD392895A884 /* WGConsoleOverlay.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGConsoleOverlay.m; sourceTree = "<group>"; };
 		42339EDAF6C08B393CB06629 /* wg_x86_decode.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_decode.c; sourceTree = "<group>"; };
-		59C1E2319973FDF630CD24AB /* WGMem.exe */ = {isa = PBXFileReference; path = WGMem.exe; sourceTree = "<group>"; };
 		63E59713DC947033856A12CF /* WineGlass.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WineGlass.entitlements; sourceTree = "<group>"; };
 		7F2AEF7511EB4DBFF0E62487 /* wg_x86_state.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_state.c; sourceTree = "<group>"; };
 		84466C30852AB61143363D30 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
@@ -55,10 +51,10 @@
 		B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_files.c; sourceTree = "<group>"; };
 		BD62DFB283E953060FB6F2B4 /* wg_selftest.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_selftest.c; sourceTree = "<group>"; };
 		C2E7451659F90F1881744FD7 /* wg_log.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_log.c; sourceTree = "<group>"; };
-		D24B8F67C6D93249E2806856 /* WGTest.exe */ = {isa = PBXFileReference; path = WGTest.exe; sourceTree = "<group>"; };
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */ = {isa = PBXFileReference; path = .gitkeep; sourceTree = "<group>"; };
 		F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_nsis_extract.c; sourceTree = "<group>"; };
 		FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_interp.c; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -120,9 +116,7 @@
 		6FF563893F10E16D1469B5B4 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
-				59C1E2319973FDF630CD24AB /* WGMem.exe */,
-				0E4A66F82214CBC0323BDB79 /* WGProbe.exe */,
-				D24B8F67C6D93249E2806856 /* WGTest.exe */,
+				ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
@@ -233,9 +227,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				95BFC4437BD39ACD7828952E /* WGMem.exe in Resources */,
-				F8F591A5CD0077C1AC32B9CD /* WGProbe.exe in Resources */,
-				A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */,
+				C75A46AF361752976EC91DC8 /* .gitkeep in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

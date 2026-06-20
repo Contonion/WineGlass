@@ -1115,6 +1115,10 @@ static bool load_pe_builtin(WGEngine *engine) {
 bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     WG_LOGI(TAG, "Loading PE: %s", path);
 
+    // Clear any windows left over from a previous program so the UI doesn't
+    // get stuck behind a lingering window.
+    wg_wm_reset();
+
     // Set the exe path for file I/O mapping
     wg_files_set_exe_path(path);
 

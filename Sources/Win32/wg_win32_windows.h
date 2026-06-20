@@ -37,6 +37,10 @@ typedef struct {
 
 WGWindowManager *wg_wm_get(void);
 
+// Destroy all windows and free their client buffers (call when loading a new
+// program so a previous run's windows don't linger on screen).
+void wg_wm_reset(void);
+
 uint32_t wg_wm_create_window(uint32_t ex_style, uint32_t class_atom,
                               const uint16_t *title,
                               uint32_t style,

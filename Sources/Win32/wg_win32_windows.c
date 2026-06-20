@@ -107,6 +107,20 @@ void wg_wm_destroy(uint32_t hwnd) {
     }
 }
 
+void wg_wm_reset(void) {
+    WGWindowManager *wm = wg_wm_get();
+    for (int i = 0; i < wm->count; i++) {
+        if (wm->windows[i].client) {
+            free(wm->windows[i].client);
+            wm->windows[i].client = NULL;
+        }
+    }
+    memset(wm->windows, 0, sizeof(wm->windows));
+    wm->count = 0;
+    wm->next_handle = WG_HWND_BASE;
+    wm->dirty = true;
+}
+
 uint32_t *wg_wm_get_client(uint32_t hwnd, int32_t *out_w, int32_t *out_h) {
     WGWin32Window *w = wg_wm_find(hwnd);
     if (!w) return NULL;
