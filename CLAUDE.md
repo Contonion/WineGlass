@@ -126,7 +126,21 @@ Native iOS (Metal rendering, file I/O, UIKit)
 
 1. **CALL/RET test failure** (2 tests): TerminateSignal longjmp during RET-to-address-0 doesn't preserve register state for the instructions between CALL return and RET. Cosmetic — real programs use ExitProcess.
 
-2. **LZMA decompression desync — THE core blocker (confirmed 2026-06-20)**:
+2. **RESOLVED 2026-06-20 — blink decodes LZMA correctly.** The "interpreter
+   desync" theory below was DISPROVEN: CPU and memory conformance probes
+   (Tests/cpu_probe.c → 0x1FFFF all-pass; Tests/mem_probe.c → 0x800007FF
+   all-pass, including a 12MB allocation) showed blink's 32-bit interpreter is
+   accurate for every instruction class LZMA uses, AND for large allocations.
+   With our native-extraction interference removed and the GlobalAlloc
+   threshold raised so the 8MB LZMA dictionary allocates, SteamSetup's solid
+   stream decompresses correctly (full 32768-byte chunks, no corrupt sizes).
+   The real cause of every "Error decompressing data" was OUR own band-aids
+   (null handles discarding blink's correct output), not the emulator. The
+   installer now extracts data and reaches plug-in directory setup. Next
+   blockers are Win32 completeness (plug-in dir init, then the real UI).
+   The probes (WGProbe.exe/WGMem.exe) remain bundled, loadable via picker.
+
+   [HISTORICAL / WRONG] LZMA decompression desync — THE core blocker:
    - SteamSetup.exe uses a SOLID raw-LZMA stream (props `5d`, 8MB dict). The
      stream is 100% standard: Python's `lzma.FORMAT_RAW` decodes it cleanly to
      7,931,223 bytes (203,614 header + 7,727,609 file data).
