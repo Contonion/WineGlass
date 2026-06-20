@@ -205,6 +205,12 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 - (void)tryLoadBundledPE {
     // Diagnostic phase: prefer the CPU conformance probe if present, then the
     // GDI test, before falling back to whatever is in Documents.
+    NSString *memPath = [[NSBundle mainBundle] pathForResource:@"WGMem" ofType:@"exe"];
+    if (memPath) {
+        WG_LOGI("App", "Loading memory probe: WGMem.exe (all-pass = 0x800007FF)");
+        [self loadAndRunPE:memPath];
+        return;
+    }
     NSString *probePath = [[NSBundle mainBundle] pathForResource:@"WGProbe" ofType:@"exe"];
     if (probePath) {
         WG_LOGI("App", "Loading CPU probe: WGProbe.exe (all-pass mask = 0x1FFFF)");

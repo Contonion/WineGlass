@@ -21,6 +21,7 @@
 		7BD37F605CABC45939057EE7 /* wg_win32_windows.c in Sources */ = {isa = PBXBuildFile; fileRef = A695F4AD386205BBF3906750 /* wg_win32_windows.c */; };
 		7EBC8DAB1EA05C2EA1D4BB1B /* wg_dll_mapper.c in Sources */ = {isa = PBXBuildFile; fileRef = AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */; };
 		8F26D5DB3E0CACB7F1E65DB6 /* wg_x86_interp.c in Sources */ = {isa = PBXBuildFile; fileRef = FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */; };
+		95BFC4437BD39ACD7828952E /* WGMem.exe in Resources */ = {isa = PBXBuildFile; fileRef = 59C1E2319973FDF630CD24AB /* WGMem.exe */; };
 		A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */ = {isa = PBXBuildFile; fileRef = D24B8F67C6D93249E2806856 /* WGTest.exe */; };
 		B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */ = {isa = PBXBuildFile; fileRef = F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */; };
 		B99F42AC783F3C7CFE7C0261 /* wg_x86_decode.c in Sources */ = {isa = PBXBuildFile; fileRef = 42339EDAF6C08B393CB06629 /* wg_x86_decode.c */; };
@@ -43,6 +44,7 @@
 		4133B5F24164662A9E7B2BF0 /* WGSceneDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGSceneDelegate.m; sourceTree = "<group>"; };
 		41538A1F449EDD392895A884 /* WGConsoleOverlay.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGConsoleOverlay.m; sourceTree = "<group>"; };
 		42339EDAF6C08B393CB06629 /* wg_x86_decode.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_decode.c; sourceTree = "<group>"; };
+		59C1E2319973FDF630CD24AB /* WGMem.exe */ = {isa = PBXFileReference; path = WGMem.exe; sourceTree = "<group>"; };
 		63E59713DC947033856A12CF /* WineGlass.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WineGlass.entitlements; sourceTree = "<group>"; };
 		7F2AEF7511EB4DBFF0E62487 /* wg_x86_state.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_state.c; sourceTree = "<group>"; };
 		84466C30852AB61143363D30 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
@@ -118,6 +120,7 @@
 		6FF563893F10E16D1469B5B4 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				59C1E2319973FDF630CD24AB /* WGMem.exe */,
 				0E4A66F82214CBC0323BDB79 /* WGProbe.exe */,
 				D24B8F67C6D93249E2806856 /* WGTest.exe */,
 			);
@@ -230,6 +233,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				95BFC4437BD39ACD7828952E /* WGMem.exe in Resources */,
 				F8F591A5CD0077C1AC32B9CD /* WGProbe.exe in Resources */,
 				A7F93E692A6452D4ABDE02CC /* WGTest.exe in Resources */,
 			);
