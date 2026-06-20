@@ -375,6 +375,15 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("USER32.dll", SendMessageTimeoutW, 7);
     R1S("USER32.dll", SetForegroundWindow, 1);
     RS("USER32.dll", GetMessageA, 4);
+    // Window message pump + GDI device contexts (handled in engine)
+    RS("USER32.dll", GetMessageW, 4);
+    RS("USER32.dll", TranslateMessage, 1);
+    RS("USER32.dll", DispatchMessageW, 1);
+    RS("USER32.dll", DefWindowProcW, 4);
+    RS("USER32.dll", GetDC, 1);
+    RS("USER32.dll", ReleaseDC, 2);
+    RS("USER32.dll", BeginPaint, 2);
+    RS("USER32.dll", FillRect, 3);
 
     // === GDI32.dll ===
     RS("GDI32.dll", SelectObject, 2);
@@ -385,6 +394,10 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R("GDI32.dll", GetDeviceCaps, stub_GetDeviceCaps, 2);
     R1S("GDI32.dll", CreateBrushIndirect, 1);
     RS("GDI32.dll", SetBkColor, 2);
+    RS("GDI32.dll", CreateSolidBrush, 1);
+    RS("GDI32.dll", TextOutW, 5);
+    RS("GDI32.dll", MoveToEx, 4);
+    RS("GDI32.dll", LineTo, 3);
 
     // === SHELL32.dll ===
     R1S("SHELL32.dll", IsUserAnAdmin, 0);

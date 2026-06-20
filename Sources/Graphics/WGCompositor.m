@@ -39,6 +39,7 @@ static NSString *const shaderSource = @""
     id<MTLRenderPipelineState> _pipeline;
     id<MTLBuffer> _vertexBuffer;
     id<MTLTexture> _textTexture;
+    NSMutableDictionary<NSNumber *, id<MTLTexture>> *_clientTextures;
     BOOL _ready;
 }
 
@@ -49,6 +50,7 @@ static NSString *const shaderSource = @""
         [self buildPipeline];
         _vertexBuffer = [device newBufferWithLength:sizeof(WGVertex) * 8192
                                            options:MTLResourceStorageModeShared];
+        _clientTextures = [NSMutableDictionary dictionary];
         [self createTextTexture];
     }
     return self;
@@ -144,6 +146,32 @@ static NSString *const shaderSource = @""
     free(pixels);
 }
 
+// Lazily create/update a Metal texture from a window's client framebuffer.
+- (id<MTLTexture>)clientTextureFor:(WGWin32Window *)w {
+    if (!w->client || w->client_w <= 0 || w->client_h <= 0) return nil;
+    NSNumber *key = @(w->handle);
+    id<MTLTexture> tex = _clientTextures[key];
+    if (!tex || (int)tex.width != w->client_w || (int)tex.height != w->client_h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:w->client_w
+                                        height:w->client_h
+                                     mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        tex = [_device newTextureWithDescriptor:td];
+        _clientTextures[key] = tex;
+        w->client_dirty = true;
+    }
+    if (w->client_dirty) {
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w->client_w, w->client_h)
+               mipmapLevel:0
+                 withBytes:w->client
+               bytesPerRow:w->client_w * 4];
+        w->client_dirty = false;
+    }
+    return tex;
+}
+
 static void addQuad(WGVertex *verts, int *count,
                     float x1, float y1, float x2, float y2,
                     float r, float g, float b, float a) {
@@ -195,6 +223,11 @@ static float toNDCy(float py, float screenH) { return 1.0f - (py / screenH) * 2.
     float offsetX = (sw - 800 * scale) / 2.0f;
     float offsetY = (sh - 600 * scale) / 2.0f;
 
+    // Collected client-area textured quads (drawn in a 2nd pass, per texture).
+    id<MTLTexture> clientTex[64];
+    int clientStart[64];
+    int nClient = 0;
+
     int titleIndex = 0;
     for (int i = 0; i < wm->count && vertCount < 7000; i++) {
         WGWin32Window *w = &wm->windows[i];
@@ -212,6 +245,24 @@ static float toNDCy(float py, float screenH) { return 1.0f - (py / screenH) * 2.
 
         // Window body — light gray like Windows
         addQuad(verts, &vertCount, x1, y1, x2, y2, 0.94f, 0.94f, 0.94f, 0.98f);
+
+        // Client-area framebuffer (GDI output), drawn below the title bar.
+        if (w->client && nClient < 64) {
+            id<MTLTexture> ctex = [self clientTextureFor:w];
+            if (ctex) {
+                float tbh = (w->parent == 0) ? 32.0f * scale : 0.0f;
+                float cx1 = toNDCx(wx, sw);
+                float cy1 = toNDCy(wy + tbh, sh);
+                float cx2 = toNDCx(wx + ww, sw);
+                float cy2 = toNDCy(wy + wh, sh);
+                clientStart[nClient] = vertCount;
+                clientTex[nClient] = ctex;
+                addTexturedQuad(verts, &vertCount, cx1, cy1, cx2, cy2,
+                                0.002f, 0.002f, 0.999f, 0.999f,
+                                1.0f, 1.0f, 1.0f, 1.0f);
+                nClient++;
+            }
+        }
 
         // Title bar for top-level windows
         if (w->parent == 0) {
@@ -266,7 +317,20 @@ static float toNDCy(float py, float screenH) { return 1.0f - (py / screenH) * 2.
     [enc setRenderPipelineState:_pipeline];
     [enc setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
     [enc setFragmentTexture:_textTexture atIndex:0];
+    // First pass: chrome (bodies, title bars, close buttons, shadows) +
+    // title text. Client quads are also in the buffer but we skip them here
+    // by drawing only up to the first client quad's start... simpler: draw
+    // everything with the text texture, then redraw client quads with their
+    // own textures on top (client quads sit below title bars, no overlap).
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertCount];
+
+    // Second pass: each window's client framebuffer with its own texture.
+    for (int c = 0; c < nClient; c++) {
+        [enc setFragmentTexture:clientTex[c] atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:clientStart[c]
+                vertexCount:6];
+    }
 
     [enc endEncoding];
     [cmd presentDrawable:drawable];

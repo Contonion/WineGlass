@@ -1,6 +1,7 @@
 #include "wg_win32_windows.h"
 #include "wg_log.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define TAG "WM"
 
@@ -101,8 +102,30 @@ void wg_wm_destroy(uint32_t hwnd) {
     if (w) {
         w->alive = false;
         w->visible = false;
+        if (w->client) { free(w->client); w->client = NULL; }
         wg_wm_get()->dirty = true;
     }
+}
+
+uint32_t *wg_wm_get_client(uint32_t hwnd, int32_t *out_w, int32_t *out_h) {
+    WGWin32Window *w = wg_wm_find(hwnd);
+    if (!w) return NULL;
+    if (!w->client) {
+        int32_t cw = w->w;
+        int32_t ch = w->h - (w->parent == 0 ? WG_TITLEBAR_H : 0);
+        if (cw < 1) cw = 1;
+        if (ch < 1) ch = 1;
+        w->client = (uint32_t *)malloc((size_t)cw * ch * 4);
+        if (!w->client) return NULL;
+        // Default window background: light gray (Windows COLOR_WINDOW-ish).
+        for (int32_t i = 0; i < cw * ch; i++) w->client[i] = 0xFFF0F0F0u;
+        w->client_w = cw;
+        w->client_h = ch;
+        w->client_dirty = true;
+    }
+    if (out_w) *out_w = w->client_w;
+    if (out_h) *out_h = w->client_h;
+    return w->client;
 }
 
 void wg_wm_set_text(uint32_t hwnd, const uint16_t *text) {

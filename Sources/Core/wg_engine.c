@@ -8,6 +8,7 @@
 #include "wg_blink_bridge.h"
 #include "wg_win32_windows.h"
 #include "wg_win32_files.h"
+#include "wg_win32_gdi.h"
 #include "wg_nsis_extract.h"
 #include <stdlib.h>
 #include <string.h>
@@ -213,6 +214,66 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 wg_blink_write_mem(engine->blink, args[1], rect, 16);
             }
+            ret_val = 1;
+        } else if (strcmp(fn, "GetDC") == 0 || strcmp(fn, "BeginPaint") == 0) {
+            uint32_t dc = wg_gdi_get_dc(args[0]);
+            // BeginPaint: fill PAINTSTRUCT.hdc (offset 0) if provided
+            if (strcmp(fn, "BeginPaint") == 0 && args[1]) {
+                wg_blink_write_mem(engine->blink, args[1], &dc, 4);
+            }
+            ret_val = dc;
+        } else if (strcmp(fn, "ReleaseDC") == 0) {
+            wg_gdi_release_dc(args[1]);
+            ret_val = 1;
+        } else if (strcmp(fn, "CreateSolidBrush") == 0) {
+            ret_val = wg_gdi_create_solid_brush(args[0]);
+        } else if (strcmp(fn, "SetTextColor") == 0) {
+            wg_gdi_set_text_color(args[0], args[1]);
+            ret_val = 0;
+        } else if (strcmp(fn, "SetBkColor") == 0) {
+            wg_gdi_set_bk_color(args[0], args[1]);
+            ret_val = 0;
+        } else if (strcmp(fn, "SetBkMode") == 0) {
+            wg_gdi_set_bk_mode(args[0], (int)args[1]);
+            ret_val = 1;
+        } else if (strcmp(fn, "FillRect") == 0) {
+            int32_t rc[4] = {0,0,0,0};
+            if (args[1]) wg_blink_read_mem(engine->blink, args[1], rc, 16);
+            bool found = false;
+            uint32_t color = wg_gdi_brush_color(args[2], &found);
+            // System color brushes (COLOR_WINDOW+1 etc.) come in as small ints
+            if (!found) color = 0x00FFFFFF; // default white
+            wg_gdi_fill_rect(args[0], rc[0], rc[1], rc[2], rc[3], color);
+            ret_val = 1;
+        } else if (strcmp(fn, "TextOutW") == 0) {
+            int count = (int)args[4];
+            if (count < 0) count = 0;
+            if (count > 1024) count = 1024;
+            uint16_t buf[1025];
+            if (args[3] && count > 0)
+                wg_blink_read_mem(engine->blink, args[3], buf, count * 2);
+            wg_gdi_text_out(args[0], (int)args[1], (int)args[2], buf, count);
+            ret_val = 1;
+        } else if (strcmp(fn, "MoveToEx") == 0) {
+            wg_gdi_move_to(args[0], (int)args[1], (int)args[2]);
+            ret_val = 1;
+        } else if (strcmp(fn, "LineTo") == 0) {
+            wg_gdi_line_to(args[0], (int)args[1], (int)args[2]);
+            ret_val = 1;
+        } else if (strcmp(fn, "DefWindowProcW") == 0 ||
+                   strcmp(fn, "TranslateMessage") == 0 ||
+                   strcmp(fn, "DispatchMessageW") == 0) {
+            ret_val = 0;
+        } else if (strcmp(fn, "GetMessageW") == 0) {
+            // Blocking message pump. Zero the MSG (WM_NULL) so the guest's
+            // Translate/Dispatch are benign, return 1 to keep the loop alive,
+            // and pause so the window stays on screen for the user.
+            if (args[0]) {
+                uint8_t zero[28] = {0};
+                wg_blink_write_mem(engine->blink, args[0], zero, 28);
+            }
+            engine->state = WG_ENGINE_PAUSED;
+            WG_LOGI(TAG, "GetMessageW — window up, pausing for UI");
             ret_val = 1;
         } else if (strcmp(fn, "ExitProcess") == 0) {
             WG_LOGI(TAG, "ExitProcess(%u) called", args[0]);

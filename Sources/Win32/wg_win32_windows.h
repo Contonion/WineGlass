@@ -19,7 +19,14 @@ typedef struct {
     uint32_t parent;        // parent HWND or 0
     uint32_t class_atom;
     bool     needs_paint;
+    uint32_t wndproc;       // guest WndProc address (from RegisterClassW)
+    // Client-area framebuffer (RGBA8, w*h), lazily allocated by GDI.
+    uint32_t *client;
+    int32_t  client_w, client_h;
+    bool     client_dirty;
 } WGWin32Window;
+
+#define WG_TITLEBAR_H 32
 
 typedef struct {
     WGWin32Window windows[WG_MAX_WINDOWS];
@@ -41,5 +48,10 @@ void     wg_wm_show(uint32_t hwnd, int cmd);
 void     wg_wm_destroy(uint32_t hwnd);
 void     wg_wm_set_text(uint32_t hwnd, const uint16_t *text);
 int      wg_wm_visible_count(void);
+
+// Lazily allocate and return the client-area RGBA8 framebuffer for a window.
+// Client size excludes the title bar for top-level windows. Returns NULL on
+// failure. *out_w / *out_h receive the client dimensions.
+uint32_t *wg_wm_get_client(uint32_t hwnd, int32_t *out_w, int32_t *out_h);
 
 #endif
