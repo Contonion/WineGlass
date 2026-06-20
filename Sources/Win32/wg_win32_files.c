@@ -78,20 +78,18 @@ const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
 uint32_t wg_files_create(const char *real_path, uint32_t access, uint32_t creation) {
     if (!real_path || !real_path[0]) return 0xFFFFFFFF;
 
-    // Determine open mode from creation disposition
-    // CREATE_ALWAYS=2, OPEN_EXISTING=3, OPEN_ALWAYS=4, TRUNCATE_EXISTING=5
+    // Determine open mode from creation disposition and access
     const char *mode;
-    switch (creation) {
-        case 2: mode = "wb+"; break;  // CREATE_ALWAYS
-        case 3: mode = "rb";  break;  // OPEN_EXISTING
-        case 4: mode = "ab+"; break;  // OPEN_ALWAYS
-        case 5: mode = "wb";  break;  // TRUNCATE_EXISTING
-        default: mode = "rb"; break;
-    }
+    bool wants_write = (access & 0x40000000) != 0; // GENERIC_WRITE
+    bool wants_read = (access & 0x80000000) != 0;  // GENERIC_READ
 
-    // If access includes write (0x40000000 = GENERIC_WRITE)
-    if ((access & 0x40000000) && creation == 3) {
-        mode = "rb+";
+    switch (creation) {
+        case 1: mode = wants_write ? "wb+" : "rb"; break; // CREATE_NEW
+        case 2: mode = "wb+"; break;                       // CREATE_ALWAYS
+        case 3: mode = wants_write ? "rb+" : "rb"; break;  // OPEN_EXISTING
+        case 4: mode = wants_write ? "ab+" : "rb"; break;  // OPEN_ALWAYS
+        case 5: mode = "wb"; break;                         // TRUNCATE_EXISTING
+        default: mode = wants_write ? "wb+" : "rb"; break;
     }
 
     FILE *fp = fopen(real_path, mode);

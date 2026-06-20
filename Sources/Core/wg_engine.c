@@ -23,6 +23,8 @@ typedef enum {
 } WGBackend;
 
 static uint32_t s_last_error = 0;
+static bool s_nsis_data_patched = false;
+static uint32_t s_nsis_exe_data_offset = 0; // exe position where raw data copy starts
 
 struct WGEngine {
     WGEngineState   state;
@@ -131,7 +133,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             "GetTickCount", "CharNextW", "CharNextA",
             "CharPrevW", "lstrcpynW", "lstrlenW", "lstrcatW",
             "lstrcmpiW", "GlobalAlloc", "GlobalFree",
-            "ReadFile", "SetFilePointer", "WriteFile",
+            "ReadFile", "WriteFile",
             "PeekMessageW", "lstrlenA", NULL
         };
         bool quiet = false;
@@ -669,26 +671,34 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGI(TAG, "GetFileSize(0x%X) -> %u", args[0], (uint32_t)ret_val);
         } else if (strcmp(fn, "SetFilePointer") == 0) {
             // Detect when NSIS finishes its truncated copy and patch the .tmp
-            static bool nsis_data_patched = false;
-            if (!nsis_data_patched && args[3] == 0 && (int32_t)args[1] == 4) {
-                // Seeking to position 4 (past magic number) — this is when
-                // NSIS starts reading data blocks from the .tmp after copying
+            // Track seeks on the EXE file (not .tmp) to find raw data offset.
+            // Only consider seeks on files larger than 1MB (that's the .exe).
+            if (!s_nsis_data_patched && args[3] == 0 &&
+                (int32_t)args[1] > 100000 && (int32_t)args[1] < 2000000) {
+                uint32_t file_size = wg_files_get_size(args[0]);
+                if (file_size > 1000000) {
+                    // This is the exe — track the last seek position
+                    s_nsis_exe_data_offset = (uint32_t)args[1];
+                }
+            }
+
+            if (!s_nsis_data_patched && s_nsis_exe_data_offset > 0) {
                 uint32_t current_size = wg_files_get_size(args[0]);
                 if (current_size > 200000 && current_size < 500000) {
-                    // This looks like the truncated .tmp data file
-                    // Append the missing data from the .exe
+                    WG_LOGI(TAG, "Patching .tmp: handle=0x%X, size=%u, exe_data_off=%u",
+                            args[0], current_size, s_nsis_exe_data_offset);
                     const char *exe_real = wg_files_map_path(0, engine->blink,
                         (char*)"C:\\a.exe", 260);
                     if (exe_real) {
                         FILE *exe_fp = fopen(exe_real, "rb");
                         if (exe_fp) {
-                            // Find NullsoftInst to get correct offsets
                             fseek(exe_fp, 0, SEEK_END);
                             long exe_size = ftell(exe_fp);
                             fseek(exe_fp, 0, SEEK_SET);
                             uint8_t *exe_data = malloc(exe_size);
                             if (exe_data) {
                                 fread(exe_data, 1, exe_size, exe_fp);
+                                // Find the end of NSIS data (NullsoftInst + archive_size)
                                 long nsi = -1;
                                 for (long i = 0; i < exe_size - 16; i++) {
                                     if (memcmp(exe_data + i, "NullsoftInst", 12) == 0) {
@@ -696,23 +706,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                                     }
                                 }
                                 if (nsi >= 0) {
-                                    uint32_t hdr_len, arc_size;
-                                    memcpy(&hdr_len, exe_data + nsi + 12, 4);
+                                    uint32_t arc_size;
                                     memcpy(&arc_size, exe_data + nsi + 16, 4);
                                     long data_start = nsi + 20;
-                                    // The .tmp should have arc_size - hdr_len bytes
-                                    // but only has current_size. Append the rest.
-                                    long expected = arc_size - hdr_len;
-                                    if ((long)current_size < expected) {
-                                        long src_offset = data_start + hdr_len + current_size;
-                                        long append_size = expected - current_size;
-                                        if (src_offset + append_size <= exe_size) {
-                                            wg_files_set_pointer(args[0], 0, 2); // seek to end
+                                    // Raw data starts at s_nsis_exe_data_offset in the exe
+                                    // NSIS copied current_size bytes from that position
+                                    // Total raw data: from exe_data_offset to data_start + arc_size
+                                    long total_raw = (data_start + arc_size) - s_nsis_exe_data_offset;
+                                    if ((long)current_size < total_raw) {
+                                        long src_offset = s_nsis_exe_data_offset + current_size;
+                                        long append_size = total_raw - current_size;
+                                        if (src_offset + append_size <= exe_size && append_size > 0) {
+                                            wg_files_set_pointer(args[0], 0, 2);
                                             uint32_t written = 0;
                                             wg_files_write(args[0], exe_data + src_offset, (uint32_t)append_size, &written);
-                                            WG_LOGI(TAG, "Patched .tmp: appended %u bytes (was %u, now %u)",
-                                                    written, current_size, current_size + written);
-                                            nsis_data_patched = true;
+                                            WG_LOGI(TAG, "Patched .tmp: appended %u bytes (was %u, now %u, from exe@%ld)",
+                                                    written, current_size, current_size + written, src_offset);
+                                            s_nsis_data_patched = true;
                                         }
                                     }
                                 }
@@ -732,18 +742,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 for (int i = 0; i < 259 && wpath[i]; i++)
                     apath[i] = wpath[i] < 128 ? (char)wpath[i] : '_';
             }
+
             const char *real = wg_files_map_path(args[0], engine->blink, apath, sizeof(apath));
             if (real) {
                 struct stat st;
                 if (stat(real, &st) == 0) {
-                    if (S_ISDIR(st.st_mode)) {
-                        ret_val = 0x10; // FILE_ATTRIBUTE_DIRECTORY
-                    } else {
-                        ret_val = 0x80; // FILE_ATTRIBUTE_NORMAL
-                    }
+                    ret_val = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
                 } else {
                     ret_val = 0xFFFFFFFF;
-                    s_last_error = 2; // ERROR_FILE_NOT_FOUND
+                    s_last_error = 2;
                 }
             } else {
                 ret_val = 0xFFFFFFFF;
@@ -875,6 +882,8 @@ static bool load_pe_blink(WGEngine *engine) {
     }
 
     WG_LOGI(TAG, "Loading %s PE via blink", pe->is_64bit ? "64-bit" : "32-bit");
+    s_nsis_data_patched = false;
+    s_nsis_exe_data_offset = 0;
 
     for (int i = 0; i < pe->num_sections; i++) {
         WGPESection *sec = &pe->sections[i];
