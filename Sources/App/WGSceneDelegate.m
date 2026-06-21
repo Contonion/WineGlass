@@ -189,6 +189,22 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 
     WG_LOGI("App", "Loading PE: %s", path.lastPathComponent.UTF8String);
 
+    // Wipe stale NSIS temp leftovers (ns*.tmp files and dirs) so installers
+    // always get fresh plug-in directories — a stale dir makes NSIS bail with
+    // "Can't initialize plug-ins directory".
+    {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = paths.firstObject;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *f in [fm contentsOfDirectoryAtPath:docs error:nil]) {
+            if (([f hasPrefix:@"ns"] && [f.pathExtension.lowercaseString isEqualToString:@"tmp"]) ||
+                [f.pathExtension.lowercaseString isEqualToString:@"tmp"]) {
+                [fm removeItemAtPath:[docs stringByAppendingPathComponent:f] error:nil];
+            }
+        }
+        WG_LOGI("App", "Cleaned stale temp files");
+    }
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         bool ok = wg_engine_load_pe(self->_engine, path.UTF8String);
         dispatch_async(dispatch_get_main_queue(), ^{
