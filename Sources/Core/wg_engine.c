@@ -743,9 +743,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (nbytes > 0x100000) nbytes = 0x100000;
             uint32_t pos_before = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
             uint8_t *tmpbuf = malloc(nbytes);
-            uint32_t first4 = 0;
+            uint32_t first4 = 0, nread = 0;
             if (tmpbuf) {
-                uint32_t nread = 0;
                 if (wg_files_read(handle, tmpbuf, nbytes, &nread)) {
                     wg_blink_write_mem(engine->blink, buf_addr, tmpbuf, nread);
                     if (bytes_read_addr) {
@@ -756,11 +755,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 free(tmpbuf);
             }
-            // Only log small "control" reads (size fields etc.) — the bulk
-            // decompression reads are large and would flood the log.
-            if (nbytes <= 64) {
-                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%u, n=%u) -> first4=0x%08X",
-                        handle, pos_before, nbytes, first4);
+            // Log small control reads always, and ANY short read (nread <
+            // nbytes) — a short read on the .exe would starve the decoder.
+            if (nbytes <= 64 || nread < nbytes) {
+                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%u, n=%u) -> nread=%u first4=0x%08X",
+                        handle, pos_before, nbytes, nread, first4);
             }
         } else if (strcmp(fn, "WriteFile") == 0) {
             uint32_t handle = args[0];
