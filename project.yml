@@ -27,6 +27,7 @@ targets:
           - $(SRCROOT)/Sources/CPU
           - $(SRCROOT)/Sources/Memory
           - $(SRCROOT)/Sources/Win32
+          - $(SRCROOT)/Sources/LZMA
           - $(SRCROOT)/Sources/Graphics
           - $(SRCROOT)/Sources/App
           - $(SRCROOT)/Vendor/blink/include

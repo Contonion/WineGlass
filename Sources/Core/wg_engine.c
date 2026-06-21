@@ -729,12 +729,30 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0xFFFFFFFF;
             }
             WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
-            // NOTE: NSIS uses a solid raw-LZMA stream that blink's x86
-            // decompressor decodes correctly (the dialog/strings/fonts all
-            // come from the decompressed header). We deliberately do NOT
-            // intercept extraction here — Apple's COMPRESSION_LZMA can't read
-            // NSIS's raw stream, and intercepting only discards blink's
-            // correct output. Let the guest do the decompression.
+
+            // NSIS decompresses its whole data section (one solid raw-LZMA
+            // stream) into a temp file, then reads each packed file from it by
+            // offset. blink's in-guest decode of that stream truncates, so when
+            // NSIS creates that data temp file (the first ns*.tmp opened
+            // CREATE_ALWAYS that is NOT inside a plugin dir), we pre-fill it
+            // with the correct full decompression done natively (LzmaDec), and
+            // then ignore the guest's own (truncated) writes to it.
+            if (ret_val != 0xFFFFFFFF && real &&
+                s_nsis_data_tmp_handle == 0 && args[4] == 2 /* CREATE_ALWAYS */ &&
+                strstr(apath, ".tmp") &&
+                !strstr(apath, ".tmp\\") && !strstr(apath, ".tmp/")) {
+                const char *exe_real = wg_files_map_path(0, engine->blink,
+                                                         (char *)"C:\\a.exe", 260);
+                if (exe_real && wg_nsis_prefill_datatmp(exe_real, real)) {
+                    s_nsis_data_tmp_handle = (uint32_t)ret_val;
+                    strncpy(s_nsis_data_tmp_path, real, sizeof(s_nsis_data_tmp_path) - 1);
+                    // Reset the guest handle to offset 0 so the guest's reads
+                    // (and ignored writes) line up; our data is already on disk.
+                    wg_files_set_pointer((uint32_t)ret_val, 0, 0);
+                    WG_LOGI(TAG, "NSIS data tmp pre-filled (handle=0x%X)",
+                            s_nsis_data_tmp_handle);
+                }
+            }
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
@@ -767,6 +785,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t nbytes = args[2];
             uint32_t bytes_written_addr = args[3];
             if (nbytes > 0x100000) nbytes = 0x100000;
+            // Ignore writes to the pre-filled NSIS data tmp — our native
+            // decompression already put the correct full data there; the
+            // guest's own (truncated) decode would corrupt it.
+            if (handle == s_nsis_data_tmp_handle && s_nsis_data_tmp_handle != 0) {
+                if (bytes_written_addr)
+                    wg_blink_write_mem(engine->blink, bytes_written_addr, &nbytes, 4);
+                ret_val = 1;
+                goto wf_done;
+            }
             uint8_t *tmpbuf = malloc(nbytes);
             if (tmpbuf) {
                 wg_blink_read_mem(engine->blink, buf_addr, tmpbuf, nbytes);
@@ -782,6 +809,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 free(tmpbuf);
             }
+            wf_done:;
         } else if (strcmp(fn, "GetFileSize") == 0) {
             ret_val = wg_files_get_size(args[0]);
             WG_LOGI(TAG, "GetFileSize(0x%X) -> %u", args[0], (uint32_t)ret_val);
@@ -1129,6 +1157,8 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_heap_ptr = WG_GUEST_HEAP_BASE;
     s_nsis_data_patched = false;
     s_last_error = 0;
+    s_nsis_data_tmp_handle = 0;
+    s_nsis_data_tmp_path[0] = 0;
 
     // Set the exe path for file I/O mapping
     wg_files_set_exe_path(path);

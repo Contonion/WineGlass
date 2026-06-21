@@ -4,19 +4,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Native NSIS file extraction using Apple's Compression framework.
-// Bypasses the x86 LZMA decompressor which has accuracy issues in
-// blink's 32-bit compatibility mode.
+// Native NSIS decompression using the LZMA SDK decoder (LzmaDec.c).
+//
+// SteamSetup-style NSIS installers decompress their entire data section (one
+// solid raw-LZMA stream) into a temp file, then read each packed file from it
+// by decompressed offset. blink's in-guest decode of that stream is unreliable
+// (truncates), so we decompress it natively and pre-fill the temp file with the
+// correct full data — NSIS then reads every file correctly.
 
-// Extract a file from the NSIS data .tmp at the given offset.
-// Returns true if extraction succeeded.
-// Decompress the entire NSIS outer LZMA stream from the .exe
-// and write the decompressed file data to the .tmp file.
-bool wg_nsis_decompress_outer_stream(const char *exe_path,
-                                      const char *tmp_path);
-
-bool wg_nsis_extract_file(const char *data_tmp_path,
-                           uint32_t data_offset,
-                           const char *output_path);
+// Find the NSIS data section in exe_path, decompress the whole solid LZMA
+// stream, and write the resulting bytes to out_path. Returns true on success.
+bool wg_nsis_prefill_datatmp(const char *exe_path, const char *out_path);
 
 #endif
