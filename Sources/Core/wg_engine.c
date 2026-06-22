@@ -350,6 +350,40 @@ static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
     if (w) w->client_dirty = true;
 }
 
+// ---- Synchronous SendMessage / wndproc dispatch ----
+// SendMessage must call the target window's procedure and return its result.
+// We do this by jumping into the wndproc with a dedicated sentinel return; when
+// it returns, the sentinel restores the SendMessage caller with the result. A
+// small stack handles nested SendMessages (NSIS nests them heavily).
+#define WG_SENDMSG_SENTINEL 0xC10010u
+typedef struct { uint32_t ret_addr, ret_rsp; } WGPendingCall;
+static WGPendingCall s_callstack[64];
+static int           s_callstack_depth = 0;
+
+static uint32_t wg_resolve_wndproc(uint32_t hwnd) {
+    if (hwnd == s_dlg_hwnd && s_dlg_proc) return s_dlg_proc;
+    WGWin32Window *w = wg_wm_find(hwnd);
+    return (w && w->wndproc) ? w->wndproc : 0;
+}
+
+// Set up a nested call proc(hwnd, msg, wParam, lParam) returning to the given
+// caller (ret_addr/clean_rsp) with the proc's EAX. Returns true if armed.
+static bool wg_call_wndproc(WGEngine *engine, uint32_t proc, uint32_t hwnd,
+                            uint32_t msg, uint32_t wp, uint32_t lp,
+                            uint32_t ret_addr, uint32_t clean_rsp) {
+    if (!proc || s_callstack_depth >= 64) return false;
+    s_callstack[s_callstack_depth].ret_addr = ret_addr;
+    s_callstack[s_callstack_depth].ret_rsp  = clean_rsp;
+    s_callstack_depth++;
+    uint32_t new_rsp = clean_rsp - 20;
+    uint32_t sd[5] = { WG_SENDMSG_SENTINEL, hwnd, msg, wp, lp };
+    wg_blink_write_mem(engine->blink, new_rsp, sd, 20);
+    wg_blink_set_reg(engine->blink, 4, new_rsp);
+    wg_blink_set_rip(engine->blink, proc);
+    wg_blink_set_reg(engine->blink, 0, 0);
+    return true;
+}
+
 // Check if RIP is in the thunk range and handle the Win32 API call.
 // Returns true if a thunk was handled.
 static bool handle_blink_thunk(WGEngine *engine) {
@@ -368,6 +402,21 @@ static bool handle_blink_thunk(WGEngine *engine) {
         if (s_dlg_active && s_dlg_hwnd) wg_render_dialog(engine, s_dlg_hwnd);
         engine->state = WG_ENGINE_PAUSED;
         WG_LOGI(TAG, "Dialog up (HWND=0x%X) — modal, waiting", s_dlg_hwnd);
+        return true;
+    }
+    // A SendMessage'd wndproc just returned — hand its result back to the
+    // SendMessage caller (and re-render in case the page content changed).
+    if (rip == WG_SENDMSG_SENTINEL) {
+        uint32_t result = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+        if (s_callstack_depth > 0) {
+            s_callstack_depth--;
+            wg_blink_set_reg(engine->blink, 4, s_callstack[s_callstack_depth].ret_rsp);
+            wg_blink_set_rip(engine->blink, s_callstack[s_callstack_depth].ret_addr);
+            wg_blink_set_reg(engine->blink, 0, result);
+            if (s_dlg_active && s_dlg_hwnd) wg_render_dialog(engine, s_dlg_hwnd);
+        } else {
+            wg_blink_set_rip(engine->blink, 0);
+        }
         return true;
     }
 
@@ -976,6 +1025,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (s_dlg_active) {
                 s_dlg_result = args[1];
                 s_dlg_active = false;
+                s_callstack_depth = 0;   // abandon any nested SendMessage frames
                 wg_blink_set_reg(engine->blink, 4, s_dlg_ret_rsp);
                 wg_blink_set_rip(engine->blink, s_dlg_ret_addr);
                 wg_blink_set_reg(engine->blink, 0, s_dlg_result);
@@ -996,15 +1046,39 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (s_dlg_active) wg_render_dialog(engine, c->hwnd);
             }
             ret_val = 1;
-        } else if (strcmp(fn, "SendMessageW") == 0) {
-            // Only STM_SETIMAGE (0x0172) matters for rendering: attach a bitmap
-            // to a static control so wg_render_dialog blits it.
-            if (args[1] == 0x0172) {
-                WGDlgCtrl *c = wg_ctrl_from_handle(args[0]);
-                if (c) { c->hbitmap = args[3]; c->is_bitmap = true;
-                         if (s_dlg_active) wg_render_dialog(engine, c->hwnd); }
+        } else if (strcmp(fn, "SendMessageW") == 0 ||
+                   strcmp(fn, "SendDlgItemMessageW") == 0) {
+            // SendDlgItemMessageW(hDlg, id, msg, wParam, lParam): redirect to the
+            // child control's handle, then fall through to SendMessage logic.
+            uint32_t hwnd, msg, wParam, lParam;
+            if (strcmp(fn, "SendDlgItemMessageW") == 0) {
+                WGDlgCtrl *c = wg_find_ctrl(args[0], args[1]);
+                hwnd = c ? (WG_CTRL_HWND_BASE + (uint32_t)(c - s_ctrls)) : 0;
+                msg = args[2]; wParam = args[3]; lParam = args[4];
+            } else {
+                hwnd = args[0]; msg = args[1]; wParam = args[2]; lParam = args[3];
             }
-            ret_val = 0;
+            // STM_SETIMAGE on one of our synthetic static controls: attach the
+            // bitmap (these controls have no guest wndproc to dispatch to).
+            if (msg == 0x0172 /*STM_SETIMAGE*/ && wg_ctrl_from_handle(hwnd)) {
+                WGDlgCtrl *c = wg_ctrl_from_handle(hwnd);
+                c->hbitmap = lParam; c->is_bitmap = true;
+                if (s_dlg_active) wg_render_dialog(engine, c->hwnd);
+                ret_val = 0;
+            } else {
+                // Real dispatch: call the target window's procedure and return
+                // its result. This is what drives NSIS's page navigation
+                // (e.g. SendMessage(hDlg, 0x408, ...) = "show next page").
+                uint32_t proc = wg_resolve_wndproc(hwnd);
+                int nargs = (strcmp(fn, "SendDlgItemMessageW") == 0) ? 5 : 4;
+                uint64_t caller_clean = rsp + ptr_size + (nargs * ptr_size);
+                if (proc && is_32bit &&
+                    wg_call_wndproc(engine, proc, hwnd, msg, wParam, lParam,
+                                    (uint32_t)ret_addr, (uint32_t)caller_clean)) {
+                    return true;
+                }
+                ret_val = 0;
+            }
         } else if (strcmp(fn, "CreateDialogParamW") == 0) {
             // CreateDialogParamW(hInstance, lpTemplateName, hWndParent=args[2], ...)
             // The NSIS inner page goes into the IDD_INST inner-dialog placeholder
@@ -1024,6 +1098,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint16_t title[] = {0};
             ret_val = wg_wm_create_window(0, 0, title, 0x50000000, // WS_CHILD|WS_VISIBLE
                                            px, py, pw, ph, parent);
+            // Remember the page's dialog proc so SendMessage dispatches to it.
+            WGWin32Window *pw_win = wg_wm_find((uint32_t)ret_val);
+            if (pw_win) pw_win->wndproc = args[3];
         } else if (strcmp(fn, "GetLastError") == 0) {
             ret_val = s_last_error;
         } else if (strcmp(fn, "SetLastError") == 0) {
@@ -1616,7 +1693,9 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_nsis_last_data_seek = 0;
     s_dlg_active = false;
     s_dlg_hwnd = 0;
+    s_dlg_proc = 0;
     s_ctrl_count = 0;
+    s_callstack_depth = 0;
     wg_bitmap_reset_all();
 
     // Set the exe path for file I/O mapping
@@ -1788,6 +1867,34 @@ void wg_engine_dialog_command(WGEngine *engine, uint32_t ctrl_id) {
     wg_blink_set_reg(engine->blink, 0, 0);
     engine->state = WG_ENGINE_RUNNING;
     WG_LOGI(TAG, "Dialog command: WM_COMMAND id=%u -> dlgproc 0x%X", ctrl_id, s_dlg_proc);
+}
+
+// Hit-test a point (in the compositor's 800x600 virtual space) against the
+// modal dialog's buttons. Returns the button control id under the point (so the
+// caller can wg_engine_dialog_command it), or 0. Lets the user tap the actual
+// Back/Next/Cancel rendered in the window instead of native overlay buttons.
+uint32_t wg_engine_hit_test(WGEngine *engine, int virt_x, int virt_y) {
+    (void)engine;
+    if (!s_dlg_active || !s_dlg_hwnd) return 0;
+    WGWin32Window *w = wg_wm_find(s_dlg_hwnd);
+    if (!w) return 0;
+    int32_t cw = 0, ch = 0;
+    if (!wg_wm_get_client(s_dlg_hwnd, &cw, &ch)) return 0;
+    int tb = (w->parent == 0) ? WG_TITLEBAR_H : 0;
+    int cx = virt_x - w->x;
+    int cy = virt_y - (w->y + tb);            // into client coords
+    if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) return 0;
+    float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
+    float sy = s_dlg_cy ? (float)ch / s_dlg_cy : 1.0f;
+    for (int i = 0; i < s_ctrl_count; i++) {
+        WGDlgCtrl *c = &s_ctrls[i];
+        if (c->hwnd != s_dlg_hwnd || c->cls != 0x0080) continue;  // buttons only
+        if (!(c->style & 0x10000000u)) continue;                  // WS_VISIBLE
+        int px = (int)(c->x * sx), py = (int)(c->y * sy);
+        int pw = (int)(c->cx * sx), ph = (int)(c->cy * sy);
+        if (cx >= px && cx < px + pw && cy >= py && cy < py + ph) return c->id;
+    }
+    return 0;
 }
 
 void wg_engine_stop(WGEngine *engine) {

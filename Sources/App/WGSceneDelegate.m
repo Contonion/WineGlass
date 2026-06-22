@@ -18,8 +18,6 @@
     WGCompositor *_compositor;
     NSThread *_engineThread;          // runs the emulator at full speed
     volatile BOOL _engineThreadRunning;
-    UIButton *_nextButton;            // wizard Next/Install
-    UIButton *_cancelButton;          // wizard Cancel
 }
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
@@ -33,7 +31,7 @@
     [self createMetalResources];
     [self createConsole];
     [self createLoadButton];
-    [self createWizardButtons];
+    [self installTapHandler];
     [self.window makeKeyAndVisible];
 
     UIApplication.sharedApplication.idleTimerDisabled = YES;
@@ -106,46 +104,37 @@
     ]];
 }
 
-- (void)createWizardButtons {
-    _nextButton = [self makeWizardButton:@"Next ›"
-                                   color:[UIColor colorWithRed:0.2 green:0.7 blue:0.3 alpha:0.95]
-                                  action:@selector(wizardNext)];
-    _cancelButton = [self makeWizardButton:@"Cancel"
-                                     color:[UIColor colorWithRed:0.5 green:0.5 blue:0.55 alpha:0.95]
-                                    action:@selector(wizardCancel)];
-    [NSLayoutConstraint activateConstraints:@[
-        [_nextButton.bottomAnchor constraintEqualToAnchor:self.metalView.safeAreaLayoutGuide.bottomAnchor constant:-16],
-        [_nextButton.trailingAnchor constraintEqualToAnchor:self.metalView.trailingAnchor constant:-16],
-        [_nextButton.heightAnchor constraintEqualToConstant:48],
-        [_nextButton.widthAnchor constraintEqualToConstant:120],
-        [_cancelButton.bottomAnchor constraintEqualToAnchor:_nextButton.bottomAnchor],
-        [_cancelButton.trailingAnchor constraintEqualToAnchor:_nextButton.leadingAnchor constant:-12],
-        [_cancelButton.heightAnchor constraintEqualToConstant:48],
-        [_cancelButton.widthAnchor constraintEqualToConstant:120],
-    ]];
-    _nextButton.hidden = YES;
-    _cancelButton.hidden = YES;
+// Tap the rendered wizard window: map the touch into the compositor's virtual
+// space, hit-test the dialog's buttons, and deliver the click to NSIS.
+- (void)installTapHandler {
+    UITapGestureRecognizer *tap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
+    [self.metalView addGestureRecognizer:tap];
 }
 
-- (UIButton *)makeWizardButton:(NSString *)title color:(UIColor *)color action:(SEL)action {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    b.backgroundColor = color;
-    b.layer.cornerRadius = 10;
-    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [self.metalView addSubview:b];
-    return b;
-}
+- (void)handleTap:(UITapGestureRecognizer *)g {
+    if (!_engine || !wg_engine_dialog_active(_engine)) return;
 
-- (void)wizardNext {
-    if (_engine) wg_engine_dialog_command(_engine, 1);   // IDOK / Next / Install
-}
+    CGPoint p = [g locationInView:self.metalView];
+    CGSize ds = self.metalView.metalLayer.drawableSize;   // pixels
+    CGSize bs = self.metalView.bounds.size;               // points
+    if (bs.width <= 0 || bs.height <= 0) return;
 
-- (void)wizardCancel {
-    if (_engine) wg_engine_dialog_command(_engine, 2);   // IDCANCEL
+    // points -> drawable pixels, then invert the compositor's fit-into-800x600.
+    float spx = p.x * (ds.width  / bs.width);
+    float spy = p.y * (ds.height / bs.height);
+    float sw = ds.width, sh = ds.height;
+    float scale = fminf(sw / 800.0f, sh / 600.0f);
+    float offX = (sw - 800.0f * scale) / 2.0f;
+    float offY = (sh - 600.0f * scale) / 2.0f;
+    int vx = (int)((spx - offX) / scale);
+    int vy = (int)((spy - offY) / scale);
+
+    uint32_t id = wg_engine_hit_test(_engine, vx, vy);
+    if (id) {
+        WG_LOGI("App", "tap (%d,%d) -> wizard button id %u", vx, vy, id);
+        wg_engine_dialog_command(_engine, id);
+    }
 }
 
 - (void)resumeEngine {
@@ -340,15 +329,8 @@
         id<CAMetalDrawable> drawable = [self.metalView.metalLayer nextDrawable];
         if (!drawable) return;
 
-        // The engine runs on its own thread now; the render loop only
-        // composites and toggles the wizard buttons when a modal dialog waits.
-        BOOL wizard = (_engine &&
-                       wg_engine_get_state(_engine) == WG_ENGINE_PAUSED &&
-                       wg_engine_dialog_active(_engine));
-        if (_nextButton.hidden != !wizard) {
-            _nextButton.hidden = !wizard;
-            _cancelButton.hidden = !wizard;
-        }
+        // The engine runs on its own thread; the render loop only composites.
+        // Wizard input is via tapping the rendered buttons (see handleTap:).
 
         // If there are visible Win32 windows, render them via compositor
         if (wg_wm_visible_count() > 0) {

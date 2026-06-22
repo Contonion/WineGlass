@@ -35,6 +35,10 @@ void wg_engine_resume(WGEngine *engine);
 bool wg_engine_dialog_active(WGEngine *engine);
 void wg_engine_dialog_command(WGEngine *engine, uint32_t ctrl_id);
 
+// Hit-test a point in the compositor's 800x600 virtual space; returns the modal
+// dialog button id under it (Back/Next/Cancel) or 0. Tap rendered wizard buttons.
+uint32_t wg_engine_hit_test(WGEngine *engine, int virt_x, int virt_y);
+
 WGEngineState wg_engine_get_state(const WGEngine *engine);
 WGEngineState wg_engine_run_sync(WGEngine *engine, int max_ticks);
 

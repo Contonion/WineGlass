@@ -233,8 +233,18 @@ static float toNDCy(float py, float screenH) { return 1.0f - (py / screenH) * 2.
         WGWin32Window *w = &wm->windows[i];
         if (!w->alive || !w->visible) continue;
 
-        float wx = offsetX + w->x * scale;
-        float wy = offsetY + w->y * scale;
+        // Child windows (e.g. the inner wizard page) are positioned relative to
+        // their parent's client area — nest them inside the parent instead of
+        // drawing them at absolute coordinates (which made them float as a
+        // separate offset box).
+        int absX = w->x, absY = w->y;
+        if (w->parent != 0) {
+            WGWin32Window *p = wg_wm_find(w->parent);
+            if (p) { absX += p->x; absY += p->y + 32 /*title bar*/; }
+        }
+
+        float wx = offsetX + absX * scale;
+        float wy = offsetY + absY * scale;
         float ww = w->w * scale;
         float wh = w->h * scale;
 

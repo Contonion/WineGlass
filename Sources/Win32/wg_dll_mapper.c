@@ -344,6 +344,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("USER32.dll", EnableWindow, 2);
     R1S("USER32.dll", InvalidateRect, 3);
     RS("USER32.dll", SendMessageW, 4);
+    RS("USER32.dll", SendDlgItemMessageW, 5);
     RS("USER32.dll", DefWindowProcW, 4);
     R1S("USER32.dll", BeginPaint, 2);
     R1S("USER32.dll", GetClientRect, 2);
