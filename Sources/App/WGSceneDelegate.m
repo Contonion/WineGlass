@@ -7,17 +7,7 @@
 #include "wg_selftest.h"
 #import "WGCompositor.h"
 #include "wg_win32_windows.h"
-
-static WGConsoleOverlay *s_consoleRef = nil;
-
-static void logCallback(WGLogLevel level, const char *tag, const char *message, void *userdata) {
-    NSString *msg = [NSString stringWithUTF8String:message];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (s_consoleRef) {
-            [s_consoleRef appendLog:msg level:level];
-        }
-    });
-}
+#include <unistd.h>
 
 @implementation WGSceneDelegate {
     CADisplayLink *_displayLink;
@@ -26,6 +16,10 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
     WGEngine *_engine;
     UIButton *_loadButton;
     WGCompositor *_compositor;
+    NSThread *_engineThread;          // runs the emulator at full speed
+    volatile BOOL _engineThreadRunning;
+    UIButton *_nextButton;            // wizard Next/Install
+    UIButton *_cancelButton;          // wizard Cancel
 }
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
@@ -39,6 +33,7 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
     [self createMetalResources];
     [self createConsole];
     [self createLoadButton];
+    [self createWizardButtons];
     [self.window makeKeyAndVisible];
 
     UIApplication.sharedApplication.idleTimerDisabled = YES;
@@ -86,19 +81,10 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 }
 
 - (void)createConsole {
-    CGRect bounds = self.metalView.bounds;
-    CGFloat consoleHeight = bounds.size.height * 0.55;
-    CGRect consoleFrame = CGRectMake(8, bounds.size.height - consoleHeight - 8,
-                                     bounds.size.width - 16, consoleHeight);
-    self.console = [[WGConsoleOverlay alloc] initWithFrame:consoleFrame];
-    self.console.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    [self.metalView addSubview:self.console];
-
-    s_consoleRef = self.console;
-    wg_log_set_callback(logCallback, NULL);
-
-    WG_LOGI("App", "WineGlass Translation Engine for iOS");
-    WG_LOGI("App", "Console overlay initialized");
+    // On-screen log overlay disabled: logs still go to stderr (visible in the
+    // Xcode/device console on the computer), and skipping the per-line
+    // main-queue dispatch keeps the UI thread free for rendering.
+    WG_LOGI("App", "WineGlass Translation Engine for iOS (logs -> console)");
 }
 
 - (void)createLoadButton {
@@ -120,14 +106,50 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
     ]];
 }
 
+- (void)createWizardButtons {
+    _nextButton = [self makeWizardButton:@"Next ›"
+                                   color:[UIColor colorWithRed:0.2 green:0.7 blue:0.3 alpha:0.95]
+                                  action:@selector(wizardNext)];
+    _cancelButton = [self makeWizardButton:@"Cancel"
+                                     color:[UIColor colorWithRed:0.5 green:0.5 blue:0.55 alpha:0.95]
+                                    action:@selector(wizardCancel)];
+    [NSLayoutConstraint activateConstraints:@[
+        [_nextButton.bottomAnchor constraintEqualToAnchor:self.metalView.safeAreaLayoutGuide.bottomAnchor constant:-16],
+        [_nextButton.trailingAnchor constraintEqualToAnchor:self.metalView.trailingAnchor constant:-16],
+        [_nextButton.heightAnchor constraintEqualToConstant:48],
+        [_nextButton.widthAnchor constraintEqualToConstant:120],
+        [_cancelButton.bottomAnchor constraintEqualToAnchor:_nextButton.bottomAnchor],
+        [_cancelButton.trailingAnchor constraintEqualToAnchor:_nextButton.leadingAnchor constant:-12],
+        [_cancelButton.heightAnchor constraintEqualToConstant:48],
+        [_cancelButton.widthAnchor constraintEqualToConstant:120],
+    ]];
+    _nextButton.hidden = YES;
+    _cancelButton.hidden = YES;
+}
+
+- (UIButton *)makeWizardButton:(NSString *)title color:(UIColor *)color action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.backgroundColor = color;
+    b.layer.cornerRadius = 10;
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [self.metalView addSubview:b];
+    return b;
+}
+
+- (void)wizardNext {
+    if (_engine) wg_engine_dialog_command(_engine, 1);   // IDOK / Next / Install
+}
+
+- (void)wizardCancel {
+    if (_engine) wg_engine_dialog_command(_engine, 2);   // IDCANCEL
+}
+
 - (void)resumeEngine {
-    if (_engine) {
-        wg_engine_resume(_engine);
-        [_loadButton setTitle:@"  Load .exe  " forState:UIControlStateNormal];
-        _loadButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.5 blue:1.0 alpha:0.9];
-        [_loadButton removeTarget:self action:@selector(resumeEngine) forControlEvents:UIControlEventTouchUpInside];
-        [_loadButton addTarget:self action:@selector(openFilePicker) forControlEvents:UIControlEventTouchUpInside];
-    }
+    if (_engine) wg_engine_resume(_engine);
 }
 
 - (void)openFilePicker {
@@ -211,11 +233,38 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
             if (ok) {
                 WG_LOGI("App", "PE loaded successfully — starting execution");
                 wg_engine_run(self->_engine);
+                [self startEngineThread];
             } else {
                 WG_LOGE("App", "Failed to load PE");
             }
         });
     });
+}
+
+// Run the emulator on a dedicated high-priority thread at full speed, decoupled
+// from the 60 Hz render loop (previously the engine only ticked once per frame).
+- (void)startEngineThread {
+    _engineThreadRunning = NO;            // signal any prior loop to exit
+    _engineThreadRunning = YES;
+    _engineThread = [[NSThread alloc] initWithTarget:self
+                                            selector:@selector(engineLoop)
+                                              object:nil];
+    _engineThread.qualityOfService = NSQualityOfServiceUserInteractive;
+    _engineThread.name = @"WineGlass-Engine";
+    [_engineThread start];
+}
+
+- (void)engineLoop {
+    while (_engineThreadRunning) {
+        WGEngineState s = wg_engine_get_state(_engine);
+        if (s == WG_ENGINE_RUNNING) {
+            wg_engine_tick(_engine);          // tight loop — full core
+        } else if (s == WG_ENGINE_PAUSED) {
+            usleep(8000);                     // idle while a modal dialog waits
+        } else {
+            break;                            // STOPPED / ERROR / IDLE
+        }
+    }
 }
 
 - (void)tryLoadBundledPE {
@@ -291,25 +340,14 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
         id<CAMetalDrawable> drawable = [self.metalView.metalLayer nextDrawable];
         if (!drawable) return;
 
-        // Tick the engine to execute x86 instructions
-        WGEngineState state = _engine ? wg_engine_get_state(_engine) : WG_ENGINE_IDLE;
-        if (state == WG_ENGINE_RUNNING) {
-            wg_engine_tick(_engine);
-        }
-
-        // Show continue button when paused
-        state = _engine ? wg_engine_get_state(_engine) : WG_ENGINE_IDLE;
-        static BOOL wasShowingContinue = NO;
-        if (state == WG_ENGINE_PAUSED && !wasShowingContinue && _loadButton) {
-            wasShowingContinue = YES;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self->_loadButton setTitle:@"  Next >  " forState:UIControlStateNormal];
-                self->_loadButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.7 blue:0.3 alpha:0.9];
-                [self->_loadButton removeTarget:self action:@selector(openFilePicker) forControlEvents:UIControlEventTouchUpInside];
-                [self->_loadButton addTarget:self action:@selector(resumeEngine) forControlEvents:UIControlEventTouchUpInside];
-            });
-        } else if (state != WG_ENGINE_PAUSED && wasShowingContinue) {
-            wasShowingContinue = NO;
+        // The engine runs on its own thread now; the render loop only
+        // composites and toggles the wizard buttons when a modal dialog waits.
+        BOOL wizard = (_engine &&
+                       wg_engine_get_state(_engine) == WG_ENGINE_PAUSED &&
+                       wg_engine_dialog_active(_engine));
+        if (_nextButton.hidden != !wizard) {
+            _nextButton.hidden = !wizard;
+            _cancelButton.hidden = !wizard;
         }
 
         // If there are visible Win32 windows, render them via compositor
@@ -344,6 +382,8 @@ static void logCallback(WGLogLevel level, const char *tag, const char *message, 
 }
 
 - (void)sceneDidDisconnect:(UIScene *)scene {
+    _engineThreadRunning = NO;        // stop the engine thread
+    [NSThread sleepForTimeInterval:0.02];
     if (_engine) {
         wg_engine_destroy(_engine);
         _engine = NULL;

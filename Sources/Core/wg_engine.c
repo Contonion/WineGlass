@@ -204,6 +204,7 @@ static bool     s_dlg_active = false;
 static uint32_t s_dlg_ret_addr = 0;     // WinMain return for DialogBoxParamW
 static uint32_t s_dlg_ret_rsp  = 0;     // RSP to restore on EndDialog
 static uint32_t s_dlg_hwnd     = 0;     // the modal dialog window
+static uint32_t s_dlg_proc     = 0;     // the dialog procedure (for WM_COMMAND)
 static uint32_t s_dlg_result   = 1;
 
 typedef struct {
@@ -950,6 +951,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (dlgproc && is_32bit) {
                 s_dlg_active = true;
                 s_dlg_hwnd = hwnd;
+                s_dlg_proc = dlgproc;
                 s_dlg_ret_addr = (uint32_t)ret_addr;
                 s_dlg_ret_rsp  = (uint32_t)clean_rsp;
                 s_dlg_result = 1;
@@ -1755,6 +1757,37 @@ void wg_engine_resume(WGEngine *engine) {
     if (!engine || engine->state != WG_ENGINE_PAUSED) return;
     WG_LOGI(TAG, "Resuming from dialog pause");
     engine->state = WG_ENGINE_RUNNING;
+}
+
+// True when a modal dialog is up and waiting for input (Next/Cancel/...).
+bool wg_engine_dialog_active(WGEngine *engine) {
+    (void)engine;
+    return s_dlg_active;
+}
+
+// Deliver a button click to the modal dialog: WM_COMMAND(ctrl_id, BN_CLICKED).
+// Re-enters the dialog proc so NSIS advances the wizard (and eventually calls
+// EndDialog). Common ids: 1 = Next/Install (IDOK), 2 = Cancel, 3 = Back.
+void wg_engine_dialog_command(WGEngine *engine, uint32_t ctrl_id) {
+    if (!engine || !s_dlg_active || !s_dlg_proc) return;
+    if (engine->state != WG_ENGINE_PAUSED) return;
+    WGDlgCtrl *c = wg_find_ctrl(s_dlg_hwnd, ctrl_id);
+    uint32_t ctrl_hwnd = c ? (WG_CTRL_HWND_BASE + (uint32_t)(c - s_ctrls)) : 0;
+    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+    uint32_t new_rsp = esp - 20;
+    uint32_t stack_data[5] = {
+        WG_DLG_SENTINEL,          // return trap
+        s_dlg_hwnd,               // hwnd
+        0x0111,                   // WM_COMMAND
+        ctrl_id,                  // wParam = MAKEWPARAM(id, BN_CLICKED=0)
+        ctrl_hwnd                 // lParam = control handle
+    };
+    wg_blink_write_mem(engine->blink, new_rsp, stack_data, 20);
+    wg_blink_set_reg(engine->blink, 4, new_rsp);
+    wg_blink_set_rip(engine->blink, s_dlg_proc);
+    wg_blink_set_reg(engine->blink, 0, 0);
+    engine->state = WG_ENGINE_RUNNING;
+    WG_LOGI(TAG, "Dialog command: WM_COMMAND id=%u -> dlgproc 0x%X", ctrl_id, s_dlg_proc);
 }
 
 void wg_engine_stop(WGEngine *engine) {

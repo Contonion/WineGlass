@@ -102,7 +102,11 @@ void wg_wm_destroy(uint32_t hwnd) {
     if (w) {
         w->alive = false;
         w->visible = false;
-        if (w->client) { free(w->client); w->client = NULL; }
+        // NOTE: do NOT free w->client here. The engine runs on a background
+        // thread while the Metal compositor reads client framebuffers on the
+        // main thread; freeing here would be a use-after-free. The buffer is
+        // reclaimed in wg_wm_reset() at the next program load (main thread,
+        // engine stopped). Windows are few, so the transient leak is fine.
         wg_wm_get()->dirty = true;
     }
 }

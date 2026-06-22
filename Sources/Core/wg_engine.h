@@ -29,6 +29,12 @@ typedef enum {
 // Resume from PAUSED state (e.g., after dialog dismissed)
 void wg_engine_resume(WGEngine *engine);
 
+// Modal-dialog input. wg_engine_dialog_active() is true while a wizard dialog
+// is up and waiting; wg_engine_dialog_command() delivers a button click
+// (1=Next/Install, 2=Cancel, 3=Back) so the wizard advances.
+bool wg_engine_dialog_active(WGEngine *engine);
+void wg_engine_dialog_command(WGEngine *engine, uint32_t ctrl_id);
+
 WGEngineState wg_engine_get_state(const WGEngine *engine);
 WGEngineState wg_engine_run_sync(WGEngine *engine, int max_ticks);
 

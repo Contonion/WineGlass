@@ -107,7 +107,9 @@ static const unsigned char FONT8X8[95][8] = {
 {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
 };
 
-#define FONT_SCALE 2  // each font pixel -> 2x2 screen pixels
+#define FONT_SCALE 1  // each font pixel -> 1 screen pixel (the compositor
+                      // upscales the whole dialog, so 1x keeps UI text from
+                      // looking oversized — e.g. the wizard buttons)
 
 // ---- DC table ----------------------------------------------------------
 typedef struct {
