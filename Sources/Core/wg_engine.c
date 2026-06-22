@@ -9,6 +9,7 @@
 #include "wg_win32_windows.h"
 #include "wg_win32_files.h"
 #include "wg_win32_gdi.h"
+#include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,21 @@ typedef enum {
 
 static uint32_t s_last_error = 0;
 static bool s_nsis_data_patched = false;
+// A/B diagnostic toggle for the NSIS solid-LZMA data section.
+//   1 = pre-decompress the data .tmp natively (LzmaDec) and ignore the guest's
+//       own writes to it. The current workaround, on the theory that blink
+//       truncates NSIS's in-guest decode.
+//   0 = let NSIS decompress the stream itself, so we can test whether its
+//       native decode actually works (blink CALL/RET is confirmed fine — the
+//       failing self-test was a no-stack harness artifact). When 0,
+//       s_nsis_data_tmp_handle stays 0, which also makes the "ignore writes"
+//       branch in WriteFile inert, so NSIS's decode lands on disk normally.
+// Flip this and rebuild to compare the two paths on-device. Overridable from
+// the build (e.g. OTHER_CFLAGS: -DWG_NSIS_PREFILL_HACK=0) without editing here.
+#ifndef WG_NSIS_PREFILL_HACK
+#define WG_NSIS_PREFILL_HACK 0
+#endif
+
 // Guest heap pointer for GlobalAlloc/etc. Reset per program load so behavior
 // is deterministic (not dependent on prior runs in the same app session).
 #define WG_GUEST_HEAP_BASE 0x20000000u
@@ -55,6 +71,50 @@ static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
 static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
 static char s_nsis_data_tmp_path[1024] = {0};  // real path of data .tmp
+
+#ifdef WG_DECODE_DIAG
+// Local-repro diagnostic: diff NSIS's own in-guest decode (written to the data
+// .tmp when prefill is off) against the reference stream in /tmp/ref.bin, to
+// find the first byte where blink's decode diverges. Zero-cost unless defined.
+static uint32_t s_diag_data_tmp_handle = 0;
+static uint8_t *s_diag_ref = NULL;
+static long     s_diag_ref_len = 0;
+static int      s_diag_reported = 0;
+static void wg_diag_check(uint32_t pos, const uint8_t *buf, uint32_t n) {
+    if (s_diag_reported) return;
+    if (!s_diag_ref) {
+        FILE *r = fopen("/tmp/ref.bin", "rb");
+        if (!r) { s_diag_reported = 1; return; }
+        fseek(r, 0, SEEK_END); s_diag_ref_len = ftell(r); fseek(r, 0, SEEK_SET);
+        s_diag_ref = (uint8_t *)malloc(s_diag_ref_len);
+        if (!s_diag_ref || fread(s_diag_ref, 1, s_diag_ref_len, r) != (size_t)s_diag_ref_len) {
+            s_diag_reported = 1; fclose(r); return;
+        }
+        fclose(r);
+        WG_LOGI("DIAG", "ref.bin loaded (%ld bytes)", s_diag_ref_len);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        long off = (long)pos + i;
+        if (off >= s_diag_ref_len) break;
+        if (buf[i] != s_diag_ref[off]) {
+            WG_LOGE("DIAG", "DECODE DIVERGES at decompressed offset %ld: "
+                    "guest=0x%02X ref=0x%02X (correct for %ld bytes)",
+                    off, buf[i], s_diag_ref[off], off);
+            // dump a little context
+            WG_LOGE("DIAG", "  ref [%ld..]: %02X %02X %02X %02X %02X %02X %02X %02X",
+                    off, s_diag_ref[off], s_diag_ref[off+1], s_diag_ref[off+2],
+                    s_diag_ref[off+3], s_diag_ref[off+4], s_diag_ref[off+5],
+                    s_diag_ref[off+6], s_diag_ref[off+7]);
+            WG_LOGE("DIAG", "  got [%ld..]: %02X %02X %02X %02X %02X %02X %02X %02X",
+                    off, buf[i], (i+1<n?buf[i+1]:0), (i+2<n?buf[i+2]:0),
+                    (i+3<n?buf[i+3]:0), (i+4<n?buf[i+4]:0), (i+5<n?buf[i+5]:0),
+                    (i+6<n?buf[i+6]:0), (i+7<n?buf[i+7]:0));
+            s_diag_reported = 1;
+            return;
+        }
+    }
+}
+#endif
 
 struct WGEngine {
     WGEngineState   state;
@@ -134,6 +194,161 @@ static void map_thunks_to_blink(WGEngine *engine) {
             (unsigned long long)thunk_base, engine->dll_mapper->count);
 }
 
+// ============================================================
+//  Modal dialogs + control rendering (NSIS wizard UI)
+// ============================================================
+#define WG_DLG_SENTINEL    0xC10000u    // dlgproc return trap (HLT-filled page)
+#define WG_CTRL_HWND_BASE  0x00C70000u  // synthetic control HWND range
+
+static bool     s_dlg_active = false;
+static uint32_t s_dlg_ret_addr = 0;     // WinMain return for DialogBoxParamW
+static uint32_t s_dlg_ret_rsp  = 0;     // RSP to restore on EndDialog
+static uint32_t s_dlg_hwnd     = 0;     // the modal dialog window
+static uint32_t s_dlg_result   = 1;
+
+typedef struct {
+    uint32_t hwnd;          // owning dialog window
+    uint32_t id;            // control id
+    uint32_t style;
+    int16_t  x, y, cx, cy;  // dialog units
+    uint16_t cls;           // 0x80 button, 0x82 static, 0x81 edit, ...
+    bool     is_bitmap;     // SS_BITMAP static
+    uint32_t hbitmap;
+    uint16_t text[80];
+} WGDlgCtrl;
+static WGDlgCtrl s_ctrls[96];
+static int       s_ctrl_count = 0;
+static int       s_dlg_cx = 331, s_dlg_cy = 222; // dialog-unit extent
+
+static WGDlgCtrl *wg_find_ctrl(uint32_t hwnd, uint32_t id) {
+    for (int i = 0; i < s_ctrl_count; i++)
+        if (s_ctrls[i].hwnd == hwnd && s_ctrls[i].id == id) return &s_ctrls[i];
+    return NULL;
+}
+static WGDlgCtrl *wg_ctrl_from_handle(uint32_t h) {
+    if (h >= WG_CTRL_HWND_BASE && h < WG_CTRL_HWND_BASE + 96) {
+        int idx = (int)(h - WG_CTRL_HWND_BASE);
+        if (idx < s_ctrl_count) return &s_ctrls[idx];
+    }
+    return NULL;
+}
+
+// ---- PE resource access (parse the dialog template from the .rsrc) ----
+static const uint8_t *pe_rva(WGPEImage *pe, uint32_t rva) {
+    for (int i = 0; i < pe->num_sections; i++) {
+        WGPESection *s = &pe->sections[i];
+        if (rva >= s->virtual_address && rva < s->virtual_address + s->raw_size)
+            return pe->raw_data + s->raw_offset + (rva - s->virtual_address);
+    }
+    return NULL;
+}
+static const uint8_t *pe_find_dialog(WGPEImage *pe, uint32_t dlg_id) {
+    if (!pe->raw_data) return NULL;
+    uint32_t e_lfanew; memcpy(&e_lfanew, pe->raw_data + 0x3C, 4);
+    uint32_t rsrc_rva; memcpy(&rsrc_rva, pe->raw_data + e_lfanew + 24 + 112, 4);
+    const uint8_t *base = pe_rva(pe, rsrc_rva);
+    if (!base) return NULL;
+    uint16_t nN, nI;
+    memcpy(&nN, base + 12, 2); memcpy(&nI, base + 14, 2);
+    for (int i = 0; i < nN + nI; i++) {
+        const uint8_t *e = base + 16 + i * 8;
+        uint32_t nameid, off; memcpy(&nameid, e, 4); memcpy(&off, e + 4, 4);
+        if (nameid != 5 /*RT_DIALOG*/ || !(off & 0x80000000u)) continue;
+        const uint8_t *l1 = base + (off & 0x7fffffff);
+        uint16_t a, b; memcpy(&a, l1 + 12, 2); memcpy(&b, l1 + 14, 2);
+        for (int j = 0; j < a + b; j++) {
+            const uint8_t *e1 = l1 + 16 + j * 8;
+            uint32_t id, o1; memcpy(&id, e1, 4); memcpy(&o1, e1 + 4, 4);
+            if ((id & 0x7fffffff) != dlg_id || !(o1 & 0x80000000u)) continue;
+            const uint8_t *l2 = base + (o1 & 0x7fffffff);
+            uint32_t o2; memcpy(&o2, l2 + 16 + 4, 4);          // first lang's data-entry off
+            const uint8_t *de = base + (o2 & 0x7fffffff);
+            uint32_t data_rva; memcpy(&data_rva, de, 4);
+            return pe_rva(pe, data_rva);
+        }
+    }
+    return NULL;
+}
+static const uint8_t *res_skip_sz(const uint8_t *p, uint16_t *out, int cap) {
+    uint16_t v; memcpy(&v, p, 2);
+    if (v == 0)      { if (out) out[0] = 0; return p + 2; }
+    if (v == 0xFFFF) { if (out) out[0] = 0; return p + 4; }
+    int k = 0;
+    for (;;) { uint16_t c; memcpy(&c, p, 2); p += 2; if (!c) break;
+               if (out && k < cap - 1) out[k++] = c; }
+    if (out) out[k] = 0;
+    return p;
+}
+static void wg_parse_dialog(WGEngine *engine, uint32_t hwnd, uint32_t dlg_id) {
+    s_ctrl_count = 0;
+    if (!engine->pe_image) return;
+    const uint8_t *t = pe_find_dialog(engine->pe_image, dlg_id);
+    if (!t) { WG_LOGI(TAG, "dialog %u: no template", dlg_id); return; }
+    uint16_t dlgVer, sig; memcpy(&dlgVer, t, 2); memcpy(&sig, t + 2, 2);
+    if (dlgVer != 1 || sig != 0xFFFF) return;   // only DLGTEMPLATEEX
+    const uint8_t *p = t + 4 + 4 + 4;           // skip dlgVer/sig, helpID, exStyle
+    uint32_t style; memcpy(&style, p, 4); p += 4;
+    uint16_t cItems; memcpy(&cItems, p, 2); p += 2;
+    p += 4;                                     // x, y
+    memcpy(&s_dlg_cx, p, 2); p += 2;
+    memcpy(&s_dlg_cy, p, 2); p += 2;
+    p = res_skip_sz(p, NULL, 0);                // menu
+    p = res_skip_sz(p, NULL, 0);                // class
+    p = res_skip_sz(p, NULL, 0);                // title
+    if (style & 0x40 /*DS_SETFONT*/) { p += 6; p = res_skip_sz(p, NULL, 0); }
+    for (int i = 0; i < cItems && s_ctrl_count < 96; i++) {
+        size_t aoff = ((size_t)(p - t) + 3) & ~(size_t)3; p = t + aoff;  // dword align
+        p += 4 + 4;                             // helpID, exStyle
+        uint32_t cstyle; memcpy(&cstyle, p, 4); p += 4;
+        WGDlgCtrl *c = &s_ctrls[s_ctrl_count++];
+        memset(c, 0, sizeof(*c));
+        c->hwnd = hwnd; c->style = cstyle;
+        memcpy(&c->x, p, 2); memcpy(&c->y, p + 2, 2);
+        memcpy(&c->cx, p + 4, 2); memcpy(&c->cy, p + 6, 2); p += 8;
+        memcpy(&c->id, p, 4); p += 4;
+        uint16_t w0; memcpy(&w0, p, 2);
+        if (w0 == 0xFFFF) { memcpy(&c->cls, p + 2, 2); p += 4; }
+        else { p = res_skip_sz(p, NULL, 0); c->cls = 0; }
+        c->is_bitmap = (c->cls == 0x0082) && ((cstyle & 0x0F) == 0x0E /*SS_BITMAP*/);
+        p = res_skip_sz(p, c->text, 80);        // title
+        uint16_t extra; memcpy(&extra, p, 2); p += 2 + extra;
+    }
+    WG_LOGI(TAG, "dialog %u parsed: %d controls (%dx%d du)",
+            dlg_id, s_ctrl_count, s_dlg_cx, s_dlg_cy);
+}
+
+// Paint the parsed controls into the dialog's client framebuffer.
+static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
+    (void)engine;
+    int32_t cw = 0, ch = 0;
+    if (!wg_wm_get_client(hwnd, &cw, &ch)) return;
+    uint32_t dc = wg_gdi_get_dc(hwnd);
+    if (!dc) return;
+    wg_gdi_fill_rect(dc, 0, 0, cw, ch, 0x00FFFFFF);          // white dialog bg
+    float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
+    float sy = s_dlg_cy ? (float)ch / s_dlg_cy : 1.0f;
+    for (int i = 0; i < s_ctrl_count; i++) {
+        WGDlgCtrl *c = &s_ctrls[i];
+        if (c->hwnd != hwnd) continue;
+        if (!(c->style & 0x10000000u /*WS_VISIBLE*/)) continue;
+        int px = (int)(c->x * sx), py = (int)(c->y * sy);
+        int pw = (int)(c->cx * sx), ph = (int)(c->cy * sy);
+        int tlen = 0; while (tlen < 79 && c->text[tlen]) tlen++;
+        if (c->cls == 0x0080) {                 // button
+            wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00E1E1E1);
+            if (tlen) wg_gdi_text_out(dc, px + 6, py + (ph - 16) / 2, c->text, tlen);
+        } else if (c->cls == 0x0082) {          // static
+            if (c->is_bitmap && c->hbitmap)
+                wg_gdi_draw_bitmap(dc, px, py, pw, ph, c->hbitmap, 0, 0, 0, 0);
+            else if (tlen)
+                wg_gdi_text_out(dc, px, py, c->text, tlen);
+        }
+    }
+    wg_gdi_release_dc(dc);
+    WGWin32Window *w = wg_wm_find(hwnd);
+    if (w) w->client_dirty = true;
+}
+
 // Check if RIP is in the thunk range and handle the Win32 API call.
 // Returns true if a thunk was handled.
 static bool handle_blink_thunk(WGEngine *engine) {
@@ -144,6 +359,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
     if (rip >= WG_THUNK_BASE && rip < WG_THUNK_BASE + 0x20000) in_thunk_range = true;
     if (!in_thunk_range) return false;
+
+    // Modal-dialog return trap: the dlgproc has returned from WM_INITDIALOG, so
+    // the dialog is now up. Paint its controls and pause (modal) — we stay here
+    // until the guest calls EndDialog (which returns control to WinMain).
+    if (rip == WG_DLG_SENTINEL) {
+        if (s_dlg_active && s_dlg_hwnd) wg_render_dialog(engine, s_dlg_hwnd);
+        engine->state = WG_ENGINE_PAUSED;
+        WG_LOGI(TAG, "Dialog up (HWND=0x%X) — modal, waiting", s_dlg_hwnd);
+        return true;
+    }
 
     WGWin32StubFunc handler = wg_dll_mapper_get_handler(
         engine->dll_mapper, rip);
@@ -285,6 +510,117 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "LineTo") == 0) {
             wg_gdi_line_to(args[0], (int)args[1], (int)args[2]);
             ret_val = 1;
+        } else if (strcmp(fn, "LoadImageW") == 0) {
+            // LoadImageW(hInst, name, type, cx, cy, fuLoad)
+            // We support IMAGE_BITMAP (type 0) loaded from a file
+            // (LR_LOADFROMFILE = 0x10) — that's how NSIS pulls in the wizard's
+            // header/branding BMPs it just extracted to $PLUGINSDIR.
+            uint32_t type = args[2];
+            uint32_t fuLoad = args[5];
+            ret_val = 0;
+            if (type == 0 /*IMAGE_BITMAP*/ && (fuLoad & 0x10) && args[1]) {
+                uint16_t wpath[260] = {0};
+                char apath[260] = {0};
+                wg_blink_read_mem(engine->blink, args[1], wpath, 518);
+                for (int i = 0; i < 259 && wpath[i]; i++)
+                    apath[i] = wpath[i] < 128 ? (char)wpath[i] : '_';
+                const char *real = wg_files_map_path(args[1], engine->blink,
+                                                     apath, sizeof(apath));
+                if (real) ret_val = wg_bitmap_load_file(real);
+                WG_LOGI(TAG, "LoadImageW('%s') -> HBITMAP 0x%X", apath,
+                        (uint32_t)ret_val);
+            }
+        } else if (strcmp(fn, "CreateCompatibleDC") == 0) {
+            ret_val = wg_gdi_create_memory_dc();
+        } else if (strcmp(fn, "DeleteDC") == 0) {
+            wg_gdi_delete_dc(args[0]);
+            ret_val = 1;
+        } else if (strcmp(fn, "CreateCompatibleBitmap") == 0) {
+            // (hdc, w, h)
+            ret_val = wg_bitmap_create((int)args[1], (int)args[2]);
+        } else if (strcmp(fn, "SelectObject") == 0) {
+            // (hdc, hgdiobj) — we only track bitmaps; for anything else return
+            // a benign non-zero "previous object" the caller can restore.
+            if (wg_bitmap_is(args[1])) {
+                uint32_t prev = wg_gdi_select_bitmap(args[0], args[1]);
+                ret_val = prev ? prev : 1;
+            } else {
+                ret_val = 1;
+            }
+        } else if (strcmp(fn, "DeleteObject") == 0) {
+            if (wg_bitmap_is(args[0])) wg_bitmap_delete(args[0]);
+            ret_val = 1;
+        } else if (strcmp(fn, "GetObjectW") == 0) {
+            // (hgdiobj, cb, lpvObject) — fill a BITMAP struct for bitmaps.
+            int bw, bh;
+            if (wg_bitmap_pixels(args[0], &bw, &bh) && args[2] && args[1] >= 24) {
+                int32_t bm[6] = {
+                    0,                  // bmType
+                    bw,                 // bmWidth
+                    bh,                 // bmHeight
+                    bw * 4,             // bmWidthBytes
+                    (int32_t)((1u << 16) | 32u), // bmPlanes=1, bmBitsPixel=32
+                    0                   // bmBits (NULL)
+                };
+                wg_blink_write_mem(engine->blink, args[2], bm, 24);
+                ret_val = 24;
+            } else {
+                ret_val = 0;
+            }
+        } else if (strcmp(fn, "BitBlt") == 0) {
+            // (hdcDst, x, y, w, h, hdcSrc, sx, sy, rop)
+            wg_gdi_blit(args[0], (int)args[1], (int)args[2], (int)args[3],
+                        (int)args[4], args[5], (int)args[6], (int)args[7],
+                        (int)args[3], (int)args[4]);
+            ret_val = 1;
+        } else if (strcmp(fn, "StretchBlt") == 0) {
+            // (hdcDst, x, y, w, h, hdcSrc, sx, sy, sw, sh, rop)
+            wg_gdi_blit(args[0], (int)args[1], (int)args[2], (int)args[3],
+                        (int)args[4], args[5], (int)args[6], (int)args[7],
+                        (int)args[8], (int)args[9]);
+            ret_val = 1;
+        } else if (strcmp(fn, "StretchDIBits") == 0 ||
+                   strcmp(fn, "SetDIBitsToDevice") == 0) {
+            // StretchDIBits(hdc, xD,yD,wD,hD, xS,yS,wS,hS, bits, bmi, usage, rop)
+            // SetDIBitsToDevice(hdc, xD,yD, w,h, xS,yS, startScan,scanLines,
+            //                   bits, bmi, usage)
+            // Both hand us a packed DIB in guest memory; decode and blit it.
+            // (StretchDIBits' stretch to a different src size is approximated by
+            // drawing the DIB at its natural size into the dest rect.)
+            // lpBits and lpbmi sit at the same arg slots (9, 10) in both APIs,
+            // as do the destination width/height (3, 4).
+            uint32_t bits_addr = args[9];
+            uint32_t bmi_addr  = args[10];
+            if (bmi_addr && bits_addr) {
+                uint8_t bih[40] = {0};
+                wg_blink_read_mem(engine->blink, bmi_addr, bih, 40);
+                int32_t biW = (int32_t)(bih[4] | (bih[5]<<8) | (bih[6]<<16) | (bih[7]<<24));
+                int32_t biH = (int32_t)(bih[8] | (bih[9]<<8) | (bih[10]<<16) | (bih[11]<<24));
+                uint16_t biBpp = (uint16_t)(bih[14] | (bih[15]<<8));
+                int aH = biH < 0 ? -biH : biH;
+                if (biW > 0 && aH > 0 && biW <= 16384 && aH <= 16384 &&
+                    (biBpp == 8 || biBpp == 24 || biBpp == 32)) {
+                    size_t stride = ((size_t)biW * (biBpp/8) + 3) & ~(size_t)3;
+                    size_t total = stride * aH;
+                    if (total <= 64u*1024*1024) {
+                        uint8_t *px = (uint8_t *)malloc(total);
+                        if (px) {
+                            wg_blink_read_mem(engine->blink, bits_addr, px, (uint32_t)total);
+                            uint32_t hb = wg_bitmap_from_dib(bih, px);
+                            free(px);
+                            if (hb) {
+                                wg_gdi_draw_bitmap(args[0], (int)args[1], (int)args[2],
+                                                   (int)args[3], (int)args[4],
+                                                   hb, 0, 0, 0, 0);
+                                wg_bitmap_delete(hb);
+                            }
+                        }
+                    }
+                }
+                ret_val = aH;
+            }
+        } else if (strcmp(fn, "SetStretchBltMode") == 0) {
+            ret_val = 1;
         } else if (strcmp(fn, "DefWindowProcW") == 0 ||
                    strcmp(fn, "TranslateMessage") == 0 ||
                    strcmp(fn, "DispatchMessageW") == 0) {
@@ -397,24 +733,27 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 8; // length
         } else if (strcmp(fn, "GetTempPathW") == 0) {
-            // GetTempPathW(nBufferLength, lpBuffer)
+            // GetTempPathW(nBufferLength=args[0], lpBuffer=args[1]). Only write
+            // if the caller's buffer is big enough; never overflow it.
             uint16_t tmp[] = {'C',':','\\','T','e','m','p','\\',0};
-            if (args[1]) {
-                wg_blink_write_mem(engine->blink, args[1], tmp, sizeof(tmp));
-            }
-            ret_val = 8;
+            int n = 9; // chars incl NUL
+            if (args[1] && args[0] >= (uint32_t)n)
+                wg_blink_write_mem(engine->blink, args[1], tmp, n * 2);
+            ret_val = (args[0] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
         } else if (strcmp(fn, "GetWindowsDirectoryW") == 0) {
+            // GetWindowsDirectoryW(lpBuffer=args[0], uSize=args[1] in chars).
             uint16_t windir[] = {'C',':','\\','W','i','n','d','o','w','s',0};
-            if (args[1]) {
-                wg_blink_write_mem(engine->blink, args[1], windir, sizeof(windir));
-            }
-            ret_val = 10;
+            int n = 11;
+            if (args[0] && args[1] >= (uint32_t)n)
+                wg_blink_write_mem(engine->blink, args[0], windir, n * 2);
+            ret_val = (args[1] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
         } else if (strcmp(fn, "GetSystemDirectoryW") == 0) {
+            // GetSystemDirectoryW(lpBuffer=args[0], uSize=args[1] in chars).
             uint16_t sysdir[] = {'C',':','\\','W','i','n','d','o','w','s','\\','S','y','s','t','e','m','3','2',0};
-            if (args[1]) {
-                wg_blink_write_mem(engine->blink, args[1], sysdir, sizeof(sysdir));
-            }
-            ret_val = 19;
+            int n = 20;
+            if (args[0] && args[1] >= (uint32_t)n)
+                wg_blink_write_mem(engine->blink, args[0], sysdir, n * 2);
+            ret_val = (args[1] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
         } else if (strcmp(fn, "RegisterClassW") == 0) {
             ret_val = 0xC001;
         } else if (strcmp(fn, "GetSystemMetrics") == 0) {
@@ -483,14 +822,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = args[0];
             }
         } else if (strcmp(fn, "lstrcpynW") == 0) {
-            // lstrcpynW(dst, src, maxlen)
-            if (args[0] && args[1] && args[2] > 0) {
+            // lstrcpynW(dst, src, maxlen): copy AT MOST maxlen-1 chars, stopping
+            // at the NUL, then NUL-terminate. Writing the full maxlen (as we used
+            // to) overflows the destination with garbage and corrupts adjacent
+            // guest memory — e.g. it was smashing NSIS's LZMA decoder context.
+            if (args[0] && args[1] && (int32_t)args[2] > 0) {
                 int maxlen = args[2];
                 if (maxlen > 1024) maxlen = 1024;
                 uint16_t buf[1024];
                 wg_blink_read_mem(engine->blink, args[1], buf, maxlen * 2);
-                buf[maxlen - 1] = 0;
-                wg_blink_write_mem(engine->blink, args[0], buf, maxlen * 2);
+                int len = 0;
+                while (len < maxlen - 1 && buf[len]) len++;
+                buf[len] = 0;
+                wg_blink_write_mem(engine->blink, args[0], buf, (len + 1) * 2);
                 ret_val = args[0];
             }
         } else if (strcmp(fn, "lstrcatW") == 0) {
@@ -555,6 +899,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // MSGBOXPARAMSW struct: cbSize(4), hwndOwner(4), hInstance(4),
             // lpszText(4), lpszCaption(4), ...
             // lpszText is at offset 12 in the struct
+#ifdef WG_DECODE_DIAG
+            WG_LOGE("DIAG", "MessageBoxIndirectW called from RIP=0x%llx",
+                    (unsigned long long)ret_addr);
+#endif
             if (args[0]) {
                 uint32_t text_ptr = 0, caption_ptr = 0;
                 wg_blink_read_mem(engine->blink, args[0] + 12, &text_ptr, 4);
@@ -578,62 +926,102 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 1; // IDOK
         } else if (strcmp(fn, "DialogBoxParamW") == 0) {
-            // DialogBoxParamW(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam)
+            // DialogBoxParamW(hInstance, lpTemplateName=args[1], hWndParent,
+            //                 lpDialogFunc=args[3], dwInitParam=args[4])
+            uint32_t dlg_id  = args[1];   // MAKEINTRESOURCE id
             uint32_t dlgproc = args[3];
             uint32_t initParam = args[4];
-            WG_LOGI(TAG, "DialogBoxParamW(dlgproc=0x%X, initParam=0x%X)", dlgproc, initParam);
+            WG_LOGI(TAG, "DialogBoxParamW(id=%u, dlgproc=0x%X)", dlg_id, dlgproc);
 
-            // Create a dialog window
             uint16_t title[] = {'S','t','e','a','m',' ','S','e','t','u','p',0};
-            uint32_t hwnd = wg_wm_create_window(0, 0, title,
-                                                  0x10CF0000,
-                                                  50, 50, 500, 360, 0);
-            WG_LOGI(TAG, "Created dialog HWND=0x%X, calling dlgproc with WM_INITDIALOG", hwnd);
+            uint32_t hwnd = wg_wm_create_window(0, 0, title, 0x10CF0000,
+                                                50, 50, 500, 360, 0);
+            // Parse the dialog template so we can render its controls.
+            wg_parse_dialog(engine, hwnd, dlg_id);
 
             // Clean up DialogBoxParamW's stack frame (5 args stdcall)
             uint64_t clean_rsp = rsp + ptr_size + (5 * ptr_size);
 
-            // Now call the dialog proc: dlgproc(hwnd, WM_INITDIALOG, 0, initParam)
-            // Push a return address that will be our "dialog done" sentinel
-            // Use the original return address so after the dlgproc returns,
-            // execution continues at the DialogBoxParamW call site
+            // Call dlgproc(hwnd, WM_INITDIALOG, 0, initParam). The return address
+            // is a SENTINEL in the HLT thunk page — when the dlgproc returns the
+            // engine catches it and goes modal (instead of falling back into
+            // WinMain, which would make it exit). EndDialog later returns to the
+            // real WinMain call site (s_dlg_ret_*).
             if (dlgproc && is_32bit) {
-                // Set up stdcall args for dlgproc on the stack:
-                // [ESP] = return_addr, [ESP+4] = hwnd, [ESP+8] = WM_INITDIALOG,
-                // [ESP+12] = wParam(0), [ESP+16] = lParam(initParam)
-                uint32_t new_rsp = (uint32_t)clean_rsp - 20; // 4 args + ret addr
+                s_dlg_active = true;
+                s_dlg_hwnd = hwnd;
+                s_dlg_ret_addr = (uint32_t)ret_addr;
+                s_dlg_ret_rsp  = (uint32_t)clean_rsp;
+                s_dlg_result = 1;
+                uint32_t new_rsp = (uint32_t)clean_rsp - 20;
                 uint32_t stack_data[5] = {
-                    (uint32_t)ret_addr,  // return address
-                    hwnd,                // HWND
-                    0x0110,              // WM_INITDIALOG
-                    0,                   // wParam
-                    initParam            // lParam
+                    WG_DLG_SENTINEL, hwnd, 0x0110 /*WM_INITDIALOG*/, 0, initParam
                 };
                 wg_blink_write_mem(engine->blink, new_rsp, stack_data, 20);
-                wg_blink_set_reg(engine->blink, 4, new_rsp); // ESP
-                wg_blink_set_rip(engine->blink, dlgproc);     // jump to dialog proc
+                wg_blink_set_reg(engine->blink, 4, new_rsp);
+                wg_blink_set_rip(engine->blink, dlgproc);
                 wg_blink_set_reg(engine->blink, 0, 0);
-
-                // After the dlgproc returns (via RET 16 for stdcall 4 args),
-                // execution continues at ret_addr. We DON'T pause here —
-                // let the dlgproc run so it creates buttons and controls.
-                // We'll pause when we see PeekMessageW (the message loop).
                 return true;
             }
 
-            // Fallback: pause as before
             engine->state = WG_ENGINE_PAUSED;
             wg_blink_set_reg(engine->blink, 4, clean_rsp);
             wg_blink_set_rip(engine->blink, ret_addr);
             wg_blink_set_reg(engine->blink, 0, 0);
             return true;
+        } else if (strcmp(fn, "EndDialog") == 0) {
+            // EndDialog(hDlg, nResult=args[1]) — return modally to WinMain.
+            if (s_dlg_active) {
+                s_dlg_result = args[1];
+                s_dlg_active = false;
+                wg_blink_set_reg(engine->blink, 4, s_dlg_ret_rsp);
+                wg_blink_set_rip(engine->blink, s_dlg_ret_addr);
+                wg_blink_set_reg(engine->blink, 0, s_dlg_result);
+                WG_LOGI(TAG, "EndDialog(%u) -> return to WinMain", s_dlg_result);
+                return true;
+            }
+            ret_val = 1;
+        } else if (strcmp(fn, "GetDlgItem") == 0) {
+            // GetDlgItem(hDlg=args[0], id=args[1]) -> synthetic control HWND.
+            WGDlgCtrl *c = wg_find_ctrl(args[0], args[1]);
+            ret_val = c ? (WG_CTRL_HWND_BASE + (uint32_t)(c - s_ctrls)) : 0;
+        } else if (strcmp(fn, "SetDlgItemTextW") == 0) {
+            // SetDlgItemTextW(hDlg=args[0], id=args[1], lpString=args[2])
+            WGDlgCtrl *c = wg_find_ctrl(args[0], args[1]);
+            if (c && args[2]) {
+                wg_blink_read_mem(engine->blink, args[2], c->text, sizeof(c->text));
+                c->text[79] = 0;
+                if (s_dlg_active) wg_render_dialog(engine, c->hwnd);
+            }
+            ret_val = 1;
+        } else if (strcmp(fn, "SendMessageW") == 0) {
+            // Only STM_SETIMAGE (0x0172) matters for rendering: attach a bitmap
+            // to a static control so wg_render_dialog blits it.
+            if (args[1] == 0x0172) {
+                WGDlgCtrl *c = wg_ctrl_from_handle(args[0]);
+                if (c) { c->hbitmap = args[3]; c->is_bitmap = true;
+                         if (s_dlg_active) wg_render_dialog(engine, c->hwnd); }
+            }
+            ret_val = 0;
         } else if (strcmp(fn, "CreateDialogParamW") == 0) {
-            // CreateDialogParamW(hInstance, lpTemplateName, hWndParent, lpDialogFunc, dwInitParam)
-            // Create a window entry for the compositor
+            // CreateDialogParamW(hInstance, lpTemplateName, hWndParent=args[2], ...)
+            // The NSIS inner page goes into the IDD_INST inner-dialog placeholder
+            // (control id 1018) — position it there so the parent's header bitmap
+            // and Back/Next/Cancel buttons stay visible around it.
             uint32_t parent = args[2];
+            int px = 0, py = 0, pw = 480, ph = 320;
+            WGDlgCtrl *placeholder = wg_find_ctrl(parent, 1018);
+            if (placeholder) {
+                int32_t cw = 0, chh = 0;
+                wg_wm_get_client(parent, &cw, &chh);
+                float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
+                float sy = s_dlg_cy ? (float)chh / s_dlg_cy : 1.0f;
+                px = (int)(placeholder->x * sx); py = (int)(placeholder->y * sy);
+                pw = (int)(placeholder->cx * sx); ph = (int)(placeholder->cy * sy);
+            }
             uint16_t title[] = {0};
             ret_val = wg_wm_create_window(0, 0, title, 0x50000000, // WS_CHILD|WS_VISIBLE
-                                           0, 0, 480, 320, parent);
+                                           px, py, pw, ph, parent);
         } else if (strcmp(fn, "GetLastError") == 0) {
             ret_val = s_last_error;
         } else if (strcmp(fn, "SetLastError") == 0) {
@@ -737,6 +1125,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // CREATE_ALWAYS that is NOT inside a plugin dir), we pre-fill it
             // with the correct full decompression done natively (LzmaDec), and
             // then ignore the guest's own (truncated) writes to it.
+#if WG_NSIS_PREFILL_HACK
             if (ret_val != 0xFFFFFFFF && real &&
                 s_nsis_data_tmp_handle == 0 && args[4] == 2 /* CREATE_ALWAYS */ &&
                 strstr(apath, ".tmp") &&
@@ -753,6 +1142,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                             s_nsis_data_tmp_handle);
                 }
             }
+#endif
+#ifdef WG_DECODE_DIAG
+            if (ret_val != 0xFFFFFFFF && args[4] == 2 && strstr(apath, ".tmp") &&
+                !strstr(apath, ".tmp\\") && !strstr(apath, ".tmp/")) {
+                s_diag_data_tmp_handle = (uint32_t)ret_val;
+            }
+#endif
         } else if (strcmp(fn, "ReadFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
@@ -779,6 +1175,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%u, n=%u) -> nread=%u first4=0x%08X",
                         handle, pos_before, nbytes, nread, first4);
             }
+#ifdef WG_DECODE_DIAG
+            else if (handle == 0x100 || handle == 0x101) {
+                WG_LOGI("RD", "ReadFile(h=0x%X, pos=%u, n=%u) -> nread=%u first4=0x%08X",
+                        handle, pos_before, nbytes, nread, first4);
+            }
+#endif
         } else if (strcmp(fn, "WriteFile") == 0) {
             uint32_t handle = args[0];
             uint32_t buf_addr = args[1];
@@ -797,6 +1199,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint8_t *tmpbuf = malloc(nbytes);
             if (tmpbuf) {
                 wg_blink_read_mem(engine->blink, buf_addr, tmpbuf, nbytes);
+#ifdef WG_DECODE_DIAG
+                if (handle == s_diag_data_tmp_handle && s_diag_data_tmp_handle != 0) {
+                    uint32_t pos = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
+                    wg_diag_check(pos, tmpbuf, nbytes);
+                }
+#endif
                 uint32_t nwritten = 0;
                 if (wg_files_write(handle, tmpbuf, nbytes, &nwritten)) {
                     if (bytes_written_addr) {
@@ -930,24 +1338,65 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "GlobalAlloc") == 0) {
             uint32_t size = args[1];
             if (size == 0) size = 4096;
-            // Only reject truly insane sizes (>512MB) as corrupt. NSIS
-            // legitimately allocates multi-MB buffers (e.g. 8MB LZMA dict).
-            if (size > 512u * 1024 * 1024) {
-                WG_LOGW(TAG, "GlobalAlloc FAILED: corrupt size %u", size);
-                ret_val = 0; // return NULL — let caller handle the error
-                goto skip_alloc;
+            // A size with the top bit set (or one that's absurdly large) is
+            // garbage that NSIS's broken in-guest LZMA decoder derived. NSIS
+            // uses it as a real length (it allocs then zero-terminates at
+            // buf[size-1]), so no buffer we return can satisfy it — masking the
+            // size and handing back a smaller buffer just turns the clean
+            // "Error decompressing data" abort into an out-of-bounds SIGSEGV.
+            // Return NULL and let NSIS take its own error path.
+            if ((size & 0x80000000u) || size > 512u * 1024 * 1024) {
+                WG_LOGW(TAG, "GlobalAlloc FAILED: corrupt size %u (in-guest "
+                        "decoder produced garbage)", size);
+#ifdef WG_DECODE_DIAG
+                // Who called GlobalAlloc with the bad size, and what's on the
+                // guest stack right now? (32-bit: args already read from stack.)
+                WG_LOGE("DIAG", "corrupt GlobalAlloc: caller RIP=0x%llx "
+                        "EAX=0x%llx ECX=0x%llx EDX=0x%llx EBX=0x%llx "
+                        "EBP=0x%llx ESP=0x%llx",
+                        (unsigned long long)ret_addr,
+                        wg_blink_get_reg(engine->blink, 0),
+                        wg_blink_get_reg(engine->blink, 1),
+                        wg_blink_get_reg(engine->blink, 2),
+                        wg_blink_get_reg(engine->blink, 3),
+                        wg_blink_get_reg(engine->blink, 5),
+                        wg_blink_get_reg(engine->blink, 4));
+                uint32_t stk[12] = {0};
+                wg_blink_read_mem(engine->blink, rsp, stk, sizeof(stk));
+                for (int si = 0; si < 12; si += 4)
+                    WG_LOGE("DIAG", "  [ESP+%2d]: %08X %08X %08X %08X",
+                            si*4, stk[si], stk[si+1], stk[si+2], stk[si+3]);
+                // The size came from 4 bytes at [ebp-0x70]. Dump that pointer and
+                // the bytes around it to see where the garbage lives.
+                uint32_t ebp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                uint32_t pInput = 0, vAccum = 0, vCount = 0;
+                wg_blink_read_mem(engine->blink, ebp - 0x70, &pInput, 4);
+                wg_blink_read_mem(engine->blink, ebp - 0x40, &vAccum, 4);
+                wg_blink_read_mem(engine->blink, ebp - 0x6c, &vCount, 4);
+                WG_LOGE("DIAG", "locals: [ebp-0x70](inPtr)=0x%08X [ebp-0x40](accum)=0x%08X [ebp-0x6c]=0x%08X",
+                        pInput, vAccum, vCount);
+                if (pInput) {
+                    uint8_t around[32] = {0};
+                    wg_blink_read_mem(engine->blink, pInput - 8, around, 32);
+                    WG_LOGE("DIAG", "  inPtr-8: %02X %02X %02X %02X %02X %02X %02X %02X | "
+                            "%02X %02X %02X %02X %02X %02X %02X %02X",
+                            around[0],around[1],around[2],around[3],around[4],around[5],around[6],around[7],
+                            around[8],around[9],around[10],around[11],around[12],around[13],around[14],around[15]);
+                }
+#endif
+                ret_val = 0;
+            } else {
+                size = (size + 0xFFF) & ~0xFFF;
+                uint32_t addr = s_heap_ptr;
+                uint8_t *zeros = calloc(1, size);
+                if (zeros) {
+                    wg_blink_load_code(engine->blink, addr, zeros, size, 0);
+                    free(zeros);
+                    s_heap_ptr += size;
+                    s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFF;
+                    ret_val = addr;
+                }
             }
-            size = (size + 0xFFF) & ~0xFFF;
-            uint32_t addr = s_heap_ptr;
-            uint8_t *zeros = calloc(1, size);
-            if (zeros) {
-                wg_blink_load_code(engine->blink, addr, zeros, size, 0);
-                free(zeros);
-                s_heap_ptr += size;
-                s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFF;
-                ret_val = addr;
-            }
-            skip_alloc:;
         } else if (strcmp(fn, "GlobalLock") == 0) {
             ret_val = args[0]; // GMEM_FIXED: handle == pointer
         }
@@ -997,6 +1446,9 @@ bool wg_engine_init(WGEngine *engine) {
 
     // Blink init is deferred — thunks will be mapped when a PE is loaded
 
+    WG_LOGI(TAG, "NSIS data mode: %s",
+            WG_NSIS_PREFILL_HACK ? "native LzmaDec prefill (workaround)"
+                                 : "guest in-VM decode (prefill DISABLED)");
     WG_LOGI(TAG, "Engine ready");
     return true;
 }
@@ -1159,6 +1611,11 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_last_error = 0;
     s_nsis_data_tmp_handle = 0;
     s_nsis_data_tmp_path[0] = 0;
+    s_nsis_last_data_seek = 0;
+    s_dlg_active = false;
+    s_dlg_hwnd = 0;
+    s_ctrl_count = 0;
+    wg_bitmap_reset_all();
 
     // Set the exe path for file I/O mapping
     wg_files_set_exe_path(path);

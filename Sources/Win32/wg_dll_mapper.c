@@ -398,6 +398,17 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("GDI32.dll", TextOutW, 5);
     RS("GDI32.dll", MoveToEx, 4);
     RS("GDI32.dll", LineTo, 3);
+    // Bitmaps / blitting (handled in engine; registered here for correct
+    // stdcall stack cleanup — wrong arg counts corrupt the guest stack).
+    RS("GDI32.dll", CreateCompatibleDC, 1);
+    RS("GDI32.dll", DeleteDC, 1);
+    RS("GDI32.dll", CreateCompatibleBitmap, 3);
+    RS("GDI32.dll", GetObjectW, 3);
+    RS("GDI32.dll", BitBlt, 9);
+    RS("GDI32.dll", StretchBlt, 11);
+    RS("GDI32.dll", SetStretchBltMode, 2);
+    RS("GDI32.dll", StretchDIBits, 13);
+    RS("GDI32.dll", SetDIBitsToDevice, 12);
 
     // === SHELL32.dll ===
     R1S("SHELL32.dll", IsUserAnAdmin, 0);

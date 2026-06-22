@@ -30,4 +30,27 @@ void wg_gdi_line_to(uint32_t hdc, int x, int y);
 uint32_t wg_gdi_create_solid_brush(uint32_t colorref);
 uint32_t wg_gdi_brush_color(uint32_t hbrush, bool *found);
 
+// ---- Bitmaps / blitting -------------------------------------------------
+// A memory DC has no window; it renders into whatever HBITMAP is selected into
+// it (CreateCompatibleDC + SelectObject), which is how Win32 code prepares an
+// image before BitBlt'ing it onto a window.
+uint32_t wg_gdi_create_memory_dc(void);
+void     wg_gdi_delete_dc(uint32_t hdc);
+
+// Select a bitmap into a DC; returns the previously-selected bitmap handle.
+uint32_t wg_gdi_select_bitmap(uint32_t hdc, uint32_t hbitmap);
+// The bitmap currently selected into a DC (0 if none).
+uint32_t wg_gdi_selected_bitmap(uint32_t hdc);
+
+// Copy (and stretch, nearest-neighbour) the source DC's selected bitmap into
+// the destination DC. Destination is a window framebuffer or another DC's
+// bitmap. Pass sw==dw && sh==dh for a 1:1 BitBlt.
+void wg_gdi_blit(uint32_t hdc_dst, int dx, int dy, int dw, int dh,
+                 uint32_t hdc_src, int sx, int sy, int sw, int sh);
+
+// Draw a bitmap object straight into a DC (used by StretchDIBits / STM_SETIMAGE
+// where there is no source DC). dw/dh may differ from sw/sh to stretch.
+void wg_gdi_draw_bitmap(uint32_t hdc_dst, int dx, int dy, int dw, int dh,
+                        uint32_t hbitmap, int sx, int sy, int sw, int sh);
+
 #endif

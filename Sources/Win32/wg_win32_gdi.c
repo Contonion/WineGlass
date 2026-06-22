@@ -1,5 +1,6 @@
 #include "wg_win32_gdi.h"
 #include "wg_win32_windows.h"
+#include "wg_win32_bitmap.h"
 #include "wg_log.h"
 #include <string.h>
 
@@ -112,7 +113,9 @@ static const unsigned char FONT8X8[95][8] = {
 typedef struct {
     bool     used;
     uint32_t handle;
-    uint32_t hwnd;
+    uint32_t hwnd;        // 0 for a memory DC
+    bool     is_memdc;
+    uint32_t sel_bitmap;  // HBITMAP selected into this DC (0 = none)
     uint32_t text_color;  // 0x00BBGGRR (COLORREF)
     uint32_t bk_color;
     int      bk_mode;     // 1=TRANSPARENT, 2=OPAQUE
@@ -275,4 +278,118 @@ uint32_t wg_gdi_brush_color(uint32_t hbrush, bool *found) {
     }
     if (found) *found = false;
     return 0x00FFFFFF;
+}
+
+// ---- Bitmaps / blitting -------------------------------------------------
+
+uint32_t wg_gdi_create_memory_dc(void) {
+    for (int i = 0; i < MAX_DCS; i++) {
+        if (!s_dcs[i].used) {
+            memset(&s_dcs[i], 0, sizeof(s_dcs[i]));
+            s_dcs[i].used = true;
+            s_dcs[i].handle = s_next_dc++;
+            s_dcs[i].is_memdc = true;
+            s_dcs[i].bk_color = 0x00FFFFFF;
+            s_dcs[i].bk_mode = 2;
+            return s_dcs[i].handle;
+        }
+    }
+    return 0;
+}
+
+void wg_gdi_delete_dc(uint32_t hdc) {
+    WGDC *dc = find_dc(hdc);
+    if (dc) dc->used = false;
+}
+
+uint32_t wg_gdi_select_bitmap(uint32_t hdc, uint32_t hbitmap) {
+    WGDC *dc = find_dc(hdc);
+    if (!dc) return 0;
+    uint32_t prev = dc->sel_bitmap;
+    dc->sel_bitmap = hbitmap;
+    return prev;
+}
+
+uint32_t wg_gdi_selected_bitmap(uint32_t hdc) {
+    WGDC *dc = find_dc(hdc);
+    return dc ? dc->sel_bitmap : 0;
+}
+
+// Resolve a DC to the pixel buffer it draws into: a window's client framebuffer
+// or, for a memory DC, its selected bitmap. *out_win receives the HWND to mark
+// dirty afterwards (0 for a memory DC).
+static uint32_t *dc_target(uint32_t hdc, int *w, int *h, uint32_t *out_win) {
+    WGDC *dc = find_dc(hdc);
+    if (out_win) *out_win = 0;
+    if (!dc) return NULL;
+    if (dc->is_memdc) {
+        return wg_bitmap_pixels(dc->sel_bitmap, w, h);
+    }
+    int32_t cw, ch;
+    uint32_t *fb = wg_wm_get_client(dc->hwnd, &cw, &ch);
+    if (!fb) return NULL;
+    if (w) *w = cw;
+    if (h) *h = ch;
+    if (out_win) *out_win = dc->hwnd;
+    return fb;
+}
+
+// Core stretch-blit from an RGBA8 source rect into a DC's target, nearest
+// neighbour, with simple straight-alpha "over" compositing.
+static void blit_pixels(uint32_t hdc_dst, int dx, int dy, int dw, int dh,
+                        const uint32_t *src, int src_w, int src_h,
+                        int sx, int sy, int sw, int sh) {
+    if (!src || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+    int tw, th; uint32_t win = 0;
+    uint32_t *dst = dc_target(hdc_dst, &tw, &th, &win);
+    if (!dst) return;
+
+    for (int j = 0; j < dh; j++) {
+        int ddy = dy + j;
+        if (ddy < 0 || ddy >= th) continue;
+        int ssy = sy + (j * sh) / dh;
+        if (ssy < 0 || ssy >= src_h) continue;
+        for (int i = 0; i < dw; i++) {
+            int ddx = dx + i;
+            if (ddx < 0 || ddx >= tw) continue;
+            int ssx = sx + (i * sw) / dw;
+            if (ssx < 0 || ssx >= src_w) continue;
+            uint32_t s = src[(size_t)ssy * src_w + ssx];
+            uint8_t a = (s >> 24) & 0xFF;
+            if (a == 0xFF) {
+                dst[(size_t)ddy * tw + ddx] = s;
+            } else if (a != 0) {
+                uint32_t d = dst[(size_t)ddy * tw + ddx];
+                uint32_t sr = s & 0xFF, sg = (s >> 8) & 0xFF, sb = (s >> 16) & 0xFF;
+                uint32_t dr = d & 0xFF, dg = (d >> 8) & 0xFF, db = (d >> 16) & 0xFF;
+                uint32_t r = (sr * a + dr * (255 - a)) / 255;
+                uint32_t g = (sg * a + dg * (255 - a)) / 255;
+                uint32_t b = (sb * a + db * (255 - a)) / 255;
+                dst[(size_t)ddy * tw + ddx] = r | (g << 8) | (b << 16) | (0xFFu << 24);
+            }
+        }
+    }
+    if (win) {
+        WGWin32Window *wn = wg_wm_find(win);
+        if (wn) wn->client_dirty = true;
+    }
+}
+
+void wg_gdi_draw_bitmap(uint32_t hdc_dst, int dx, int dy, int dw, int dh,
+                        uint32_t hbitmap, int sx, int sy, int sw, int sh) {
+    int bw, bh;
+    const uint32_t *src = wg_bitmap_pixels(hbitmap, &bw, &bh);
+    if (!src) return;
+    if (sw <= 0) sw = bw;
+    if (sh <= 0) sh = bh;
+    if (dw <= 0) dw = sw;
+    if (dh <= 0) dh = sh;
+    blit_pixels(hdc_dst, dx, dy, dw, dh, src, bw, bh, sx, sy, sw, sh);
+}
+
+void wg_gdi_blit(uint32_t hdc_dst, int dx, int dy, int dw, int dh,
+                 uint32_t hdc_src, int sx, int sy, int sw, int sh) {
+    uint32_t hbmp = wg_gdi_selected_bitmap(hdc_src);
+    if (!hbmp) return;
+    wg_gdi_draw_bitmap(hdc_dst, dx, dy, dw, dh, hbmp, sx, sy, sw, sh);
 }

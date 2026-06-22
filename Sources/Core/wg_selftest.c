@@ -260,6 +260,13 @@ static void test_blink_bridge(void) {
     CHECK(blink != NULL, "Blink VM created");
     if (!blink) return;
 
+    // Map a real stack. Without this SP is 0, so any CALL/PUSH faults on its
+    // store to [SP-8] — which is exactly why the CALL/RET test used to "fail"
+    // (the call faulted before reaching the callee, leaving RAX/RCX at 0). The
+    // real PE path sets this up via wg_blink_setup_stack(); the self-test must
+    // too or it slanders blink's perfectly-good CALL/RET handling.
+    CHECK(wg_blink_setup_stack(blink, 0x400000), "Blink: stack set up");
+
     // Warm-up: first execution after VM creation can trigger a one-time
     // JIT/page-fault abort on iOS. Run a NOP+RET to prime the VM.
     {
