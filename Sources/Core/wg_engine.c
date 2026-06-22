@@ -208,18 +208,19 @@ static uint32_t s_dlg_proc     = 0;     // the dialog procedure (for WM_COMMAND)
 static uint32_t s_dlg_result   = 1;
 
 typedef struct {
-    uint32_t hwnd;          // owning dialog window
-    uint32_t id;            // control id
+    uint32_t hwnd;            // owning dialog window
+    uint32_t id;              // control id
     uint32_t style;
-    int16_t  x, y, cx, cy;  // dialog units
-    uint16_t cls;           // 0x80 button, 0x82 static, 0x81 edit, ...
-    bool     is_bitmap;     // SS_BITMAP static
+    int16_t  x, y, cx, cy;    // dialog units
+    int16_t  dlg_cx, dlg_cy;  // this dialog's unit extent (for scaling)
+    uint16_t cls;             // 0x80 button, 0x82 static, 0x81 edit, ...
+    bool     is_bitmap;       // SS_BITMAP static
     uint32_t hbitmap;
     uint16_t text[80];
 } WGDlgCtrl;
-static WGDlgCtrl s_ctrls[96];
+static WGDlgCtrl s_ctrls[160];
 static int       s_ctrl_count = 0;
-static int       s_dlg_cx = 331, s_dlg_cy = 222; // dialog-unit extent
+static int       s_dlg_cx = 331, s_dlg_cy = 222; // last-parsed dialog-unit extent
 
 static WGDlgCtrl *wg_find_ctrl(uint32_t hwnd, uint32_t id) {
     for (int i = 0; i < s_ctrl_count; i++)
@@ -227,7 +228,7 @@ static WGDlgCtrl *wg_find_ctrl(uint32_t hwnd, uint32_t id) {
     return NULL;
 }
 static WGDlgCtrl *wg_ctrl_from_handle(uint32_t h) {
-    if (h >= WG_CTRL_HWND_BASE && h < WG_CTRL_HWND_BASE + 96) {
+    if (h >= WG_CTRL_HWND_BASE && h < WG_CTRL_HWND_BASE + 160) {
         int idx = (int)(h - WG_CTRL_HWND_BASE);
         if (idx < s_ctrl_count) return &s_ctrls[idx];
     }
@@ -280,8 +281,14 @@ static const uint8_t *res_skip_sz(const uint8_t *p, uint16_t *out, int cap) {
     if (out) out[k] = 0;
     return p;
 }
+static void wg_remove_ctrls(uint32_t hwnd) {
+    int n = 0;
+    for (int i = 0; i < s_ctrl_count; i++)
+        if (s_ctrls[i].hwnd != hwnd) s_ctrls[n++] = s_ctrls[i];
+    s_ctrl_count = n;
+}
 static void wg_parse_dialog(WGEngine *engine, uint32_t hwnd, uint32_t dlg_id) {
-    s_ctrl_count = 0;
+    wg_remove_ctrls(hwnd);          // replace this window's controls
     if (!engine->pe_image) return;
     const uint8_t *t = pe_find_dialog(engine->pe_image, dlg_id);
     if (!t) { WG_LOGI(TAG, "dialog %u: no template", dlg_id); return; }
@@ -291,19 +298,22 @@ static void wg_parse_dialog(WGEngine *engine, uint32_t hwnd, uint32_t dlg_id) {
     uint32_t style; memcpy(&style, p, 4); p += 4;
     uint16_t cItems; memcpy(&cItems, p, 2); p += 2;
     p += 4;                                     // x, y
-    memcpy(&s_dlg_cx, p, 2); p += 2;
-    memcpy(&s_dlg_cy, p, 2); p += 2;
+    int16_t dcx, dcy;
+    memcpy(&dcx, p, 2); p += 2;
+    memcpy(&dcy, p, 2); p += 2;
+    s_dlg_cx = dcx; s_dlg_cy = dcy;
     p = res_skip_sz(p, NULL, 0);                // menu
     p = res_skip_sz(p, NULL, 0);                // class
     p = res_skip_sz(p, NULL, 0);                // title
     if (style & 0x40 /*DS_SETFONT*/) { p += 6; p = res_skip_sz(p, NULL, 0); }
-    for (int i = 0; i < cItems && s_ctrl_count < 96; i++) {
+    for (int i = 0; i < cItems && s_ctrl_count < 160; i++) {
         size_t aoff = ((size_t)(p - t) + 3) & ~(size_t)3; p = t + aoff;  // dword align
         p += 4 + 4;                             // helpID, exStyle
         uint32_t cstyle; memcpy(&cstyle, p, 4); p += 4;
         WGDlgCtrl *c = &s_ctrls[s_ctrl_count++];
         memset(c, 0, sizeof(*c));
         c->hwnd = hwnd; c->style = cstyle;
+        c->dlg_cx = dcx; c->dlg_cy = dcy;
         memcpy(&c->x, p, 2); memcpy(&c->y, p + 2, 2);
         memcpy(&c->cx, p + 4, 2); memcpy(&c->cy, p + 6, 2); p += 8;
         memcpy(&c->id, p, 4); p += 4;
@@ -326,23 +336,35 @@ static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
     uint32_t dc = wg_gdi_get_dc(hwnd);
     if (!dc) return;
     wg_gdi_fill_rect(dc, 0, 0, cw, ch, 0x00FFFFFF);          // white dialog bg
-    float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
-    float sy = s_dlg_cy ? (float)ch / s_dlg_cy : 1.0f;
     for (int i = 0; i < s_ctrl_count; i++) {
         WGDlgCtrl *c = &s_ctrls[i];
         if (c->hwnd != hwnd) continue;
         if (!(c->style & 0x10000000u /*WS_VISIBLE*/)) continue;
+        float sx = c->dlg_cx ? (float)cw / c->dlg_cx : 1.0f;
+        float sy = c->dlg_cy ? (float)ch / c->dlg_cy : 1.0f;
         int px = (int)(c->x * sx), py = (int)(c->y * sy);
         int pw = (int)(c->cx * sx), ph = (int)(c->cy * sy);
         int tlen = 0; while (tlen < 79 && c->text[tlen]) tlen++;
-        if (c->cls == 0x0080) {                 // button
-            wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00E1E1E1);
-            if (tlen) wg_gdi_text_out(dc, px + 6, py + (ph - 16) / 2, c->text, tlen);
+        if (c->cls == 0x0080) {                 // button (incl. group box)
+            if ((c->style & 0x07) == 0x07 /*BS_GROUPBOX*/) {
+                // frame + caption, no fill
+                wg_gdi_fill_rect(dc, px, py, px + pw, py + 1, 0x00A0A0A0);
+                if (tlen) wg_gdi_text_out(dc, px + 6, py - 4, c->text, tlen);
+            } else {
+                wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00E1E1E1);
+                int tx = px + 6;
+                if (tlen) wg_gdi_text_out(dc, tx, py + (ph - 8) / 2, c->text, tlen);
+            }
         } else if (c->cls == 0x0082) {          // static
             if (c->is_bitmap && c->hbitmap)
                 wg_gdi_draw_bitmap(dc, px, py, pw, ph, c->hbitmap, 0, 0, 0, 0);
             else if (tlen)
                 wg_gdi_text_out(dc, px, py, c->text, tlen);
+        } else if (c->cls == 0x0081) {          // edit box
+            wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00FFFFFF);
+            wg_gdi_fill_rect(dc, px, py, px + pw, py + 1, 0x00808080);   // top border
+            wg_gdi_fill_rect(dc, px, py, px + 1, py + ph, 0x00808080);   // left border
+            if (tlen) wg_gdi_text_out(dc, px + 3, py + (ph - 8) / 2, c->text, tlen);
         }
     }
     wg_gdi_release_dc(dc);
@@ -356,7 +378,7 @@ static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
 // it returns, the sentinel restores the SendMessage caller with the result. A
 // small stack handles nested SendMessages (NSIS nests them heavily).
 #define WG_SENDMSG_SENTINEL 0xC10010u
-typedef struct { uint32_t ret_addr, ret_rsp; } WGPendingCall;
+typedef struct { uint32_t ret_addr, ret_rsp, ovr_eax; bool ovr; } WGPendingCall;
 static WGPendingCall s_callstack[64];
 static int           s_callstack_depth = 0;
 
@@ -368,12 +390,15 @@ static uint32_t wg_resolve_wndproc(uint32_t hwnd) {
 
 // Set up a nested call proc(hwnd, msg, wParam, lParam) returning to the given
 // caller (ret_addr/clean_rsp) with the proc's EAX. Returns true if armed.
-static bool wg_call_wndproc(WGEngine *engine, uint32_t proc, uint32_t hwnd,
-                            uint32_t msg, uint32_t wp, uint32_t lp,
-                            uint32_t ret_addr, uint32_t clean_rsp) {
+static bool wg_call_wndproc_ovr(WGEngine *engine, uint32_t proc, uint32_t hwnd,
+                                uint32_t msg, uint32_t wp, uint32_t lp,
+                                uint32_t ret_addr, uint32_t clean_rsp,
+                                bool ovr, uint32_t ovr_eax) {
     if (!proc || s_callstack_depth >= 64) return false;
     s_callstack[s_callstack_depth].ret_addr = ret_addr;
     s_callstack[s_callstack_depth].ret_rsp  = clean_rsp;
+    s_callstack[s_callstack_depth].ovr      = ovr;
+    s_callstack[s_callstack_depth].ovr_eax  = ovr_eax;
     s_callstack_depth++;
     uint32_t new_rsp = clean_rsp - 20;
     uint32_t sd[5] = { WG_SENDMSG_SENTINEL, hwnd, msg, wp, lp };
@@ -382,6 +407,12 @@ static bool wg_call_wndproc(WGEngine *engine, uint32_t proc, uint32_t hwnd,
     wg_blink_set_rip(engine->blink, proc);
     wg_blink_set_reg(engine->blink, 0, 0);
     return true;
+}
+static bool wg_call_wndproc(WGEngine *engine, uint32_t proc, uint32_t hwnd,
+                            uint32_t msg, uint32_t wp, uint32_t lp,
+                            uint32_t ret_addr, uint32_t clean_rsp) {
+    return wg_call_wndproc_ovr(engine, proc, hwnd, msg, wp, lp,
+                               ret_addr, clean_rsp, false, 0);
 }
 
 // Check if RIP is in the thunk range and handle the Win32 API call.
@@ -410,8 +441,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
         uint32_t result = (uint32_t)wg_blink_get_reg(engine->blink, 0);
         if (s_callstack_depth > 0) {
             s_callstack_depth--;
-            wg_blink_set_reg(engine->blink, 4, s_callstack[s_callstack_depth].ret_rsp);
-            wg_blink_set_rip(engine->blink, s_callstack[s_callstack_depth].ret_addr);
+            WGPendingCall *pc = &s_callstack[s_callstack_depth];
+            // CreateDialog dispatches WM_INITDIALOG but must still return the
+            // HWND, not the dlgproc's result — that's what ovr_eax carries.
+            if (pc->ovr) result = pc->ovr_eax;
+            wg_blink_set_reg(engine->blink, 4, pc->ret_rsp);
+            wg_blink_set_rip(engine->blink, pc->ret_addr);
             wg_blink_set_reg(engine->blink, 0, result);
             if (s_dlg_active && s_dlg_hwnd) wg_render_dialog(engine, s_dlg_hwnd);
         } else {
@@ -496,6 +531,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 1;
         } else if (strcmp(fn, "DestroyWindow") == 0) {
             wg_wm_destroy(args[0]);
+            wg_remove_ctrls(args[0]);   // drop the page's controls
             ret_val = 1;
         } else if (strcmp(fn, "SetWindowTextW") == 0) {
             uint16_t text_buf[256] = {0};
@@ -1080,27 +1116,37 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0;
             }
         } else if (strcmp(fn, "CreateDialogParamW") == 0) {
-            // CreateDialogParamW(hInstance, lpTemplateName, hWndParent=args[2], ...)
-            // The NSIS inner page goes into the IDD_INST inner-dialog placeholder
-            // (control id 1018) — position it there so the parent's header bitmap
-            // and Back/Next/Cancel buttons stay visible around it.
-            uint32_t parent = args[2];
+            // CreateDialogParamW(hInstance, lpTemplateName=args[1], hWndParent=args[2],
+            //                    lpDialogFunc=args[3], dwInitParam=args[4])
+            uint32_t dlg_id = args[1], parent = args[2], dlgproc = args[3];
+            uint32_t initParam = args[4];
+            // Position the inner page in the IDD_INST inner-dialog placeholder
+            // (id 1018) so the parent's header/buttons stay visible around it.
             int px = 0, py = 0, pw = 480, ph = 320;
             WGDlgCtrl *placeholder = wg_find_ctrl(parent, 1018);
             if (placeholder) {
                 int32_t cw = 0, chh = 0;
                 wg_wm_get_client(parent, &cw, &chh);
-                float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
-                float sy = s_dlg_cy ? (float)chh / s_dlg_cy : 1.0f;
+                float sx = placeholder->dlg_cx ? (float)cw / placeholder->dlg_cx : 1.0f;
+                float sy = placeholder->dlg_cy ? (float)chh / placeholder->dlg_cy : 1.0f;
                 px = (int)(placeholder->x * sx); py = (int)(placeholder->y * sy);
                 pw = (int)(placeholder->cx * sx); ph = (int)(placeholder->cy * sy);
             }
             uint16_t title[] = {0};
-            ret_val = wg_wm_create_window(0, 0, title, 0x50000000, // WS_CHILD|WS_VISIBLE
-                                           px, py, pw, ph, parent);
-            // Remember the page's dialog proc so SendMessage dispatches to it.
-            WGWin32Window *pw_win = wg_wm_find((uint32_t)ret_val);
-            if (pw_win) pw_win->wndproc = args[3];
+            uint32_t hwnd = wg_wm_create_window(0, 0, title, 0x50000000,
+                                                px, py, pw, ph, parent);
+            WGWin32Window *pw_win = wg_wm_find(hwnd);
+            if (pw_win) pw_win->wndproc = dlgproc;
+            (void)initParam;
+            // Parse the page's own dialog template (e.g. the directory page) so
+            // we can render its controls — these are built-in NSIS dialogs, not
+            // nsDialogs plugin pages. NSIS drives the page's WM_INITDIALOG /
+            // SetDlgItemText itself (which our handlers render), so we just
+            // create the window, render the template, and return the HWND.
+            wg_parse_dialog(engine, hwnd, dlg_id);
+            wg_render_dialog(engine, hwnd);
+            WG_LOGI(TAG, "CreateDialogParamW(template=%u) -> page HWND=0x%X", dlg_id, hwnd);
+            ret_val = hwnd;
         } else if (strcmp(fn, "GetLastError") == 0) {
             ret_val = s_last_error;
         } else if (strcmp(fn, "SetLastError") == 0) {
@@ -1884,12 +1930,12 @@ uint32_t wg_engine_hit_test(WGEngine *engine, int virt_x, int virt_y) {
     int cx = virt_x - w->x;
     int cy = virt_y - (w->y + tb);            // into client coords
     if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) return 0;
-    float sx = s_dlg_cx ? (float)cw / s_dlg_cx : 1.0f;
-    float sy = s_dlg_cy ? (float)ch / s_dlg_cy : 1.0f;
     for (int i = 0; i < s_ctrl_count; i++) {
         WGDlgCtrl *c = &s_ctrls[i];
         if (c->hwnd != s_dlg_hwnd || c->cls != 0x0080) continue;  // buttons only
         if (!(c->style & 0x10000000u)) continue;                  // WS_VISIBLE
+        float sx = c->dlg_cx ? (float)cw / c->dlg_cx : 1.0f;
+        float sy = c->dlg_cy ? (float)ch / c->dlg_cy : 1.0f;
         int px = (int)(c->x * sx), py = (int)(c->y * sy);
         int pw = (int)(c->cx * sx), ph = (int)(c->cy * sy);
         if (cx >= px && cx < px + pw && cy >= py && cy < py + ph) return c->id;
