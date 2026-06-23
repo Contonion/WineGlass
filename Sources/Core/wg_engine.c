@@ -301,6 +301,7 @@ static uint32_t s_fls_next = 0;
 static bool s_event_signalled[WG_MAX_EVENTS];
 static uint32_t s_event_next = 0;
 static uint32_t s_main_teb = 0; // TEB address of main thread
+static bool s_cmdpage_mapped = false;
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
 static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
@@ -1403,22 +1404,27 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "GetVersion") == 0) {
             ret_val = 0x00000A00;
-        } else if (strcmp(fn, "GetCommandLineW") == 0) {
-            const char *winpath = wg_files_exe_win_path();
-            uint16_t wcmd[520] = {0};
-            wcmd[0] = '"';
-            int i = 0;
-            for (; winpath[i] && i < 510; i++)
-                wcmd[i + 1] = (uint8_t)winpath[i];
-            wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
-            wg_blink_write_mem(engine->blink, 0xA00000, wcmd, (i + 3) * 2);
-            ret_val = 0xA00000;
-        } else if (strcmp(fn, "GetCommandLineA") == 0) {
-            const char *winpath = wg_files_exe_win_path();
-            char acmd[520];
-            snprintf(acmd, sizeof(acmd), "\"%s\"", winpath);
-            wg_blink_write_mem(engine->blink, 0xA00100, acmd, strlen(acmd) + 1);
-            ret_val = 0xA00100;
+        } else if (strcmp(fn, "GetCommandLineW") == 0 ||
+                   strcmp(fn, "GetCommandLineA") == 0) {
+            // Map a page at 0xA00000 on first call (W at +0, A at +0x100)
+            if (!s_cmdpage_mapped) {
+                const char *winpath = wg_files_exe_win_path();
+                uint8_t page[0x1000];
+                memset(page, 0, sizeof(page));
+                // Wide command line at offset 0
+                uint16_t *wcmd = (uint16_t *)page;
+                wcmd[0] = '"';
+                int i = 0;
+                for (; winpath[i] && i < 250; i++)
+                    wcmd[i + 1] = (uint8_t)winpath[i];
+                wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
+                // ANSI command line at offset 0x100
+                char *acmd = (char *)(page + 0x100);
+                snprintf(acmd, 256, "\"%s\"", winpath);
+                wg_blink_load_code(engine->blink, 0xA00000, page, 0x1000, 0);
+                s_cmdpage_mapped = true;
+            }
+            ret_val = (fn[14] == 'W') ? 0xA00000 : 0xA00100;
         } else if (strcmp(fn, "CommandLineToArgvW") == 0) {
             // CommandLineToArgvW(lpCmdLine=args[0], pNumArgs=args[1])
             // Read the wide command line from guest memory
@@ -3298,6 +3304,7 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_event_next = 0;
     memset(s_event_signalled, 0, sizeof(s_event_signalled));
     s_alloc_count = 0;
+    s_cmdpage_mapped = false;
     wg_bitmap_reset_all();
 
     // Reset the loaded-DLL table (fresh VM => previous mappings are gone).
