@@ -40,6 +40,9 @@ uint64_t wg_dll_mapper_register(WGDllMapper *mapper, const char *dll,
 
 uint64_t wg_dll_mapper_resolve(WGDllMapper *mapper, const char *dll, const char *func);
 
+// Like resolve but searches ALL registered DLLs for `func`. Returns 0 if not found.
+uint64_t wg_dll_mapper_find_any(WGDllMapper *mapper, const char *func);
+
 WGWin32StubFunc wg_dll_mapper_get_handler(WGDllMapper *mapper, uint64_t thunk_addr);
 
 void wg_dll_mapper_register_defaults(WGDllMapper *mapper);

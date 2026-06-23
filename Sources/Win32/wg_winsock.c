@@ -17,10 +17,7 @@
 
 #define TAG "WSock"
 
-// blink memory access (declared in wg_blink_bridge.h, but we only need
-// read/write — keep the dependency light by declaring the two we use).
-extern void wg_blink_read_mem(void *vm, uint64_t addr, void *buf, uint32_t len);
-extern void wg_blink_write_mem(void *vm, uint64_t addr, const void *buf, uint32_t len);
+#include "wg_blink_bridge.h"
 
 // ── Windows socket constants ────────────────────────────────────────
 #define WSADESCRIPTION_LEN  256
@@ -598,16 +595,18 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     }
 
     // ── WSASocketW(af, type, proto, info, group, flags) ─────────────
-    if (strcmp(fn, "WSASocketW") == 0) {
+    if (strcmp(fn, "WSASocketW") == 0 || strcmp(fn, "WSASocketA") == 0) {
         int af = (int)args[0], type = (int)args[1], proto = (int)args[2];
+        WG_LOGI(TAG, "%s(af=%d, type=%d, proto=%d)", fn, af, type, proto);
         if (af == WIN_AF_INET6) af = AF_INET6;
         int fd = socket(af, type, proto);
         if (fd < 0) {
             ws->last_error = errno_to_wsa(errno);
+            WG_LOGW(TAG, "%s FAILED: %s (errno=%d)", fn, strerror(errno), errno);
             *out_ret = WIN_INVALID_SOCKET;
         } else {
             *out_ret = alloc_socket(ws, fd);
-            WG_LOGI(TAG, "WSASocketW(%d,%d,%d) -> 0x%X", args[0], args[1], args[2], (uint32_t)*out_ret);
+            WG_LOGI(TAG, "%s -> 0x%X (fd=%d)", fn, (uint32_t)*out_ret, fd);
         }
         return true;
     }

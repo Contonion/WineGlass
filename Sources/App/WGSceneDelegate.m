@@ -238,6 +238,7 @@
     _engineThread = [[NSThread alloc] initWithTarget:self
                                             selector:@selector(engineLoop)
                                               object:nil];
+    _engineThread.stackSize = 4 * 1024 * 1024; // 4MB — handle_blink_thunk is large
     _engineThread.qualityOfService = NSQualityOfServiceUserInteractive;
     _engineThread.name = @"WineGlass-Engine";
     [_engineThread start];

@@ -281,6 +281,13 @@ static uint32_t s_tls_slots[1088] = {0};
 static uint32_t s_tls_next = 0;
 static uint32_t s_fls_slots[1088] = {0};   // Fiber-Local Storage (CRT uses it)
 static uint32_t s_fls_next = 0;
+
+// Fake event/mutex/semaphore handles. Single-threaded, so events are just
+// signalled/unsignalled flags. Handles start at 0x200 to avoid collisions.
+#define WG_EVENT_BASE   0x200u
+#define WG_MAX_EVENTS   256
+static bool s_event_signalled[WG_MAX_EVENTS];
+static uint32_t s_event_next = 0;
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
 static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
@@ -1175,7 +1182,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     WG_LOGI(TAG, "GetProcAddress(%s) -> 0x%X (module export)",
                             func_name, exp);
                 } else {
-                    ret_val = wg_dll_mapper_resolve(engine->dll_mapper, dll, func_name);
+                    // Try the specific DLL first, then search all registered
+                    // DLLs (GetProcAddress is often called with ws2_32/user32
+                    // handles but we only have one mapper namespace).
+                    ret_val = wg_dll_mapper_find_any(engine->dll_mapper, func_name);
+                    if (!ret_val) {
+                        ret_val = wg_dll_mapper_resolve(engine->dll_mapper, dll, func_name);
+                    }
                     if (ret_val >= 0xC00000ULL && ret_val < 0xC00000ULL + 0x20000) {
                         uint8_t hlt = 0xF4;
                         wg_blink_write_mem(engine->blink, ret_val, &hlt, 1);
@@ -1234,7 +1247,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_read_mem(engine->blink, args[0], modname, 255);
                 WG_LOGD(TAG, "GetModuleHandleA('%s')", modname);
                 if (strcasestr(modname, "kernel32") ||
+                    strcasestr(modname, "kernelbase") ||
                     strcasestr(modname, "ntdll") ||
+                    strcasestr(modname, "ws2_32") ||
+                    strcasestr(modname, "wsock32") ||
+                    strcasestr(modname, "advapi32") ||
+                    strcasestr(modname, "user32") ||
+                    strcasestr(modname, "gdi32") ||
+                    strcasestr(modname, "shell32") ||
+                    strcasestr(modname, "ole32") ||
+                    strcasestr(modname, "crypt32") ||
+                    strcasestr(modname, "bcrypt") ||
+                    strcasestr(modname, "msvcrt") ||
+                    strcasestr(modname, "ucrtbase") ||
                     strcasestr(modname, "api-ms-win")) {
                     ret_val = 0xBFFF0000u;
                 } else {
@@ -1262,7 +1287,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 } else if (loaded) {
                     ret_val = loaded;
                 } else if (strcasestr(ascii, "kernel32") ||
+                           strcasestr(ascii, "kernelbase") ||
                            strcasestr(ascii, "ntdll") ||
+                           strcasestr(ascii, "ws2_32") ||
+                           strcasestr(ascii, "wsock32") ||
+                           strcasestr(ascii, "advapi32") ||
+                           strcasestr(ascii, "user32") ||
+                           strcasestr(ascii, "gdi32") ||
+                           strcasestr(ascii, "shell32") ||
+                           strcasestr(ascii, "ole32") ||
+                           strcasestr(ascii, "crypt32") ||
+                           strcasestr(ascii, "bcrypt") ||
+                           strcasestr(ascii, "msvcrt") ||
+                           strcasestr(ascii, "ucrtbase") ||
                            strcasestr(ascii, "api-ms-win")) {
                     ret_val = 0xBFFF0000u;
                 } else {
@@ -1377,9 +1414,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 ret_val = base;
             }
+        } else if (strcmp(fn, "GetModuleFileNameA") == 0) {
+            // GetModuleFileNameA(hModule, lpFilename, nSize)
+            uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+            const char *path;
+            if (args[0] == 0 || args[0] == base)
+                path = wg_files_exe_win_path();
+            else
+                path = "C:\\Windows\\System32\\kernel32.dll";
+            int len = (int)strlen(path);
+            if (args[1] && args[2] > 0) {
+                int max = (int)args[2] - 1;
+                if (len > max) len = max;
+                wg_blink_write_mem(engine->blink, args[1], path, len + 1);
+            }
+            ret_val = len;
         } else if (strcmp(fn, "GetModuleFileNameW") == 0) {
             // GetModuleFileNameW(hModule, lpFilename, nSize)
-            const char *winpath = wg_files_exe_win_path();
+            uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+            const char *winpath;
+            if (args[0] == 0 || args[0] == base)
+                winpath = wg_files_exe_win_path();
+            else
+                winpath = "C:\\Windows\\System32\\kernel32.dll";
             int len = (int)strlen(winpath);
             if (args[1] && args[2] > 0) {
                 int max = (int)args[2] - 1;
@@ -1832,6 +1889,21 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // No environment set — always "not found"
             s_last_error = 203; // ERROR_ENVVAR_NOT_FOUND
             ret_val = 0;
+        } else if (strcmp(fn, "OutputDebugStringA") == 0) {
+            if (args[0]) {
+                char dbg[512] = {0};
+                wg_blink_read_mem(engine->blink, args[0], dbg, 511);
+                WG_LOGI(TAG, "DbgPrint: %s", dbg);
+            }
+        } else if (strcmp(fn, "OutputDebugStringW") == 0) {
+            if (args[0]) {
+                uint16_t wdbg[256] = {0};
+                wg_blink_read_mem(engine->blink, args[0], wdbg, 510);
+                char dbg[256] = {0};
+                for (int i = 0; i < 255 && wdbg[i]; i++)
+                    dbg[i] = wdbg[i] < 128 ? (char)wdbg[i] : '?';
+                WG_LOGI(TAG, "DbgPrint: %s", dbg);
+            }
         } else if (strcmp(fn, "AppPolicyGetProcessTerminationMethod") == 0) {
             // AppPolicyGetProcessTerminationMethod(token, *policy)
             // Write 0 (ExitProcess) to *policy, return ERROR_SUCCESS
@@ -2043,6 +2115,50 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = dst;
+        } else if (strcmp(fn, "CreateEventA") == 0 ||
+                   strcmp(fn, "CreateEventW") == 0) {
+            // CreateEvent(lpSecurityAttributes, bManualReset, bInitialState, lpName)
+            uint32_t handle = 0;
+            if (s_event_next < WG_MAX_EVENTS) {
+                uint32_t idx = s_event_next++;
+                s_event_signalled[idx] = (args[2] != 0);
+                handle = WG_EVENT_BASE + idx;
+            }
+            ret_val = handle;
+        } else if (strcmp(fn, "SetEvent") == 0) {
+            uint32_t h = args[0];
+            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+                s_event_signalled[h - WG_EVENT_BASE] = true;
+            ret_val = 1;
+        } else if (strcmp(fn, "ResetEvent") == 0) {
+            uint32_t h = args[0];
+            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+                s_event_signalled[h - WG_EVENT_BASE] = false;
+            ret_val = 1;
+        } else if (strcmp(fn, "WaitForSingleObject") == 0) {
+            // Single-threaded: events are either signalled or not.
+            // Return WAIT_OBJECT_0 (0) if signalled, WAIT_TIMEOUT (258) otherwise.
+            uint32_t h = args[0];
+            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS) {
+                ret_val = s_event_signalled[h - WG_EVENT_BASE] ? 0 : 258;
+            } else {
+                ret_val = 0; // WAIT_OBJECT_0
+            }
+        } else if (strcmp(fn, "WaitForMultipleObjects") == 0) {
+            ret_val = 0; // WAIT_OBJECT_0
+        } else if (strcmp(fn, "CreateMutexW") == 0 ||
+                   strcmp(fn, "CreateMutexA") == 0) {
+            // Return a unique fake handle. Steam uses mutexes for single-instance.
+            if (s_event_next < WG_MAX_EVENTS) {
+                ret_val = WG_EVENT_BASE + s_event_next++;
+            }
+            s_last_error = 0; // not ERROR_ALREADY_EXISTS
+        } else if (strcmp(fn, "OpenMutexW") == 0 ||
+                   strcmp(fn, "OpenMutexA") == 0) {
+            ret_val = 0; // mutex not found
+            s_last_error = 2; // ERROR_FILE_NOT_FOUND
+        } else if (strcmp(fn, "ReleaseMutex") == 0) {
+            ret_val = 1;
         } else if (strcmp(fn, "CreateThread") == 0) {
             // CreateThread(secAttr, stackSize, start=args[2], param=args[3],
             //              flags=args[4], lpThreadId=args[5]).
@@ -2614,27 +2730,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     case 21: ws_fn = "setsockopt"; break;
                     case 22: ws_fn = "shutdown"; break;
                     case 23: ws_fn = "socket"; break;
-                    case 32: ws_fn = "WSAEnumNetworkEvents"; break;
-                    case 33: ws_fn = "WSAEventSelect"; break;
-                    case 36: ws_fn = "WSAIoctl"; break;
-                    case 51: ws_fn = "getaddrinfo"; break;
-                    case 52: ws_fn = "freeaddrinfo"; break;
-                    case 67: ws_fn = "WSARecv"; break;
-                    case 72: ws_fn = "WSASend"; break;
-                    case 73: ws_fn = "WSASendTo"; break;
-                    case 74: ws_fn = "WSARecvFrom"; break;
-                    case 111: ws_fn = "WSAStartup"; break;
-                    case 112: ws_fn = "WSACleanup"; break;
+                    case 52: ws_fn = "gethostbyname"; break;
+                    case 111: ws_fn = "WSAEnumNetworkEvents"; break;
+                    case 112: ws_fn = "WSAEventSelect"; break;
                     case 113: ws_fn = "WSAGetLastError"; break;
-                    case 115: ws_fn = "WSASocketW"; break;
-                    case 116: ws_fn = "WSASetLastError"; break;
+                    case 115: ws_fn = "WSAStartup"; break;
+                    case 116: ws_fn = "WSACleanup"; break;
                     case 1142: ws_fn = "WSAStartup"; break; // WSOCK32
                     default: break;
                 }
             }
             uint64_t ws_ret = 0;
+            WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
             if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
                 ret_val = ws_ret;
+            } else {
+                WG_LOGW(TAG, "WS2_32 unhandled: %s", ws_fn);
             }
         }
     }
@@ -2876,6 +2987,33 @@ static bool load_pe_blink(WGEngine *engine) {
         }
     }
 
+    // Map a minimal PE stub at the fake system-DLL handle (0xBFFF0000) so
+    // programs that walk kernel32's PE export table (GetModuleHandle +
+    // manual export parsing) find valid headers but an empty export dir.
+    {
+        uint8_t fake[0x200];
+        memset(fake, 0, sizeof(fake));
+        // DOS header
+        fake[0] = 'M'; fake[1] = 'Z';
+        // e_lfanew at offset 0x3C -> PE header at 0x80
+        uint32_t pe_off = 0x80;
+        memcpy(fake + 0x3C, &pe_off, 4);
+        // PE signature
+        fake[0x80] = 'P'; fake[0x81] = 'E';
+        // COFF: Machine=0x14C (i386), NumberOfSections=0
+        uint16_t machine = 0x14C;
+        memcpy(fake + 0x84, &machine, 2);
+        // SizeOfOptionalHeader = 0xE0 (standard PE32)
+        uint16_t opt_sz = 0xE0;
+        memcpy(fake + 0x94, &opt_sz, 2);
+        // Optional header magic = PE32 (0x10B)
+        uint16_t magic = 0x10B;
+        memcpy(fake + 0x98, &magic, 2);
+        // Export directory RVA at OptionalHeader + 0x60 (offset 0x98+0x60=0xF8)
+        // Leave it 0 (no exports)
+        wg_blink_load_code(engine->blink, 0xBFFF0000u, fake, sizeof(fake), 0);
+    }
+
     WG_LOGI(TAG, "PE mapped via blink. Entry: 0x%llx", (unsigned long long)entry);
     return true;
 }
@@ -2953,6 +3091,8 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     memset(s_tls_slots, 0, sizeof(s_tls_slots));
     s_fls_next = 0;
     memset(s_fls_slots, 0, sizeof(s_fls_slots));
+    s_event_next = 0;
+    memset(s_event_signalled, 0, sizeof(s_event_signalled));
     wg_bitmap_reset_all();
 
     // Reset the loaded-DLL table (fresh VM => previous mappings are gone).
