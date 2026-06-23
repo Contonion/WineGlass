@@ -18,6 +18,7 @@ static char s_exe_dir[1024]  = {0};
 // the installed app lands in e.g. drive_c/Program Files (x86)/Steam instead of
 // being scattered through one-off temp mappings.
 static char s_drive_c[1024]  = {0};
+static bool s_win_path_cached = false;
 
 // Recursively create a directory and all missing parents (like `mkdir -p`).
 static void mkdir_p(const char *path) {
@@ -134,6 +135,7 @@ void wg_files_set_exe_path(const char *path) {
     WG_LOGI(TAG, "EXE path: %s", s_exe_path);
     WG_LOGI(TAG, "EXE dir: %s", s_exe_dir);
     s_drive_c[0] = '\0';   // re-anchor the bottle to this exe's directory
+    s_win_path_cached = false;
     ensure_bottle();
 }
 
@@ -165,17 +167,15 @@ static bool find_in_bottle(const char *dir, const char *name, char *out, int out
 
 const char *wg_files_exe_win_path(void) {
     static char win[1024];
+    if (s_win_path_cached) return win;
     ensure_bottle();
     size_t dc_len = strlen(s_drive_c);
     if (dc_len > 0 && strncmp(s_exe_path, s_drive_c, dc_len) == 0) {
-        // Exe is inside the bottle — derive the Windows path directly
         const char *rel = s_exe_path + dc_len;
         while (*rel == '/') rel++;
         snprintf(win, sizeof(win), "C:\\%s", rel);
         for (char *p = win; *p; p++) { if (*p == '/') *p = '\\'; }
     } else {
-        // Exe is outside the bottle (user-picked). Search the bottle
-        // for a file with the same name so steam sees the right path.
         const char *fname = strrchr(s_exe_path, '/');
         fname = fname ? fname + 1 : s_exe_path;
         char found[1024] = {0};
@@ -189,7 +189,12 @@ const char *wg_files_exe_win_path(void) {
             snprintf(win, sizeof(win), "C:\\a.exe");
         }
     }
+    s_win_path_cached = true;
     return win;
+}
+
+void wg_files_reset_win_path_cache(void) {
+    s_win_path_cached = false;
 }
 
 static void fix_separators(char *path) {

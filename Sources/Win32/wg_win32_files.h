@@ -12,6 +12,7 @@ void wg_files_set_exe_path(const char *path);
 
 // The Windows-style path to the loaded exe (e.g. "C:\Program Files\Steam\steam.exe").
 const char *wg_files_exe_win_path(void);
+void wg_files_reset_win_path_cache(void);
 
 // The bottle's C: drive (a persistent prefix dir, like a Wine/CrossOver bottle).
 // All guest C:\ paths map under here. Returns the real drive_c path (or "").

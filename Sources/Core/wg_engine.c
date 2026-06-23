@@ -721,6 +721,27 @@ static bool wg_call_wndproc(WGEngine *engine, uint32_t proc, uint32_t hwnd,
                                ret_addr, clean_rsp, false, 0);
 }
 
+// Allocation size tracking for HeapSize
+#define WG_MAX_ALLOCS 8192
+static struct { uint32_t addr; uint32_t size; } s_alloc_sizes[WG_MAX_ALLOCS];
+static int s_alloc_count = 0;
+
+static void track_alloc(uint32_t addr, uint32_t size) {
+    if (s_alloc_count < WG_MAX_ALLOCS) {
+        s_alloc_sizes[s_alloc_count].addr = addr;
+        s_alloc_sizes[s_alloc_count].size = size;
+        s_alloc_count++;
+    }
+}
+
+static uint32_t lookup_alloc_size(uint32_t addr) {
+    for (int i = s_alloc_count - 1; i >= 0; i--) {
+        if (s_alloc_sizes[i].addr == addr)
+            return s_alloc_sizes[i].size;
+    }
+    return 0;
+}
+
 // Bump-allocate `size` bytes of zeroed guest heap (shared with GlobalAlloc).
 // Returns the guest address, or 0 on failure. Used by the CRT allocators that
 // real DLLs (StdUtils, and eventually steam.exe) call.
@@ -735,6 +756,7 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     free(zeros);
     s_heap_ptr += alloc;
     s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFFu;
+    track_alloc(addr, size);
     return addr;
 }
 
@@ -1366,23 +1388,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "GetVersion") == 0) {
             ret_val = 0x00000A00;
         } else if (strcmp(fn, "GetCommandLineW") == 0) {
-            const char *winpath = wg_files_exe_win_path();
-            uint16_t wcmd[520] = {0};
-            wcmd[0] = '"';
-            int i = 0;
-            for (; winpath[i] && i < 510; i++)
-                wcmd[i + 1] = (uint8_t)winpath[i];
-            wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
-            uint64_t cmd_addr = 0xA00000;
-            wg_blink_load_code(engine->blink, cmd_addr, (uint8_t*)wcmd, (i + 3) * 2, 0);
-            ret_val = cmd_addr;
+            static bool s_cmdw_written = false;
+            if (!s_cmdw_written) {
+                const char *winpath = wg_files_exe_win_path();
+                uint16_t wcmd[520] = {0};
+                wcmd[0] = '"';
+                int i = 0;
+                for (; winpath[i] && i < 510; i++)
+                    wcmd[i + 1] = (uint8_t)winpath[i];
+                wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
+                wg_blink_load_code(engine->blink, 0xA00000, (uint8_t*)wcmd, (i + 3) * 2, 0);
+                s_cmdw_written = true;
+            }
+            ret_val = 0xA00000;
         } else if (strcmp(fn, "GetCommandLineA") == 0) {
-            const char *winpath = wg_files_exe_win_path();
-            char acmd[520];
-            snprintf(acmd, sizeof(acmd), "\"%s\"", winpath);
-            uint64_t cmd_addr = 0xA00100;
-            wg_blink_load_code(engine->blink, cmd_addr, (uint8_t*)acmd, strlen(acmd) + 1, 0);
-            ret_val = cmd_addr;
+            static bool s_cmda_written = false;
+            if (!s_cmda_written) {
+                const char *winpath = wg_files_exe_win_path();
+                char acmd[520];
+                snprintf(acmd, sizeof(acmd), "\"%s\"", winpath);
+                wg_blink_load_code(engine->blink, 0xA00100, (uint8_t*)acmd, strlen(acmd) + 1, 0);
+                s_cmda_written = true;
+            }
+            ret_val = 0xA00100;
         } else if (strcmp(fn, "CommandLineToArgvW") == 0) {
             // CommandLineToArgvW(lpCmdLine=args[0], pNumArgs=args[1])
             // Read the wide command line from guest memory
@@ -2055,6 +2083,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // malloc/startup heap-init goes through here — returning 0 crashed
             // steam.exe right after the TEB setup.
             ret_val = wg_guest_alloc(engine, args[2]);
+        } else if (strcmp(fn, "HeapSize") == 0) {
+            // HeapSize(hHeap, dwFlags, lpMem=args[2])
+            ret_val = lookup_alloc_size(args[2]);
         } else if (strcmp(fn, "HeapReAlloc") == 0) {
             // HeapReAlloc(hHeap, dwFlags, lpMem=args[2], dwBytes=args[3])
             uint32_t np = wg_guest_alloc(engine, args[3]);
@@ -3093,6 +3124,7 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     memset(s_fls_slots, 0, sizeof(s_fls_slots));
     s_event_next = 0;
     memset(s_event_signalled, 0, sizeof(s_event_signalled));
+    s_alloc_count = 0;
     wg_bitmap_reset_all();
 
     // Reset the loaded-DLL table (fresh VM => previous mappings are gone).
