@@ -3379,7 +3379,25 @@ bool wg_engine_run(WGEngine *engine) {
 }
 
 void wg_engine_tick(WGEngine *engine) {
-    if (!engine || engine->state != WG_ENGINE_RUNNING) return;
+    if (!engine) return;
+    // Allow ticking when PAUSED if worker threads need to run
+    if (engine->state == WG_ENGINE_PAUSED && engine->scheduler) {
+        bool has_ready = false;
+        for (int ti = 0; ti < WG_MAX_THREADS; ti++) {
+            if (engine->scheduler->threads[ti].state == WG_THREAD_READY) {
+                has_ready = true;
+                break;
+            }
+        }
+        if (has_ready) {
+            // Switch to a worker thread and run it
+            wg_sched_save_current(engine->scheduler, engine->blink, WG_THREAD_WAITING);
+            if (wg_sched_switch_next(engine->scheduler, engine->blink)) {
+                engine->state = WG_ENGINE_RUNNING;
+            }
+        }
+    }
+    if (engine->state != WG_ENGINE_RUNNING) return;
 
     engine->tick_count++;
 
