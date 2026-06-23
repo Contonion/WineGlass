@@ -3017,14 +3017,36 @@ static bool load_pe_blink(WGEngine *engine) {
     // CRT startup (steam.exe) doesn't fault reading fs:[…].
     wg_setup_win32_teb(engine);
 
-    // Map a zero page at address 0 so NULL-pointer dereferences read 0
-    // instead of crashing. Real Windows catches these via SEH which we
-    // don't implement; many programs rely on that for cleanup paths.
+    // Map zero pages so reads from unmapped addresses return 0 instead of
+    // faulting. Real Windows catches these via SEH; without it, programs
+    // crash on NULL dereferences and stale pointers (e.g. vtable entries
+    // referencing unloaded DLLs). We map:
+    //   0x00000000-0x0000FFFF  — NULL dereferences
+    //   0x10000000-0x10000FFF  — low DLL range (fake load addresses)
+    //   0x50000000-0x5FFFFFFF  — covers stale DLL pointers from .rdata
+    //     (e.g. 0x53572073 "CNet::BFrame..." network handler tables)
     {
-        uint8_t *zp = calloc(1, 0x10000);
-        if (zp) {
-            wg_blink_load_code(engine->blink, 0, zp, 0x10000, 0);
-            free(zp);
+        // Map zero regions for unmapped address ranges that programs
+        // may dereference (stale DLL pointers, uninitialized vtables).
+        // Blink uses real mmap pages, but the OS COW-shares zero pages
+        // so actual RAM is only used for pages that get written.
+        uint32_t zero_ranges[][2] = {
+            {0x00000000u, 0x00010000u},   // NULL dereferences
+            {0x10000000u, 0x00100000u},   // low DLL range
+            {0x50000000u, 0x10000000u},   // stale DLL pointers (256MB)
+        };
+        for (int r = 0; r < 3; r++) {
+            uint32_t base = zero_ranges[r][0];
+            uint32_t size = zero_ranges[r][1];
+            // Map in 1MB chunks to avoid huge single allocations
+            for (uint32_t off = 0; off < size; off += 0x100000u) {
+                uint32_t chunk = (size - off < 0x100000u) ? (size - off) : 0x100000u;
+                uint8_t *zp = calloc(1, chunk);
+                if (zp) {
+                    wg_blink_load_code(engine->blink, base + off, zp, chunk, 0);
+                    free(zp);
+                }
+            }
         }
     }
 
@@ -3288,6 +3310,32 @@ void wg_engine_tick(WGEngine *engine) {
                         WG_LOGE(TAG, "  caller@%08X-8: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
                             stk[0], caller[0],caller[1],caller[2],caller[3],caller[4],caller[5],caller[6],caller[7],
                             caller[8],caller[9],caller[10],caller[11],caller[12],caller[13],caller[14],caller[15]);
+                    }
+                    // EBP-based frame: dump caller's return addr and locals
+                    uint32_t ebp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                    if (ebp >= 0x7FFE0000 && ebp < 0x80000000) {
+                        uint32_t frame[8] = {0};
+                        wg_blink_read_mem(engine->blink, ebp, frame, 32);
+                        WG_LOGE(TAG, "  [EBP+00]: %08X %08X %08X %08X  %08X %08X %08X %08X",
+                            frame[0],frame[1],frame[2],frame[3],frame[4],frame[5],frame[6],frame[7]);
+                        // Dump caller's code at return address
+                        if (frame[1] >= 0x401000 && frame[1] < 0x8C0000) {
+                            uint8_t callercode[16] = {0};
+                            wg_blink_read_mem(engine->blink, frame[1] - 8, callercode, 16);
+                            WG_LOGE(TAG, "  retaddr@%08X-8: %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X",
+                                frame[1], callercode[0],callercode[1],callercode[2],callercode[3],
+                                callercode[4],callercode[5],callercode[6],callercode[7],
+                                callercode[8],callercode[9],callercode[10],callercode[11],
+                                callercode[12],callercode[13],callercode[14],callercode[15]);
+                        }
+                    }
+                    // Dump [EDI] (often the heap buffer being operated on)
+                    uint32_t edi = (uint32_t)wg_blink_get_reg(engine->blink, 7);
+                    if (edi >= 0x20000000 && edi < 0x30000000) {
+                        uint32_t dibuf[8] = {0};
+                        wg_blink_read_mem(engine->blink, edi, dibuf, 32);
+                        WG_LOGE(TAG, "  [EDI+00]: %08X %08X %08X %08X  %08X %08X %08X %08X",
+                            dibuf[0],dibuf[1],dibuf[2],dibuf[3],dibuf[4],dibuf[5],dibuf[6],dibuf[7]);
                     }
                     // Memory at ESI (likely object with bad vtable)
                     uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
