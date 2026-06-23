@@ -3211,6 +3211,8 @@ static bool load_pe_blink(WGEngine *engine) {
             // addresses from steam's .rdata (0x53572073 etc.)
             wg_blink_load_code(engine->blink, 0x53572000u, zp, 0x1000, 0);
             wg_blink_load_code(engine->blink, 0x5ECF7000u, zp, 0x1000, 0);
+            // Top of 32-bit address space (GetCurrentThread returns 0xFFFFFFFE)
+            wg_blink_load_code(engine->blink, 0xFFFFF000u, zp, 0x1000, 0);
             free(zp);
         }
     }
