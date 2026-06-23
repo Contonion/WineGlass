@@ -709,5 +709,82 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     // === ntdll.dll ===
     RS("ntdll.dll", RtlInitializeCriticalSection, 1);
 
+    // === WS2_32.dll (Winsock2) ===
+    // WS2_32 exports by ordinal. Map ordinals to names with correct arg counts.
+    RS("WS2_32.dll", Ordinal_1,   0);  // accept -> 3 but not stdcall-cleaned
+    RS("WS2_32.dll", Ordinal_2,   3);  // bind
+    RS("WS2_32.dll", Ordinal_3,   1);  // closesocket
+    RS("WS2_32.dll", Ordinal_4,   3);  // connect
+    RS("WS2_32.dll", Ordinal_5,   3);  // getpeername
+    RS("WS2_32.dll", Ordinal_6,   3);  // getsockname
+    RS("WS2_32.dll", Ordinal_7,   5);  // getsockopt
+    RS("WS2_32.dll", Ordinal_8,   4);  // htonl (1 arg but mapped as passthru)
+    RS("WS2_32.dll", Ordinal_9,   1);  // htons
+    RS("WS2_32.dll", Ordinal_10,  3);  // ioctlsocket
+    RS("WS2_32.dll", Ordinal_11,  1);  // inet_addr
+    RS("WS2_32.dll", Ordinal_12,  1);  // inet_ntoa
+    RS("WS2_32.dll", Ordinal_13,  2);  // listen
+    RS("WS2_32.dll", Ordinal_14,  1);  // ntohl
+    RS("WS2_32.dll", Ordinal_15,  1);  // ntohs
+    RS("WS2_32.dll", Ordinal_16,  4);  // recv
+    RS("WS2_32.dll", Ordinal_17,  4);  // recvfrom -> 6
+    RS("WS2_32.dll", Ordinal_18,  5);  // select
+    RS("WS2_32.dll", Ordinal_19,  4);  // send
+    RS("WS2_32.dll", Ordinal_20,  6);  // sendto
+    RS("WS2_32.dll", Ordinal_21,  5);  // setsockopt
+    RS("WS2_32.dll", Ordinal_22,  2);  // shutdown
+    RS("WS2_32.dll", Ordinal_23,  3);  // socket
+    RS("WS2_32.dll", Ordinal_51,  4);  // getaddrinfo
+    RS("WS2_32.dll", Ordinal_111, 2);  // WSAStartup
+    RS("WS2_32.dll", Ordinal_112, 0);  // WSACleanup
+    RS("WS2_32.dll", Ordinal_113, 0);  // WSAGetLastError
+    RS("WS2_32.dll", Ordinal_116, 1);  // WSASetLastError
+    RS("WS2_32.dll", Ordinal_115, 6);  // WSASocketW
+    RS("WS2_32.dll", Ordinal_72,  7);  // WSASend
+    RS("WS2_32.dll", Ordinal_73,  9);  // WSASendTo
+    RS("WS2_32.dll", Ordinal_67,  7);  // WSARecv
+    RS("WS2_32.dll", Ordinal_74,  9);  // WSARecvFrom
+    RS("WS2_32.dll", Ordinal_36,  9);  // WSAIoctl
+    RS("WS2_32.dll", Ordinal_33,  3);  // WSAEventSelect
+    RS("WS2_32.dll", Ordinal_32,  3);  // WSAEnumNetworkEvents
+    RS("WS2_32.dll", Ordinal_52,  1);  // freeaddrinfo
+    // Named imports (some are by name, not ordinal)
+    RS("WS2_32.dll", WSAStartup, 2);
+    RS("WS2_32.dll", WSACleanup, 0);
+    RS("WS2_32.dll", WSAGetLastError, 0);
+    RS("WS2_32.dll", WSASetLastError, 1);
+    RS("WS2_32.dll", WSASend, 7);
+    RS("WS2_32.dll", WSASendTo, 9);
+    RS("WS2_32.dll", WSARecv, 7);
+    RS("WS2_32.dll", WSASocketW, 6);
+    RS("WS2_32.dll", WSAIoctl, 9);
+    RS("WS2_32.dll", WSAEventSelect, 3);
+    RS("WS2_32.dll", WSAEnumNetworkEvents, 3);
+    RS("WS2_32.dll", getaddrinfo, 4);
+    RS("WS2_32.dll", freeaddrinfo, 1);
+    RS("WS2_32.dll", socket, 3);
+    RS("WS2_32.dll", closesocket, 1);
+    RS("WS2_32.dll", connect, 3);
+    RS("WS2_32.dll", send, 4);
+    RS("WS2_32.dll", recv, 4);
+    RS("WS2_32.dll", bind, 3);
+    RS("WS2_32.dll", listen, 2);
+    RS("WS2_32.dll", select, 5);
+    RS("WS2_32.dll", shutdown, 2);
+    RS("WS2_32.dll", setsockopt, 5);
+    RS("WS2_32.dll", getsockopt, 5);
+    RS("WS2_32.dll", ioctlsocket, 3);
+    RS("WS2_32.dll", htons, 1);
+    RS("WS2_32.dll", htonl, 1);
+    RS("WS2_32.dll", ntohs, 1);
+    RS("WS2_32.dll", ntohl, 1);
+    RS("WS2_32.dll", inet_addr, 1);
+    RS("WS2_32.dll", inet_ntoa, 1);
+    RS("WS2_32.dll", getpeername, 3);
+    RS("WS2_32.dll", getsockname, 3);
+
+    // === WSOCK32.dll ===
+    RS("WSOCK32.dll", Ordinal_1142, 2); // WSAStartup (legacy alias)
+
     WG_LOGI(TAG, "Registered %d Win32 API stubs", m->count);
 }

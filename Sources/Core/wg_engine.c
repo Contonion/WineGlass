@@ -11,6 +11,7 @@
 #include "wg_win32_gdi.h"
 #include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
+#include "wg_winsock.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -343,6 +344,7 @@ struct WGEngine {
     // Shared
     WGPEImage      *pe_image;
     WGDllMapper    *dll_mapper;
+    WGWinsock      *winsock;
     uint64_t        tick_count;
     int             instructions_per_tick;
     bool            thunks_mapped; // whether HLT stubs are in blink memory
@@ -354,6 +356,7 @@ WGEngine *wg_engine_create(void) {
     e->state = WG_ENGINE_IDLE;
     e->instructions_per_tick = 100000;
     e->backend = WG_BACKEND_BLINK;
+    e->winsock = wg_winsock_create();
     return e;
 }
 
@@ -365,6 +368,7 @@ void wg_engine_destroy(WGEngine *engine) {
     if (engine->pe_image) wg_pe_image_free(engine->pe_image);
     if (engine->dll_mapper) wg_dll_mapper_destroy(engine->dll_mapper);
     if (engine->blink) wg_blink_destroy(engine->blink);
+    if (engine->winsock) wg_winsock_destroy(engine->winsock);
     free(engine);
 }
 
@@ -2575,6 +2579,63 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = wg_guest_alloc(engine, size ? size : 1);
         } else if (strcmp(fn, "LocalFree") == 0) {
             ret_val = 0; // success
+        }
+
+        // WS2_32 / WSOCK32 dispatch — map ordinal names to function names
+        // and forward to the winsock handler.
+        if (entry && entry->dll_name &&
+            (strcasecmp(entry->dll_name, "WS2_32.dll") == 0 ||
+             strcasecmp(entry->dll_name, "WSOCK32.dll") == 0)) {
+            const char *ws_fn = fn;
+            // Map WS2_32 ordinals to function names
+            if (strncmp(fn, "Ordinal_", 8) == 0) {
+                int ord = atoi(fn + 8);
+                switch (ord) {
+                    case 1: ws_fn = "accept"; break;
+                    case 2: ws_fn = "bind"; break;
+                    case 3: ws_fn = "closesocket"; break;
+                    case 4: ws_fn = "connect"; break;
+                    case 5: ws_fn = "getpeername"; break;
+                    case 6: ws_fn = "getsockname"; break;
+                    case 7: ws_fn = "getsockopt"; break;
+                    case 8: ws_fn = "htonl"; break;
+                    case 9: ws_fn = "htons"; break;
+                    case 10: ws_fn = "ioctlsocket"; break;
+                    case 11: ws_fn = "inet_addr"; break;
+                    case 12: ws_fn = "inet_ntoa"; break;
+                    case 13: ws_fn = "listen"; break;
+                    case 14: ws_fn = "ntohl"; break;
+                    case 15: ws_fn = "ntohs"; break;
+                    case 16: ws_fn = "recv"; break;
+                    case 17: ws_fn = "recvfrom"; break;
+                    case 18: ws_fn = "select"; break;
+                    case 19: ws_fn = "send"; break;
+                    case 20: ws_fn = "sendto"; break;
+                    case 21: ws_fn = "setsockopt"; break;
+                    case 22: ws_fn = "shutdown"; break;
+                    case 23: ws_fn = "socket"; break;
+                    case 32: ws_fn = "WSAEnumNetworkEvents"; break;
+                    case 33: ws_fn = "WSAEventSelect"; break;
+                    case 36: ws_fn = "WSAIoctl"; break;
+                    case 51: ws_fn = "getaddrinfo"; break;
+                    case 52: ws_fn = "freeaddrinfo"; break;
+                    case 67: ws_fn = "WSARecv"; break;
+                    case 72: ws_fn = "WSASend"; break;
+                    case 73: ws_fn = "WSASendTo"; break;
+                    case 74: ws_fn = "WSARecvFrom"; break;
+                    case 111: ws_fn = "WSAStartup"; break;
+                    case 112: ws_fn = "WSACleanup"; break;
+                    case 113: ws_fn = "WSAGetLastError"; break;
+                    case 115: ws_fn = "WSASocketW"; break;
+                    case 116: ws_fn = "WSASetLastError"; break;
+                    case 1142: ws_fn = "WSAStartup"; break; // WSOCK32
+                    default: break;
+                }
+            }
+            uint64_t ws_ret = 0;
+            if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
+                ret_val = ws_ret;
+            }
         }
     }
 
