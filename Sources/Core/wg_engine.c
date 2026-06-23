@@ -2501,14 +2501,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 s_last_error = 0;
             }
         } else if (strcmp(fn, "PeekMessageW") == 0) {
-            // PeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
-            // This is the Windows message pump. On Windows, this returns TRUE
-            // if a message is available. We return FALSE (no messages) which
-            // makes the app idle. After many consecutive calls, pause for UI.
+            // PeekMessageW — idle point in the message loop. If worker
+            // threads are READY, yield to them before returning.
+            bool has_ready = false;
+            for (int ti = 0; ti < WG_MAX_THREADS; ti++) {
+                if (engine->scheduler->threads[ti].state == WG_THREAD_READY) {
+                    has_ready = true;
+                    break;
+                }
+            }
+            if (has_ready) {
+                // Yield to worker threads (e.g. NSIS install thread)
+                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
+                    return true; // switched to worker
+                }
+            }
             static int peek_count = 0;
             peek_count++;
             if (peek_count > 5) {
-                // Pause to let the user see the rendered windows
                 peek_count = 0;
                 engine->state = WG_ENGINE_PAUSED;
                 WG_LOGI(TAG, "Message loop — pausing for UI");
