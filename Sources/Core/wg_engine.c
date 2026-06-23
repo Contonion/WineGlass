@@ -250,6 +250,17 @@ static uint32_t s_last_error = 0;
 static struct { const char *fn; uint64_t ret; } s_call_ring[WG_CALL_RING_SIZE];
 static int s_call_ring_idx = 0;
 static inline void wg_call_ring_push(const char *name, uint64_t ret) {
+    // Filter out noisy cleanup/infrastructure calls
+    if (name[0] == 'H' && (name[4] == 'F' || name[4] == 'S' || name[4] == 'A'))
+        return; // HeapFree, HeapSize, HeapAlloc
+    if (name[0] == 'D' && name[1] == 'e') return; // DeleteCriticalSection
+    if (name[0] == 'E' && name[5] == 'C') return; // EnterCriticalSection
+    if (name[0] == 'L' && name[5] == 'C') return; // LeaveCriticalSection
+    if (name[0] == 'T' && name[3] == 'E') return; // TryEnterCriticalSection
+    if (name[0] == 'G' && name[3] == 'L') return; // GetLastError
+    if (name[0] == 'S' && name[3] == 'L') return; // SetLastError
+    if (name[0] == 'F' && name[3] == 'G') return; // FlsGetValue
+    if (name[0] == 'F' && name[3] == 'S') return; // FlsSetValue
     int idx = s_call_ring_idx % WG_CALL_RING_SIZE;
     s_call_ring[idx].fn = name;
     s_call_ring[idx].ret = ret;
