@@ -1404,28 +1404,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "GetVersion") == 0) {
             ret_val = 0x00000A00;
         } else if (strcmp(fn, "GetCommandLineW") == 0) {
-            static bool s_cmdw_written = false;
-            if (!s_cmdw_written) {
-                const char *winpath = wg_files_exe_win_path();
-                uint16_t wcmd[520] = {0};
-                wcmd[0] = '"';
-                int i = 0;
-                for (; winpath[i] && i < 510; i++)
-                    wcmd[i + 1] = (uint8_t)winpath[i];
-                wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
-                wg_blink_load_code(engine->blink, 0xA00000, (uint8_t*)wcmd, (i + 3) * 2, 0);
-                s_cmdw_written = true;
-            }
+            const char *winpath = wg_files_exe_win_path();
+            uint16_t wcmd[520] = {0};
+            wcmd[0] = '"';
+            int i = 0;
+            for (; winpath[i] && i < 510; i++)
+                wcmd[i + 1] = (uint8_t)winpath[i];
+            wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
+            wg_blink_write_mem(engine->blink, 0xA00000, wcmd, (i + 3) * 2);
             ret_val = 0xA00000;
         } else if (strcmp(fn, "GetCommandLineA") == 0) {
-            static bool s_cmda_written = false;
-            if (!s_cmda_written) {
-                const char *winpath = wg_files_exe_win_path();
-                char acmd[520];
-                snprintf(acmd, sizeof(acmd), "\"%s\"", winpath);
-                wg_blink_load_code(engine->blink, 0xA00100, (uint8_t*)acmd, strlen(acmd) + 1, 0);
-                s_cmda_written = true;
-            }
+            const char *winpath = wg_files_exe_win_path();
+            char acmd[520];
+            snprintf(acmd, sizeof(acmd), "\"%s\"", winpath);
+            wg_blink_write_mem(engine->blink, 0xA00100, acmd, strlen(acmd) + 1);
             ret_val = 0xA00100;
         } else if (strcmp(fn, "CommandLineToArgvW") == 0) {
             // CommandLineToArgvW(lpCmdLine=args[0], pNumArgs=args[1])
