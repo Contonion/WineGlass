@@ -17,8 +17,11 @@
 #define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20B
 
 // Directory entry indices
-#define IMAGE_DIRECTORY_ENTRY_IMPORT  1
-#define IMAGE_DIRECTORY_ENTRY_IAT     12
+#define IMAGE_DIRECTORY_ENTRY_EXPORT    0
+#define IMAGE_DIRECTORY_ENTRY_IMPORT    1
+#define IMAGE_DIRECTORY_ENTRY_BASERELOC 5
+#define IMAGE_DIRECTORY_ENTRY_TLS       9
+#define IMAGE_DIRECTORY_ENTRY_IAT       12
 
 // Structures matching the PE spec exactly
 #pragma pack(push, 1)
@@ -351,6 +354,20 @@ WGPEImage *wg_pe_load_memory(const uint8_t *data, size_t size) {
         WG_LOGI(TAG, "Import directory: RVA=0x%X, Size=0x%X",
                 imp_dir->VirtualAddress, imp_dir->Size);
         parse_imports(img, imp_dir->VirtualAddress, imp_dir->Size);
+    }
+
+    // Record export & base-reloc directory locations (used when loading DLLs).
+    if (num_directories > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        img->export_rva  = directories[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        img->export_size = directories[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+    }
+    if (num_directories > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+        img->reloc_rva  = directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress;
+        img->reloc_size = directories[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+    }
+    if (num_directories > IMAGE_DIRECTORY_ENTRY_TLS) {
+        img->tls_rva  = directories[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+        img->tls_size = directories[IMAGE_DIRECTORY_ENTRY_TLS].Size;
     }
 
     return img;

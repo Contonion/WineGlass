@@ -27,6 +27,8 @@ extern int WGBlinkVM_ReadMem(WGBlinkVM *vm, unsigned long long addr,
                               void *buf, unsigned int len);
 extern int WGBlinkVM_SetupStack(WGBlinkVM *vm, unsigned long long entry_rip);
 extern void WGBlinkVM_SwitchTo32(WGBlinkVM *vm);
+extern void WGBlinkVM_SetFsBase(WGBlinkVM *vm, unsigned long long base);
+extern void WGBlinkVM_SetGsBase(WGBlinkVM *vm, unsigned long long base);
 
 // From wg_blink_stubs.c — our Abort() override recovery point
 extern void wg_blink_set_abort_recovery(sigjmp_buf *buf);
@@ -198,6 +200,14 @@ uint64_t wg_blink_get_rip(WGBlinkInstance *inst) {
 void wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip) {
     if (!inst || !inst->vm) return;
     WGBlinkVM_SetRIP(inst->vm, rip);
+}
+
+void wg_blink_set_fs_base(WGBlinkInstance *inst, uint64_t base) {
+    if (inst && inst->vm) WGBlinkVM_SetFsBase(inst->vm, base);
+}
+
+void wg_blink_set_gs_base(WGBlinkInstance *inst, uint64_t base) {
+    if (inst && inst->vm) WGBlinkVM_SetGsBase(inst->vm, base);
 }
 
 bool wg_blink_write_mem(WGBlinkInstance *inst, uint64_t addr,

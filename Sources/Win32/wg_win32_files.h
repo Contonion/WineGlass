@@ -10,6 +10,20 @@
 // Set the real filesystem path for the loaded .exe
 void wg_files_set_exe_path(const char *path);
 
+// The Windows-style path to the loaded exe (e.g. "C:\Program Files\Steam\steam.exe").
+const char *wg_files_exe_win_path(void);
+
+// The bottle's C: drive (a persistent prefix dir, like a Wine/CrossOver bottle).
+// All guest C:\ paths map under here. Returns the real drive_c path (or "").
+const char *wg_files_drive_c(void);
+
+// Remove stale NSIS plug-in temp dirs (ns*.tmp) from the bottle's Temp so each
+// run gets a fresh plug-ins directory.
+void wg_files_reset_temp(void);
+
+// Recursively create all parent directories of a real (already-mapped) path.
+void wg_files_ensure_parents(const char *real_path);
+
 // Map a Windows-style path to a real iOS filesystem path
 const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
                                char *buf, int bufsize);

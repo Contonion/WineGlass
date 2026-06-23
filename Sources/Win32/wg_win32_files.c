@@ -5,11 +5,116 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <unistd.h>
 
 #define TAG "Files"
 
 static char s_exe_path[1024] = {0};
-static char s_exe_dir[1024] = {0};
+static char s_exe_dir[1024]  = {0};
+// The "bottle" — a persistent Windows prefix (like a Wine/CrossOver bottle or a
+// GPTK bottle). drive_c is the guest C:\ root; every C:\ path maps under it, so
+// the installed app lands in e.g. drive_c/Program Files (x86)/Steam instead of
+// being scattered through one-off temp mappings.
+static char s_drive_c[1024]  = {0};
+
+// Recursively create a directory and all missing parents (like `mkdir -p`).
+static void mkdir_p(const char *path) {
+    if (!path || !path[0]) return;
+    char tmp[1024];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) { /* keep going */ }
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+void wg_files_ensure_parents(const char *real_path) {
+    if (!real_path || !real_path[0]) return;
+    char parent[1024];
+    strncpy(parent, real_path, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    char *last = strrchr(parent, '/');
+    if (last) { *last = '\0'; mkdir_p(parent); }
+}
+
+// Lazily create the bottle (drive_c + a few standard dirs). Anchored next to the
+// loaded .exe (which lives in the app's Documents dir), so the bottle persists
+// across runs.
+static void ensure_bottle(void) {
+    if (s_drive_c[0] || !s_exe_dir[0]) return;
+    snprintf(s_drive_c, sizeof(s_drive_c), "%sBottle/drive_c", s_exe_dir);
+    mkdir_p(s_drive_c);
+    const char *subdirs[] = {
+        "Temp", "Program Files", "Program Files (x86)", "windows", NULL
+    };
+    for (int i = 0; subdirs[i]; i++) {
+        char sub[1024];
+        snprintf(sub, sizeof(sub), "%s/%s", s_drive_c, subdirs[i]);
+        mkdir(sub, 0755);
+    }
+    WG_LOGI(TAG, "Bottle drive_c: %s", s_drive_c);
+}
+
+const char *wg_files_drive_c(void) {
+    ensure_bottle();
+    return s_drive_c;
+}
+
+// Recursively delete a file or directory tree (no shell — iOS forbids system()).
+static void rm_rf(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                    continue;
+                char child[1200];
+                snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+                rm_rf(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
+void wg_files_reset_temp(void) {
+    ensure_bottle();
+    if (!s_drive_c[0]) return;
+    char temp[1024];
+    snprintf(temp, sizeof(temp), "%s/Temp", s_drive_c);
+    DIR *d = opendir(temp);
+    if (!d) return;
+    struct dirent *e;
+    int cleared = 0;
+    while ((e = readdir(d))) {
+        // NSIS plug-in dirs/files look like ns<hex>.tmp; clear them so each run
+        // gets a fresh plug-ins directory (NSIS bails on a pre-existing one).
+        size_t n = strlen(e->d_name);
+        bool is_ns_tmp = (n > 4 && strncmp(e->d_name, "ns", 2) == 0 &&
+                          strcasecmp(e->d_name + n - 4, ".tmp") == 0);
+        if (is_ns_tmp) {
+            char full[1100];
+            snprintf(full, sizeof(full), "%s/%s", temp, e->d_name);
+            rm_rf(full);
+            cleared++;
+        }
+    }
+    closedir(d);
+    if (cleared) WG_LOGI(TAG, "Reset bottle Temp: cleared %d ns*.tmp", cleared);
+}
 
 typedef struct {
     FILE    *fp;
@@ -28,6 +133,63 @@ void wg_files_set_exe_path(const char *path) {
     if (last_slash) *(last_slash + 1) = '\0';
     WG_LOGI(TAG, "EXE path: %s", s_exe_path);
     WG_LOGI(TAG, "EXE dir: %s", s_exe_dir);
+    s_drive_c[0] = '\0';   // re-anchor the bottle to this exe's directory
+    ensure_bottle();
+}
+
+// Recursively find `name` under `dir`, writing the result to `out`.
+static bool find_in_bottle(const char *dir, const char *name, char *out, int outsz) {
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        if (strcasecmp(e->d_name, name) == 0) {
+            snprintf(out, outsz, "%s", full);
+            closedir(d);
+            return true;
+        }
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (find_in_bottle(full, name, out, outsz)) {
+                closedir(d);
+                return true;
+            }
+        }
+    }
+    closedir(d);
+    return false;
+}
+
+const char *wg_files_exe_win_path(void) {
+    static char win[1024];
+    ensure_bottle();
+    size_t dc_len = strlen(s_drive_c);
+    if (dc_len > 0 && strncmp(s_exe_path, s_drive_c, dc_len) == 0) {
+        // Exe is inside the bottle — derive the Windows path directly
+        const char *rel = s_exe_path + dc_len;
+        while (*rel == '/') rel++;
+        snprintf(win, sizeof(win), "C:\\%s", rel);
+        for (char *p = win; *p; p++) { if (*p == '/') *p = '\\'; }
+    } else {
+        // Exe is outside the bottle (user-picked). Search the bottle
+        // for a file with the same name so steam sees the right path.
+        const char *fname = strrchr(s_exe_path, '/');
+        fname = fname ? fname + 1 : s_exe_path;
+        char found[1024] = {0};
+        if (dc_len > 0 && find_in_bottle(s_drive_c, fname, found, sizeof(found))) {
+            const char *rel = found + dc_len;
+            while (*rel == '/') rel++;
+            snprintf(win, sizeof(win), "C:\\%s", rel);
+            for (char *p = win; *p; p++) { if (*p == '/') *p = '\\'; }
+            WG_LOGI(TAG, "Exe found in bottle: %s -> %s", fname, win);
+        } else {
+            snprintf(win, sizeof(win), "C:\\a.exe");
+        }
+    }
+    return win;
 }
 
 static void fix_separators(char *path) {
@@ -38,41 +200,31 @@ static void fix_separators(char *path) {
 
 const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
                                char *buf, int bufsize) {
-    // Map known Windows paths to iOS paths
+    ensure_bottle();
+
+    // The installer .exe itself is the file the user picked — it lives in the
+    // app sandbox, not inside the bottle, so keep mapping it to the real path.
     if (strcasecmp(buf, "C:\\a.exe") == 0 ||
         strcasecmp(buf, "C:/a.exe") == 0) {
         return s_exe_path;
     }
 
-    // Map C:\Temp\ to the exe's directory
-    if (strncasecmp(buf, "C:\\Temp\\", 8) == 0 ||
-        strncasecmp(buf, "C:/Temp/", 8) == 0) {
-        static char mapped[1024];
-        snprintf(mapped, sizeof(mapped), "%s%s", s_exe_dir, buf + 8);
-        fix_separators(mapped);
-        return mapped;
-    }
-    if (strncasecmp(buf, "C:\\Temp", 7) == 0 && (buf[7] == 0 || buf[7] == '\\')) {
-        static char mapped2[1024];
-        snprintf(mapped2, sizeof(mapped2), "%s%s", s_exe_dir, buf + 7 ? buf + 7 : "");
-        fix_separators(mapped2);
-        return mapped2;
-    }
-
-    // Map C:\Windows\ paths
-    if (strncasecmp(buf, "C:\\Windows\\", 11) == 0 ||
-        strncasecmp(buf, "C:/Windows/", 11) == 0) {
-        return NULL;
-    }
-
-    // Everything else: relative to exe dir
-    static char rel_mapped[1024];
+    // Everything else lives on the bottle's C: drive. Strip a leading drive
+    // letter ("C:") and any leading separators, then join under drive_c. This
+    // makes C:\Temp\..., C:\Program Files (x86)\Steam\..., C:\Windows\..., etc.
+    // all resolve to real, persistent paths inside the bottle — so an install
+    // ends up in a proper drive_c tree instead of scattered temp files.
     const char *p = buf;
-    if (p[1] == ':') p += 2;
-    while (*p == '\\' || *p == '/') p++;
-    snprintf(rel_mapped, sizeof(rel_mapped), "%s%s", s_exe_dir, p);
-    fix_separators(rel_mapped);
-    return rel_mapped;
+    if (p[0] && p[1] == ':') p += 2;            // skip drive letter (any drive)
+    while (*p == '\\' || *p == '/') p++;        // skip leading separators
+
+    static char mapped[1024];
+    if (*p)
+        snprintf(mapped, sizeof(mapped), "%s/%s", s_drive_c, p);
+    else
+        snprintf(mapped, sizeof(mapped), "%s", s_drive_c);  // bare "C:\" -> root
+    fix_separators(mapped);
+    return mapped;
 }
 
 uint32_t wg_files_create(const char *real_path, uint32_t access, uint32_t creation) {
@@ -94,15 +246,11 @@ uint32_t wg_files_create(const char *real_path, uint32_t access, uint32_t creati
 
     FILE *fp = fopen(real_path, mode);
     if (!fp && (creation == 2 || creation == 4)) {
-        // CREATE_ALWAYS or OPEN_ALWAYS — try creating parent directories
-        char parent[1024];
-        strncpy(parent, real_path, sizeof(parent) - 1);
-        char *last_sep = strrchr(parent, '/');
-        if (last_sep) {
-            *last_sep = '\0';
-            mkdir(parent, 0755); // create parent dir if needed
-            fp = fopen(real_path, mode); // retry
-        }
+        // CREATE_ALWAYS or OPEN_ALWAYS — create the full parent dir tree (deep
+        // install paths like drive_c/Program Files (x86)/Steam/bin/ need every
+        // intermediate directory), then retry.
+        wg_files_ensure_parents(real_path);
+        fp = fopen(real_path, mode);
     }
     if (!fp) {
         WG_LOGD(TAG, "Open failed: %s (mode=%s)", real_path, mode);

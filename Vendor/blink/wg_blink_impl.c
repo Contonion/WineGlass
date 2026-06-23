@@ -162,6 +162,16 @@ int WGBlinkVM_SetupStack(struct WGBlinkVM *vm, unsigned long long entry_rip) {
     return 1;
 }
 
+// Set the FS/GS segment base (linear address). Windows uses FS for the 32-bit
+// TEB and GS for the 64-bit TEB; the MSVC CRT reads fs:[0x18]/[0x2C]/[0x30]
+// during startup, so without a real base + TEB it faults immediately.
+void WGBlinkVM_SetFsBase(struct WGBlinkVM *vm, unsigned long long base) {
+    if (vm) vm->m->fs.base = base;
+}
+void WGBlinkVM_SetGsBase(struct WGBlinkVM *vm, unsigned long long base) {
+    if (vm) vm->m->gs.base = base;
+}
+
 
 // Defined in wg_blink_stubs.c — lets TerminateSignal longjmp back to us
 extern void wg_blink_set_onhalt(sigjmp_buf *buf);

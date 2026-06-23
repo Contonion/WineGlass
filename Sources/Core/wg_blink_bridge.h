@@ -40,6 +40,10 @@ void     wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val);
 uint64_t wg_blink_get_rip(WGBlinkInstance *inst);
 void     wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip);
 
+// Set the FS (32-bit TEB) / GS (64-bit TEB) segment base linear address.
+void     wg_blink_set_fs_base(WGBlinkInstance *inst, uint64_t base);
+void     wg_blink_set_gs_base(WGBlinkInstance *inst, uint64_t base);
+
 // Memory access
 bool wg_blink_write_mem(WGBlinkInstance *inst, uint64_t addr,
                          const void *buf, uint32_t len);

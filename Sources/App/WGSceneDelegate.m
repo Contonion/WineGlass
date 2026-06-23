@@ -254,6 +254,14 @@
             break;                            // STOPPED / ERROR / IDLE
         }
     }
+    // The installer exited — if it asked to launch the Steam bootstrapper
+    // (steam.exe), chain-load and run it (the "fancier" Steam UI).
+    const char *next = wg_engine_take_pending_exec(_engine);
+    if (next && next[0] && _engineThreadRunning) {
+        NSString *p = [NSString stringWithUTF8String:next];
+        WG_LOGI("App", "Chain-loading bootstrapper: %s", next);
+        dispatch_async(dispatch_get_main_queue(), ^{ [self loadAndRunPE:p]; });
+    }
 }
 
 - (void)tryLoadBundledPE {

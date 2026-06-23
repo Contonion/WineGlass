@@ -17,7 +17,11 @@ typedef struct {
     char     func_name[128];
     uint64_t thunk_addr;
     WGWin32StubFunc handler;
-    int      num_args;  // stdcall argument count (for stack cleanup)
+    int      num_args;     // stdcall argument count (for stack cleanup)
+    int      default_ret;  // EAX for funcs not in the engine's explicit chain
+                           // (the registered stub's intent: R1S->1, RnegS->-1).
+                           // Legacy stub fns are dead under blink; this is how a
+                           // bare registration actually "returns".
 } WGDllEntry;
 
 typedef struct {

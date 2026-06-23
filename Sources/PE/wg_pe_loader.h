@@ -50,6 +50,11 @@ typedef struct {
     int            num_imports;
     WGPEImportDll  imports[PE_MAX_IMPORTS];
 
+    // Export & base-relocation directories (for loading DLLs / plug-ins)
+    uint32_t  export_rva,  export_size;
+    uint32_t  reloc_rva,   reloc_size;
+    uint32_t  tls_rva,     tls_size;   // TLS directory (CRT thread-local setup)
+
     // Raw file data
     uint8_t *raw_data;
     size_t   raw_size;

@@ -176,6 +176,14 @@ uint64_t wg_dll_mapper_register(WGDllMapper *mapper, const char *dll,
     e->thunk_addr = mapper->next_thunk;
     e->handler = handler ? handler : stub_default;
     e->num_args = num_args;
+    // The legacy stub fns write the (unused) builtin-interpreter CPU, so under
+    // blink a bare registration "returns" via default_ret. Derive it from the
+    // registered stub so R1S/RnegS/etc. actually take effect without needing an
+    // explicit engine handler for every function.
+    if (handler == stub_return_1)            e->default_ret = 1;
+    else if (handler == stub_return_neg1)    e->default_ret = -1;
+    else if (handler == stub_GetCurrentProcess) e->default_ret = -1; // pseudo-handle
+    else                                     e->default_ret = 0;
     mapper->next_thunk += 8;
     return e->thunk_addr;
 }
@@ -250,9 +258,25 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", GlobalUnlock, 1);
     R("KERNEL32.dll", GlobalLock, stub_GlobalLock, 1);
     R1S("KERNEL32.dll", CreateThread, 6);
+    RS("KERNEL32.dll", GetExitCodeThread, 2);
+    R1S("KERNEL32.dll", ResumeThread, 1);
     RS("KERNEL32.dll", GetLastError, 0);
     R1S("KERNEL32.dll", CreateDirectoryW, 2);
     RS("KERNEL32.dll", CreateProcessW, 10);
+    RS("KERNEL32.dll", CreateProcessA, 10);
+    // nsExec plug-in (ExecToLog) imports — register with correct stdcall arg
+    // counts so each call cleans the stack (auto-stub num_args=0 desyncs it and
+    // hangs nsExec, which froze the installer UI after the Steam-launch step).
+    RS("KERNEL32.dll", GlobalReAlloc, 3);
+    RS("KERNEL32.dll", PeekNamedPipe, 6);
+    RS("KERNEL32.dll", GetStartupInfoW, 1);
+    RS("KERNEL32.dll", CreatePipe, 4);
+    RS("KERNEL32.dll", UnmapViewOfFile, 1);
+    RS("KERNEL32.dll", MapViewOfFile, 5);
+    RS("KERNEL32.dll", CreateFileMappingW, 6);
+    RS("KERNEL32.dll", IsWow64Process, 2);
+    RS("ADVAPI32.dll", InitializeSecurityDescriptor, 2);
+    RS("ADVAPI32.dll", SetSecurityDescriptorDacl, 4);
     R1S("KERNEL32.dll", RemoveDirectoryW, 1);
     RS("KERNEL32.dll", lstrcmpiA, 2);
     RS("KERNEL32.dll", GetTempFileNameW, 4);
@@ -271,6 +295,17 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("KERNEL32.dll", lstrcmpiW, 2);
     R1S("KERNEL32.dll", SetFileTime, 4);
     R1S("KERNEL32.dll", CloseHandle, 1);
+    // Toolhelp process enumeration (used by the nsProcess plug-in). Registered
+    // with correct stdcall arg counts so the stack stays balanced when the real
+    // plug-in code runs; the default return 0 makes Process32First report no
+    // processes -> FindProcess("Steam.exe") resolves to "not running".
+    RS("KERNEL32.dll", CreateToolhelp32Snapshot, 2);
+    RS("KERNEL32.dll", Process32First, 2);
+    RS("KERNEL32.dll", Process32Next, 2);
+    RS("KERNEL32.dll", Process32FirstW, 2);
+    RS("KERNEL32.dll", Process32NextW, 2);
+    RS("KERNEL32.dll", OpenProcess, 3);
+    R1S("KERNEL32.dll", TerminateProcess, 2);
     RS("KERNEL32.dll", ExpandEnvironmentStringsW, 3);
     RS("KERNEL32.dll", lstrcmpW, 2);
     R("KERNEL32.dll", GetDiskFreeSpaceW, stub_GetDiskFreeSpaceW, 5);
@@ -307,6 +342,220 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", QueryPerformanceFrequency, 1);
     RS("KERNEL32.dll", GetSystemInfo, 1);
     R1S("KERNEL32.dll", GetVersionExA, 1);
+    R1S("KERNEL32.dll", GetVersionExW, 1);
+
+    // === MSVC CRT startup imports (steam.exe & other real EXEs) ===
+    // Registered with CORRECT stdcall arg counts so each call cleans the stack;
+    // auto-stub (num_args=0) desyncs it and crashes the CRT. R1S = return TRUE
+    // for BOOL-success calls; RS = default 0. Engine handlers exist for
+    // Tls*/Encode/DecodePointer/Heap*/GetCurrentThread and override returns.
+    // -- critical sections / SRW / one-time init / SLIST (mostly void/BOOL) --
+    RS ("KERNEL32.dll", InitializeCriticalSection, 1);
+    R1S("KERNEL32.dll", InitializeCriticalSectionEx, 3);
+    R1S("KERNEL32.dll", InitializeCriticalSectionAndSpinCount, 2);
+    RS ("KERNEL32.dll", EnterCriticalSection, 1);
+    RS ("KERNEL32.dll", LeaveCriticalSection, 1);
+    RS ("KERNEL32.dll", DeleteCriticalSection, 1);
+    R1S("KERNEL32.dll", TryEnterCriticalSection, 1);
+    RS ("KERNEL32.dll", InitializeSRWLock, 1);
+    RS ("KERNEL32.dll", AcquireSRWLockExclusive, 1);
+    RS ("KERNEL32.dll", ReleaseSRWLockExclusive, 1);
+    R1S("KERNEL32.dll", TryAcquireSRWLockExclusive, 1);
+    R1S("KERNEL32.dll", InitOnceBeginInitialize, 4);
+    R1S("KERNEL32.dll", InitOnceComplete, 3);
+    // condition variables + address-wait (UCRT resolves these dynamically from
+    // api-ms-win-core-synch; auto-stub num_args=0 would desync like FlsAlloc did)
+    RS ("KERNEL32.dll", InitializeConditionVariable, 1);
+    RS ("KERNEL32.dll", WakeConditionVariable, 1);
+    RS ("KERNEL32.dll", WakeAllConditionVariable, 1);
+    R1S("KERNEL32.dll", SleepConditionVariableCS, 3);
+    R1S("KERNEL32.dll", SleepConditionVariableSRW, 4);
+    RS ("KERNEL32.dll", AcquireSRWLockShared, 1);
+    RS ("KERNEL32.dll", ReleaseSRWLockShared, 1);
+    R1S("KERNEL32.dll", TryAcquireSRWLockShared, 1);
+    R1S("KERNEL32.dll", WaitOnAddress, 4);
+    RS ("KERNEL32.dll", WakeByAddressSingle, 1);
+    RS ("KERNEL32.dll", WakeByAddressAll, 1);
+    RS ("KERNEL32.dll", GetTickCount64, 0);
+    // localization (UCRT resolves these dynamically from api-ms-win-core-localization)
+    RS ("KERNEL32.dll", LCMapStringEx, 9);
+    RS ("KERNEL32.dll", CompareStringEx, 9);
+    RS ("KERNEL32.dll", GetLocaleInfoEx, 4);
+    RS ("KERNEL32.dll", GetLocaleInfoW, 4);
+    RS ("KERNEL32.dll", GetUserDefaultLocaleName, 2);
+    RS ("KERNEL32.dll", GetSystemDefaultLocaleName, 2);
+    R1S("KERNEL32.dll", GetStringTypeExW, 5);
+    R1S("KERNEL32.dll", IsValidLocale, 2);
+    RS ("KERNEL32.dll", EnumSystemLocalesW, 2);
+    RS ("KERNEL32.dll", EnumSystemLocalesEx, 4);
+    RS ("KERNEL32.dll", GetNLSVersionEx, 3);
+    RS ("KERNEL32.dll", ResolveLocaleName, 3);
+    RS ("KERNEL32.dll", GetUserDefaultLCID, 0);
+    RS ("KERNEL32.dll", GetSystemDefaultLCID, 0);
+    RS ("KERNEL32.dll", InitializeSListHead, 1);
+    RS ("KERNEL32.dll", InterlockedPushEntrySList, 2);
+    RS ("KERNEL32.dll", InterlockedPopEntrySList, 1);
+    RS ("KERNEL32.dll", InterlockedFlushSList, 1);
+    // -- TLS (engine handlers provide values) --
+    RS ("KERNEL32.dll", TlsAlloc, 0);
+    RS ("KERNEL32.dll", TlsGetValue, 1);
+    R1S("KERNEL32.dll", TlsSetValue, 2);
+    R1S("KERNEL32.dll", TlsFree, 1);
+    RS ("KERNEL32.dll", FlsAlloc, 1);
+    RS ("KERNEL32.dll", FlsGetValue, 1);
+    R1S("KERNEL32.dll", FlsSetValue, 2);
+    R1S("KERNEL32.dll", FlsFree, 1);
+    // -- heap (engine handlers for HeapReAlloc) --
+    RS ("KERNEL32.dll", HeapReAlloc, 4);
+    RS ("KERNEL32.dll", HeapSize, 3);
+    R1S("KERNEL32.dll", HeapValidate, 3);
+    R1S("KERNEL32.dll", HeapSetInformation, 4);
+    R1S("KERNEL32.dll", HeapLock, 1);
+    R1S("KERNEL32.dll", HeapUnlock, 1);
+    RS ("KERNEL32.dll", HeapWalk, 2);
+    R1S("KERNEL32.dll", HeapQueryInformation, 5);
+    RS ("KERNEL32.dll", GetProcessHeaps, 2);
+    // -- console / std handles --
+    RS ("KERNEL32.dll", GetStdHandle, 1);
+    R1S("KERNEL32.dll", SetStdHandle, 2);
+    RS ("KERNEL32.dll", GetFileType, 1);
+    RS ("KERNEL32.dll", GetConsoleCP, 0);
+    R1S("KERNEL32.dll", GetConsoleMode, 2);
+    R1S("KERNEL32.dll", SetConsoleMode, 2);
+    R1S("KERNEL32.dll", WriteConsoleW, 5);
+    R1S("KERNEL32.dll", ReadConsoleW, 5);
+    R1S("KERNEL32.dll", ReadConsoleA, 5);
+    R1S("KERNEL32.dll", SetConsoleCtrlHandler, 2);
+    // -- locale / codepage --
+    RS ("KERNEL32.dll", GetACP, 0);
+    RS ("KERNEL32.dll", GetOEMCP, 0);
+    R1S("KERNEL32.dll", GetCPInfo, 2);
+    R1S("KERNEL32.dll", IsValidCodePage, 1);
+    RS ("KERNEL32.dll", LCMapStringW, 6);
+    RS ("KERNEL32.dll", LCMapStringA, 6);
+    RS ("KERNEL32.dll", CompareStringW, 6);
+    R1S("KERNEL32.dll", GetStringTypeW, 4);
+    RS ("KERNEL32.dll", GetDateFormatW, 6);
+    RS ("KERNEL32.dll", GetTimeFormatW, 6);
+    // -- exception / pointer encoding (engine handlers for Encode/DecodePointer) --
+    RS ("KERNEL32.dll", RtlUnwind, 4);
+    RS ("KERNEL32.dll", UnhandledExceptionFilter, 1);
+    RS ("KERNEL32.dll", SetUnhandledExceptionFilter, 1);
+    RS ("KERNEL32.dll", RaiseException, 4);
+    RS ("KERNEL32.dll", IsProcessorFeaturePresent, 1);  // 0 = use safe CPU paths
+    RS ("KERNEL32.dll", EncodePointer, 1);
+    RS ("KERNEL32.dll", DecodePointer, 1);
+    R1S("KERNEL32.dll", DuplicateHandle, 7);
+    RS ("KERNEL32.dll", GetCurrentThread, 0);
+    // -- threads / events / sync objects --
+    RS ("KERNEL32.dll", OpenThread, 3);
+    R1S("KERNEL32.dll", SetThreadPriority, 2);
+    R1S("KERNEL32.dll", TerminateThread, 2);
+    RS ("KERNEL32.dll", SuspendThread, 1);
+    RS ("KERNEL32.dll", SwitchToThread, 0);
+    RS ("KERNEL32.dll", SetThreadAffinityMask, 2);
+    R1S("KERNEL32.dll", SetProcessAffinityMask, 2);
+    R1S("KERNEL32.dll", GetProcessAffinityMask, 3);
+    RS ("KERNEL32.dll", CreateEventW, 4);
+    RS ("KERNEL32.dll", CreateEventA, 4);
+    RS ("KERNEL32.dll", OpenEventA, 3);
+    R1S("KERNEL32.dll", SetEvent, 1);
+    R1S("KERNEL32.dll", ResetEvent, 1);
+    RS ("KERNEL32.dll", WaitForSingleObjectEx, 3);
+    RS ("KERNEL32.dll", SleepEx, 2);
+    RS ("KERNEL32.dll", CreateIoCompletionPort, 4);
+    R1S("KERNEL32.dll", PostQueuedCompletionStatus, 4);
+    // -- fibers --
+    RS ("KERNEL32.dll", ConvertThreadToFiber, 1);
+    R1S("KERNEL32.dll", ConvertFiberToThread, 0);
+    RS ("KERNEL32.dll", CreateFiber, 3);
+    RS ("KERNEL32.dll", DeleteFiber, 1);
+    RS ("KERNEL32.dll", SwitchToFiber, 1);
+    // -- module / resource --
+    RS ("KERNEL32.dll", LoadLibraryA, 1);
+    RS ("KERNEL32.dll", LoadLibraryExA, 3);
+    R1S("KERNEL32.dll", GetModuleHandleExW, 3);
+    R1S("KERNEL32.dll", GetModuleHandleExA, 3);
+    RS ("KERNEL32.dll", GetModuleFileNameA, 3);
+    RS ("KERNEL32.dll", FindResourceA, 3);
+    RS ("KERNEL32.dll", LoadResource, 2);
+    RS ("KERNEL32.dll", LockResource, 1);
+    RS ("KERNEL32.dll", SizeofResource, 2);
+    RS ("KERNEL32.dll", LocalAlloc, 2);
+    RS ("KERNEL32.dll", LocalFree, 1);
+    // -- env / time / file / misc --
+    RS ("KERNEL32.dll", GetEnvironmentVariableW, 3);
+    RS ("KERNEL32.dll", GetEnvironmentStringsW, 0);
+    R1S("KERNEL32.dll", FreeEnvironmentStringsW, 1);
+    RS ("KERNEL32.dll", GetCommandLineA, 0);
+    RS ("KERNEL32.dll", SystemTimeToFileTime, 2);
+    RS ("KERNEL32.dll", GetSystemTime, 1);
+    RS ("KERNEL32.dll", GetSystemTimeAsFileTime, 1);
+    RS ("KERNEL32.dll", GetSystemTimePreciseAsFileTime, 1);
+    RS ("KERNEL32.dll", FileTimeToSystemTime, 2);
+    RS ("KERNEL32.dll", SystemTimeToTzSpecificLocalTime, 3);
+    RS ("KERNEL32.dll", GetTimeZoneInformation, 1);
+    RS ("KERNEL32.dll", GetFileAttributesA, 1);
+    RS ("KERNEL32.dll", GetCurrentDirectoryA, 2);
+    RS ("KERNEL32.dll", GetCurrentDirectoryW, 2);
+    R1S("KERNEL32.dll", FlushFileBuffers, 1);
+    RS ("KERNEL32.dll", GetDriveTypeW, 1);
+    R1S("KERNEL32.dll", GetFileAttributesExW, 3);
+    R1S("KERNEL32.dll", GetFileInformationByHandle, 2);
+    R1S("KERNEL32.dll", GetFileSizeEx, 2);
+    R1S("KERNEL32.dll", SetEndOfFile, 1);
+    R1S("KERNEL32.dll", SetFilePointerEx, 5);
+    RS ("KERNEL32.dll", FindFirstFileExW, 6);
+    RS ("KERNEL32.dll", VirtualQuery, 3);
+    RS ("KERNEL32.dll", CreateFileA, 7);
+    R1S("KERNEL32.dll", DeviceIoControl, 8);
+    RS ("KERNEL32.dll", VerSetConditionMask, 4);
+    R1S("KERNEL32.dll", VerifyVersionInfoW, 3);
+    R1S("KERNEL32.dll", GlobalMemoryStatusEx, 1);
+    R1S("KERNEL32.dll", ProcessIdToSessionId, 2);
+    R1S("KERNEL32.dll", SetHandleInformation, 3);
+    RS ("KERNEL32.dll", GetFileTime, 4);
+    R1S("KERNEL32.dll", RemoveDirectoryA, 1);
+    RS ("KERNEL32.dll", OutputDebugStringW, 1);
+    RS ("KERNEL32.dll", DebugBreak, 0);
+    RS ("KERNEL32.dll", IsBadWritePtr, 2);  // 0 = "writable" (FALSE)
+    // Dynamically resolved via GetProcAddress — must have correct arg counts
+    RS ("KERNEL32.dll", AppPolicyGetProcessTerminationMethod, 2);
+    RS ("KERNEL32.dll", GetCurrentPackageId, 2);
+    RS ("KERNEL32.dll", GetTempPath2W, 2);
+    RS ("KERNEL32.dll", CorExitProcess, 1);
+    RS ("KERNEL32.dll", SetCurrentProcessExplicitAppUserModelID, 1);
+    // -- USER32 / GDI / ADVAPI auto-stubbed by steam --
+    RS ("USER32.dll", RegisterClassExW, 1);
+    RS ("USER32.dll", UnregisterClassW, 2);
+    R1S("USER32.dll", GetClassInfoExW, 3);
+    RS ("USER32.dll", MessageBoxW, 4);
+    RS ("USER32.dll", MessageBoxA, 4);
+    RS ("USER32.dll", GetDesktopWindow, 0);
+    RS ("USER32.dll", MonitorFromWindow, 2);
+    RS ("USER32.dll", MonitorFromPoint, 3);
+    R1S("USER32.dll", GetMonitorInfoW, 2);
+    R1S("USER32.dll", PostThreadMessageW, 4);
+    RS ("USER32.dll", GetWindowThreadProcessId, 2);
+    R1S("USER32.dll", EnumWindows, 2);
+    R1S("USER32.dll", EnumChildWindows, 3);
+    R1S("USER32.dll", UpdateWindow, 1);
+    R1S("USER32.dll", MoveWindow, 6);
+    R1S("USER32.dll", RedrawWindow, 4);
+    R1S("USER32.dll", KillTimer, 2);
+    RS ("USER32.dll", LoadIconW, 2);
+    RS ("USER32.dll", MsgWaitForMultipleObjects, 5);
+    R1S("USER32.dll", AllowSetForegroundWindow, 1);
+    RS ("GDI32.dll", GetStockObject, 1);
+    RS ("GDI32.dll", CreateFontW, 14);
+    R1S("GDI32.dll", GetTextExtentPoint32W, 4);
+    RS ("GDI32.dll", CreateDIBSection, 6);
+    RS ("ADVAPI32.dll", RegOpenKeyExA, 5);
+    RS ("ADVAPI32.dll", RegCreateKeyExA, 9);
+    RS ("ADVAPI32.dll", RegQueryValueExA, 6);
+    RS ("ADVAPI32.dll", RegSetValueExA, 6);
+    RS ("ADVAPI32.dll", RegOpenKeyA, 3);
+    RS ("bcrypt.dll", BCryptGenRandom, 4);
 
     // === USER32.dll ===
     RS("USER32.dll", GetSystemMenu, 2);
@@ -412,7 +661,14 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("GDI32.dll", SetDIBitsToDevice, 12);
 
     // === SHELL32.dll ===
+    RS("SHELL32.dll", CommandLineToArgvW, 2);
     R1S("SHELL32.dll", IsUserAnAdmin, 0);
+    // SHGetFolderPathW: 5-arg stdcall. Register under KERNEL32 too because our
+    // GetProcAddress resolves with a hardcoded KERNEL32 dll name — without a
+    // correct-arg registration it auto-stubs with num_args=0 and desyncs the
+    // stack on every call. The engine has an explicit handler that fills a path.
+    RS("SHELL32.dll", SHGetFolderPathW, 5);
+    RS("KERNEL32.dll", SHGetFolderPathW, 5);
     R("SHELL32.dll", SHGetSpecialFolderLocation, stub_SHGetSpecialFolderLocation, 3);
     RS("SHELL32.dll", SHGetPathFromIDListW, 2);
     RS("SHELL32.dll", SHBrowseForFolderW, 1);
@@ -440,6 +696,9 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("COMCTL32.dll", Ordinal_17, 1);
     R1S("COMCTL32.dll", ImageList_Destroy, 1);
     R1S("COMCTL32.dll", ImageList_Create, 5);
+
+    // === OLEAUT32.dll ===
+    RS("OLEAUT32.dll", Ordinal_9, 1);   // VariantClear(VARIANT*)
 
     // === ole32.dll ===
     RS("ole32.dll", OleUninitialize, 0);

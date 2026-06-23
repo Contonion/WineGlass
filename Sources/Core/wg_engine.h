@@ -42,4 +42,9 @@ uint32_t wg_engine_hit_test(WGEngine *engine, int virt_x, int virt_y);
 WGEngineState wg_engine_get_state(const WGEngine *engine);
 WGEngineState wg_engine_run_sync(WGEngine *engine, int max_ticks);
 
+// If the just-exited program asked to launch another (the Steam bootstrapper),
+// returns its real path and clears it (one-shot); else returns NULL. The app
+// chain-loads it after the engine stops.
+const char *wg_engine_take_pending_exec(WGEngine *engine);
+
 #endif
