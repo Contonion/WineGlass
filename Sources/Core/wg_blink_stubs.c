@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 // TerminateSignal is called when blink wants to kill the emulated process.
 // In standalone blink, this calls exit(). In library mode, we longjmp back
@@ -52,5 +53,14 @@ void Abort(void) {
         s_abort_recovery_active = false;
         siglongjmp(*s_abort_recovery, 99);
     }
-    fprintf(stderr, "[WineGlass] Abort() with no recovery — returning\n");
+    fprintf(stderr, "[WineGlass] Abort() with no recovery — returning (NOT aborting)\n");
+    // Do NOT call abort() — just return. The caller may handle the error.
+}
+
+// Also override abort() itself to prevent process termination
+void abort(void) {
+    fprintf(stderr, "[WineGlass] abort() intercepted — redirecting to Abort()\n");
+    Abort();
+    // If Abort() returned (no recovery), just spin forever rather than die
+    for (;;) { usleep(1000000); }
 }
