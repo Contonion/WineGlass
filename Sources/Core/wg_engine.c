@@ -12,6 +12,7 @@
 #include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
 #include "wg_winsock.h"
+#include "wg_threading.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -288,6 +289,7 @@ static uint32_t s_fls_next = 0;
 #define WG_MAX_EVENTS   256
 static bool s_event_signalled[WG_MAX_EVENTS];
 static uint32_t s_event_next = 0;
+static uint32_t s_main_teb = 0; // TEB address of main thread
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
 static uint32_t s_nsis_last_data_seek = 0;     // last seek position in data .tmp
@@ -351,7 +353,8 @@ struct WGEngine {
     // Shared
     WGPEImage      *pe_image;
     WGDllMapper    *dll_mapper;
-    WGWinsock      *winsock;
+    WGWinsock          *winsock;
+    WGThreadScheduler  *scheduler;
     uint64_t        tick_count;
     int             instructions_per_tick;
     bool            thunks_mapped; // whether HLT stubs are in blink memory
@@ -364,6 +367,7 @@ WGEngine *wg_engine_create(void) {
     e->instructions_per_tick = 100000;
     e->backend = WG_BACKEND_BLINK;
     e->winsock = wg_winsock_create();
+    e->scheduler = wg_sched_create();
     return e;
 }
 
@@ -376,6 +380,7 @@ void wg_engine_destroy(WGEngine *engine) {
     if (engine->dll_mapper) wg_dll_mapper_destroy(engine->dll_mapper);
     if (engine->blink) wg_blink_destroy(engine->blink);
     if (engine->winsock) wg_winsock_destroy(engine->winsock);
+    if (engine->scheduler) wg_sched_destroy(engine->scheduler);
     free(engine);
 }
 
@@ -2170,6 +2175,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t h = args[0];
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = true;
+            wg_sched_wake(engine->scheduler, h);
             ret_val = 1;
         } else if (strcmp(fn, "ResetEvent") == 0) {
             uint32_t h = args[0];
@@ -2177,13 +2183,30 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 s_event_signalled[h - WG_EVENT_BASE] = false;
             ret_val = 1;
         } else if (strcmp(fn, "WaitForSingleObject") == 0) {
-            // Single-threaded: events are either signalled or not.
-            // Return WAIT_OBJECT_0 (0) if signalled, WAIT_TIMEOUT (258) otherwise.
             uint32_t h = args[0];
-            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS) {
-                ret_val = s_event_signalled[h - WG_EVENT_BASE] ? 0 : 258;
-            } else {
+            uint32_t timeout = args[1];
+            // Check if the handle is already signalled
+            bool signalled = false;
+            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+                signalled = s_event_signalled[h - WG_EVENT_BASE];
+            // Check if it's a thread handle that has exited
+            WGThread *wt = wg_sched_find(engine->scheduler, h);
+            if (wt && wt->state == WG_THREAD_EXITED) signalled = true;
+            if (signalled) {
                 ret_val = 0; // WAIT_OBJECT_0
+            } else if (timeout == 0) {
+                ret_val = 258; // WAIT_TIMEOUT
+            } else {
+                // Block and try to switch to another thread
+                WGThread *cur = wg_sched_current(engine->scheduler);
+                if (cur) {
+                    cur->wait_handle = h;
+                    cur->wait_timeout = timeout;
+                }
+                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_WAITING)) {
+                    return true; // switched to another thread
+                }
+                ret_val = 0; // no other threads, just return signalled
             }
         } else if (strcmp(fn, "WaitForMultipleObjects") == 0) {
             ret_val = 0; // WAIT_OBJECT_0
@@ -2203,25 +2226,25 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "CreateThread") == 0) {
             // CreateThread(secAttr, stackSize, start=args[2], param=args[3],
             //              flags=args[4], lpThreadId=args[5]).
-            // NSIS's instfiles page runs the install SECTION (the file
-            // extraction) on a worker thread. blink is single-threaded and this
-            // was a no-op stub, so the section never ran and nothing installed.
-            // Run the thread routine synchronously via the nested-call sentinel,
-            // then hand the caller a fake thread handle (ovr_eax). The routine's
-            // own thunk calls (CreateFileW/WriteFile to $INSTDIR, etc.) extract
-            // Steam.exe + the rest while it runs.
             uint32_t start = args[2], param = args[3], flags = args[4];
-            if (args[5]) { uint32_t tid = 0x00001234;
-                wg_blink_write_mem(engine->blink, args[5], &tid, 4); }
-            uint32_t hthread = 0x00007100;
-            uint64_t clean_rsp = rsp + ptr_size + (6 * ptr_size);
-            if (start && is_32bit && !(flags & 0x4u /*CREATE_SUSPENDED*/) &&
-                wg_call_wndproc_ovr(engine, start, param, 0, 0, 0,
-                                    (uint32_t)ret_addr, (uint32_t)clean_rsp,
-                                    true, hthread)) {
-                WG_LOGI(TAG, "CreateThread: running start=0x%X(param=0x%X) synchronously",
-                        start, param);
-                return true;
+            uint32_t tid = 0;
+            uint32_t hthread = wg_sched_create_thread(
+                engine->scheduler, engine->blink,
+                start, param, flags, &tid);
+            if (args[5] && tid) {
+                wg_blink_write_mem(engine->blink, args[5], &tid, 4);
+            }
+            if (!hthread) {
+                // Fallback: run synchronously (for NSIS compatibility)
+                hthread = 0x7100;
+                uint64_t clean_rsp = rsp + ptr_size + (6 * ptr_size);
+                if (start && is_32bit && !(flags & 0x4u)) {
+                    wg_call_wndproc_ovr(engine, start, param, 0, 0, 0,
+                                        (uint32_t)ret_addr, (uint32_t)clean_rsp,
+                                        true, hthread);
+                    WG_LOGI(TAG, "CreateThread: fallback sync start=0x%X", start);
+                    return true;
+                }
             }
             ret_val = hthread;
         } else if (strcmp(fn, "GetExitCodeThread") == 0) {
@@ -2423,6 +2446,26 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[0], &ft, 8);
             }
             ret_val = 0;
+        } else if (strcmp(fn, "GetCurrentThreadId") == 0) {
+            ret_val = wg_sched_current_tid(engine->scheduler);
+            if (!ret_val) ret_val = 1;
+        } else if (strcmp(fn, "Sleep") == 0 || strcmp(fn, "SleepEx") == 0) {
+            // Try to yield to another thread during sleep
+            if (args[0] > 0 &&
+                wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
+                return true;
+            }
+            ret_val = 0;
+        } else if (strcmp(fn, "ExitThread") == 0) {
+            WG_LOGI(TAG, "ExitThread(%u)", args[0]);
+            wg_sched_exit_thread(engine->scheduler, engine->blink, args[0]);
+            WGThread *cur_after = wg_sched_current(engine->scheduler);
+            if (cur_after) {
+                return true; // switched to another thread
+            }
+            // No more threads — halt
+            wg_blink_set_rip(engine->blink, 0);
+            return true;
         } else if (strcmp(fn, "GetCurrentProcess") == 0) {
             ret_val = (uint64_t)-1;
         } else if (strcmp(fn, "CloseHandle") == 0) {
@@ -2938,6 +2981,7 @@ static void wg_setup_win32_teb(WGEngine *engine) {
     }
 
     wg_blink_set_fs_base(engine->blink, teb);
+    s_main_teb = teb;
     WG_LOGI(TAG, "Win32 TEB@0x%X PEB@0x%X fs-base set", teb, peb);
 }
 
@@ -3063,6 +3107,21 @@ static bool load_pe_blink(WGEngine *engine) {
         // Export directory RVA at OptionalHeader + 0x60 (offset 0x98+0x60=0xF8)
         // Leave it 0 (no exports)
         wg_blink_load_code(engine->blink, 0xBFFF0000u, fake, sizeof(fake), 0);
+    }
+
+    // Register the main thread (thread 0) with the scheduler
+    if (engine->scheduler) {
+        WGThread *mt = &engine->scheduler->threads[0];
+        memset(mt, 0, sizeof(*mt));
+        mt->state = WG_THREAD_RUNNING;
+        mt->id = 1;
+        mt->handle = 0x7000;
+        mt->exit_code = 259;
+        // Save FS base from the TEB we just set up
+        mt->regs.fs_base = s_main_teb;
+        mt->teb = s_main_teb;
+        engine->scheduler->current = 0;
+        engine->scheduler->count = 1;
     }
 
     WG_LOGI(TAG, "PE mapped via blink. Entry: 0x%llx", (unsigned long long)entry);
@@ -3239,6 +3298,18 @@ void wg_engine_tick(WGEngine *engine) {
                 if (handle_blink_thunk(engine)) break;
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
                 if (halt_rip == 0) {
+                    // RIP=0 can mean: (a) ExitProcess set it, or (b) a
+                    // worker thread returned from its start function.
+                    // Check if there are other threads to run.
+                    WGThread *cur = wg_sched_current(engine->scheduler);
+                    if (cur && cur->id != 1) {
+                        // Worker thread returned — exit it and switch
+                        uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                        wg_sched_exit_thread(engine->scheduler, engine->blink, eax);
+                        wg_sched_wake(engine->scheduler, cur->handle);
+                        if (wg_sched_switch_next(engine->scheduler, engine->blink))
+                            break;
+                    }
                     WG_LOGI(TAG, "Program exited normally after %llu ticks",
                             (unsigned long long)engine->tick_count);
                 } else {

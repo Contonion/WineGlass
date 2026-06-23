@@ -32,6 +32,7 @@
 		DE48CAB52C304F62F5C45C8D /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 84466C30852AB61143363D30 /* main.m */; };
 		ED40774431FAD40D5F0AFABE /* wg_winsock.c in Sources */ = {isa = PBXBuildFile; fileRef = 6E7BD0669D0C63DA944073BE /* wg_winsock.c */; };
 		FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */ = {isa = PBXBuildFile; fileRef = B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */; };
+		FF0C10672178332D27C8A826 /* wg_threading.c in Sources */ = {isa = PBXBuildFile; fileRef = CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -57,6 +58,7 @@
 		B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_files.c; sourceTree = "<group>"; };
 		BD62DFB283E953060FB6F2B4 /* wg_selftest.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_selftest.c; sourceTree = "<group>"; };
 		C2E7451659F90F1881744FD7 /* wg_log.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_log.c; sourceTree = "<group>"; };
+		CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_threading.c; sourceTree = "<group>"; };
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -103,6 +105,7 @@
 			children = (
 				AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */,
 				F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */,
+				CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */,
 				A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */,
 				B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */,
 				3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */,
@@ -274,6 +277,7 @@
 				B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */,
 				6F440B002DECA62AC5C07C6A /* wg_pe_loader.c in Sources */,
 				DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */,
+				FF0C10672178332D27C8A826 /* wg_threading.c in Sources */,
 				4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */,
 				FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */,
 				7880F90BE3616E67CD6E01D5 /* wg_win32_gdi.c in Sources */,

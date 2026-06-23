@@ -481,6 +481,8 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("KERNEL32.dll", CreateSemaphoreA, 4);
     R1S("KERNEL32.dll", ReleaseSemaphore, 3);
     RS ("KERNEL32.dll", SleepEx, 2);
+    RS ("KERNEL32.dll", Sleep, 1);
+    RS ("KERNEL32.dll", ExitThread, 1);
     RS ("KERNEL32.dll", CreateIoCompletionPort, 4);
     R1S("KERNEL32.dll", PostQueuedCompletionStatus, 4);
     // -- fibers --
