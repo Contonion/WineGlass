@@ -577,6 +577,8 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("ADVAPI32.dll", RegSetValueExA, 6);
     RS ("ADVAPI32.dll", RegOpenKeyA, 3);
     RS ("bcrypt.dll", BCryptGenRandom, 4);
+    R1S("KERNEL32.dll", SystemFunction036, 2); // RtlGenRandom
+    R1S("ADVAPI32.dll", SystemFunction036, 2);
 
     // === USER32.dll ===
     RS("USER32.dll", GetSystemMenu, 2);

@@ -2036,6 +2036,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[2], &handle, 4);
             }
             ret_val = 1; // TRUE
+        } else if (strcmp(fn, "SystemFunction036") == 0) {
+            // RtlGenRandom(pvBuffer=args[0], cbBuffer=args[1]) -> BOOLEAN
+            if (args[0] && args[1] > 0 && args[1] <= 256) {
+                uint8_t rnd[256];
+                for (uint32_t i = 0; i < args[1]; i++)
+                    rnd[i] = (uint8_t)(arc4random() & 0xFF);
+                wg_blink_write_mem(engine->blink, args[0], rnd, args[1]);
+            }
+            ret_val = 1; // TRUE = success
         } else if (strcmp(fn, "CreateFontW") == 0 ||
                    strcmp(fn, "CreateFontA") == 0 ||
                    strcmp(fn, "CreateFontIndirectW") == 0 ||
