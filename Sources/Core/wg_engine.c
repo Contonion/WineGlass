@@ -3026,27 +3026,15 @@ static bool load_pe_blink(WGEngine *engine) {
     //   0x50000000-0x5FFFFFFF  — covers stale DLL pointers from .rdata
     //     (e.g. 0x53572073 "CNet::BFrame..." network handler tables)
     {
-        // Map zero regions for unmapped address ranges that programs
-        // may dereference (stale DLL pointers, uninitialized vtables).
-        // Blink uses real mmap pages, but the OS COW-shares zero pages
-        // so actual RAM is only used for pages that get written.
-        uint32_t zero_ranges[][2] = {
-            {0x00000000u, 0x00010000u},   // NULL dereferences
-            {0x10000000u, 0x00100000u},   // low DLL range
-            {0x50000000u, 0x10000000u},   // stale DLL pointers (256MB)
-        };
-        for (int r = 0; r < 3; r++) {
-            uint32_t base = zero_ranges[r][0];
-            uint32_t size = zero_ranges[r][1];
-            // Map in 1MB chunks to avoid huge single allocations
-            for (uint32_t off = 0; off < size; off += 0x100000u) {
-                uint32_t chunk = (size - off < 0x100000u) ? (size - off) : 0x100000u;
-                uint8_t *zp = calloc(1, chunk);
-                if (zp) {
-                    wg_blink_load_code(engine->blink, base + off, zp, chunk, 0);
-                    free(zp);
-                }
-            }
+        uint8_t *zp = calloc(1, 0x10000);
+        if (zp) {
+            // NULL dereferences
+            wg_blink_load_code(engine->blink, 0, zp, 0x10000, 0);
+            // Stale DLL pointers: map specific 4KB pages covering known
+            // addresses from steam's .rdata (0x53572073 etc.)
+            wg_blink_load_code(engine->blink, 0x53572000u, zp, 0x1000, 0);
+            wg_blink_load_code(engine->blink, 0x5ECF7000u, zp, 0x1000, 0);
+            free(zp);
         }
     }
 
