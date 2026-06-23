@@ -245,6 +245,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", SetCurrentDirectoryW, 1);
     R("KERNEL32.dll", GetFileAttributesW, stub_GetFileAttributesW, 1);
     RS("KERNEL32.dll", GetFullPathNameW, 4);
+    RS("KERNEL32.dll", GetFullPathNameA, 4);
     RS("KERNEL32.dll", Sleep, 1);
     R("KERNEL32.dll", GetTickCount, stub_GetTickCount, 0);
     R("KERNEL32.dll", CreateFileW, stub_CreateFileW, 7);

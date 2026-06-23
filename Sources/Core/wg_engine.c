@@ -1500,31 +1500,106 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[1] && args[0] >= (uint32_t)n)
                 wg_blink_write_mem(engine->blink, args[1], tmp, n * 2);
             ret_val = (args[0] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
-        } else if (strcmp(fn, "GetCurrentDirectoryW") == 0) {
-            // GetCurrentDirectoryW(nBufferLength=args[0], lpBuffer=args[1])
+        } else if (strcmp(fn, "GetCurrentDirectoryW") == 0 ||
+                   strcmp(fn, "GetCurrentDirectoryA") == 0) {
             const char *winpath = wg_files_exe_win_path();
-            // Strip filename to get directory
+            char dir[520] = {0};
             const char *last = strrchr(winpath, '\\');
             int dirlen = last ? (int)(last - winpath) : (int)strlen(winpath);
-            if (args[1] && args[0] > (uint32_t)dirlen) {
-                uint16_t wbuf[520] = {0};
-                for (int i = 0; i < dirlen; i++)
-                    wbuf[i] = (uint8_t)winpath[i];
-                wbuf[dirlen] = 0;
-                wg_blink_write_mem(engine->blink, args[1], wbuf, (dirlen + 1) * 2);
+            memcpy(dir, winpath, dirlen);
+            // Ensure trailing backslash for root dirs (C: -> C:\)
+            if (dirlen >= 2 && dir[dirlen-1] == ':') {
+                dir[dirlen++] = '\\';
+            }
+            dir[dirlen] = 0;
+            bool wide = (fn[19] == 'W');
+            if (wide) {
+                if (args[1] && args[0] > (uint32_t)dirlen) {
+                    uint16_t wbuf[520] = {0};
+                    for (int i = 0; i < dirlen; i++)
+                        wbuf[i] = (uint8_t)dir[i];
+                    wbuf[dirlen] = 0;
+                    wg_blink_write_mem(engine->blink, args[1], wbuf, (dirlen + 1) * 2);
+                }
+            } else {
+                if (args[1] && args[0] > (uint32_t)dirlen) {
+                    wg_blink_write_mem(engine->blink, args[1], dir, dirlen + 1);
+                }
             }
             ret_val = dirlen;
-        } else if (strcmp(fn, "GetCurrentDirectoryA") == 0) {
-            const char *winpath = wg_files_exe_win_path();
-            const char *last = strrchr(winpath, '\\');
-            int dirlen = last ? (int)(last - winpath) : (int)strlen(winpath);
-            if (args[1] && args[0] > (uint32_t)dirlen) {
-                char abuf[520] = {0};
-                memcpy(abuf, winpath, dirlen);
-                abuf[dirlen] = 0;
-                wg_blink_write_mem(engine->blink, args[1], abuf, dirlen + 1);
+        } else if (strcmp(fn, "GetFullPathNameW") == 0) {
+            // GetFullPathNameW(lpFileName=args[0], nBufferLength=args[1],
+            //                   lpBuffer=args[2], lpFilePart=args[3])
+            uint16_t fname[520] = {0};
+            if (args[0]) wg_blink_read_mem(engine->blink, args[0], fname, 1038);
+            // Convert to ASCII for processing
+            char aname[520] = {0};
+            for (int i = 0; i < 519 && fname[i]; i++)
+                aname[i] = fname[i] < 128 ? (char)fname[i] : '?';
+            char full[520] = {0};
+            if (aname[0] && aname[1] == ':') {
+                // Already absolute (C:\...)
+                snprintf(full, sizeof(full), "%s", aname);
+            } else {
+                // Relative — prepend current directory
+                const char *winpath = wg_files_exe_win_path();
+                const char *last = strrchr(winpath, '\\');
+                int dirlen = last ? (int)(last - winpath) : (int)strlen(winpath);
+                char dir[520] = {0};
+                memcpy(dir, winpath, dirlen);
+                if (dirlen >= 2 && dir[dirlen-1] == ':')
+                    dir[dirlen++] = '\\';
+                dir[dirlen] = 0;
+                snprintf(full, sizeof(full), "%s%s%s",
+                    dir, (dir[dirlen-1] == '\\') ? "" : "\\", aname);
             }
-            ret_val = dirlen;
+            // Fix separators
+            for (char *p = full; *p; p++) { if (*p == '/') *p = '\\'; }
+            int len = (int)strlen(full);
+            if (args[2] && args[1] > (uint32_t)len) {
+                uint16_t wfull[520] = {0};
+                for (int i = 0; i <= len; i++)
+                    wfull[i] = (uint8_t)full[i];
+                wg_blink_write_mem(engine->blink, args[2], wfull, (len + 1) * 2);
+                // Set lpFilePart to point to the filename portion
+                if (args[3]) {
+                    const char *fp = strrchr(full, '\\');
+                    uint32_t fp_off = fp ? (uint32_t)(fp - full + 1) : 0;
+                    uint32_t fp_addr = args[2] + fp_off * 2;
+                    wg_blink_write_mem(engine->blink, args[3], &fp_addr, 4);
+                }
+            }
+            ret_val = len;
+        } else if (strcmp(fn, "GetFullPathNameA") == 0) {
+            char aname[520] = {0};
+            if (args[0]) wg_blink_read_mem(engine->blink, args[0], aname, 519);
+            char full[520] = {0};
+            if (aname[0] && aname[1] == ':') {
+                snprintf(full, sizeof(full), "%s", aname);
+            } else {
+                const char *winpath = wg_files_exe_win_path();
+                const char *last = strrchr(winpath, '\\');
+                int dirlen = last ? (int)(last - winpath) : (int)strlen(winpath);
+                char dir[520] = {0};
+                memcpy(dir, winpath, dirlen);
+                if (dirlen >= 2 && dir[dirlen-1] == ':')
+                    dir[dirlen++] = '\\';
+                dir[dirlen] = 0;
+                snprintf(full, sizeof(full), "%s%s%s",
+                    dir, (dir[dirlen-1] == '\\') ? "" : "\\", aname);
+            }
+            for (char *p = full; *p; p++) { if (*p == '/') *p = '\\'; }
+            int len = (int)strlen(full);
+            if (args[2] && args[1] > (uint32_t)len) {
+                wg_blink_write_mem(engine->blink, args[2], full, len + 1);
+                if (args[3]) {
+                    const char *fp = strrchr(full, '\\');
+                    uint32_t fp_off = fp ? (uint32_t)(fp - full + 1) : 0;
+                    uint32_t fp_addr = args[2] + fp_off;
+                    wg_blink_write_mem(engine->blink, args[3], &fp_addr, 4);
+                }
+            }
+            ret_val = len;
         } else if (strcmp(fn, "GetWindowsDirectoryW") == 0) {
             // GetWindowsDirectoryW(lpBuffer=args[0], uSize=args[1] in chars).
             uint16_t windir[] = {'C',':','\\','W','i','n','d','o','w','s',0};
@@ -1943,6 +2018,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[2], &handle, 4);
             }
             ret_val = 1; // TRUE
+        } else if (strcmp(fn, "RegisterClassExW") == 0 ||
+                   strcmp(fn, "RegisterClassExA") == 0 ||
+                   strcmp(fn, "RegisterClassW") == 0 ||
+                   strcmp(fn, "RegisterClassA") == 0) {
+            static uint32_t s_next_atom = 0xC000;
+            ret_val = s_next_atom++;
         } else if (strcmp(fn, "OutputDebugStringA") == 0) {
             if (args[0]) {
                 char dbg[512] = {0};
