@@ -250,7 +250,8 @@
         if (s == WG_ENGINE_RUNNING) {
             wg_engine_tick(_engine);          // tight loop — full core
         } else if (s == WG_ENGINE_PAUSED) {
-            usleep(8000);                     // idle while a modal dialog waits
+            wg_engine_tick(_engine);          // let worker threads run
+            usleep(8000);                     // then idle briefly
         } else {
             break;                            // STOPPED / ERROR / IDLE
         }
