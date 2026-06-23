@@ -246,7 +246,7 @@ typedef enum {
 static uint32_t s_last_error = 0;
 
 // Ring buffer of recent Win32 API calls for crash diagnostics
-#define WG_CALL_RING_SIZE 64
+#define WG_CALL_RING_SIZE 256
 static struct { const char *fn; uint64_t ret; } s_call_ring[WG_CALL_RING_SIZE];
 static int s_call_ring_idx = 0;
 static inline void wg_call_ring_push(const char *name, uint64_t ret) {
