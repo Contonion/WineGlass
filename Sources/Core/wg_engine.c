@@ -984,6 +984,26 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_read_mem(engine->blink, args[1], text_buf, 510);
             }
             wg_wm_set_text(args[0], text_buf);
+            // Render text into the window's client area
+            WGWin32Window *tw = wg_wm_find(args[0]);
+            if (tw && tw->w > 0 && tw->h > 0 && text_buf[0]) {
+                int32_t cw, ch;
+                uint32_t *client = wg_wm_get_client(args[0], &cw, &ch);
+                if (client && cw > 0 && ch > 0) {
+                    // Fill with light gray background
+                    for (int p = 0; p < cw * ch; p++)
+                        client[p] = 0xFFF0F0F0;
+                    // Count chars for text
+                    int tlen = 0;
+                    while (tlen < 255 && text_buf[tlen]) tlen++;
+                    // Render text (use GDI text_out on this window's DC)
+                    uint32_t dc = wg_gdi_get_dc(args[0]);
+                    wg_gdi_set_text_color(dc, 0x00000000);
+                    wg_gdi_text_out(dc, 4, (ch - 8) / 2, text_buf, tlen);
+                    wg_gdi_release_dc(dc);
+                    tw->client_dirty = true;
+                }
+            }
             ret_val = 1;
         } else if (strcmp(fn, "GetClientRect") == 0 || strcmp(fn, "GetWindowRect") == 0) {
             WGWin32Window *w = wg_wm_find(args[0]);
@@ -2016,6 +2036,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[2], &handle, 4);
             }
             ret_val = 1; // TRUE
+        } else if (strcmp(fn, "CreateFontW") == 0 ||
+                   strcmp(fn, "CreateFontA") == 0 ||
+                   strcmp(fn, "CreateFontIndirectW") == 0 ||
+                   strcmp(fn, "CreateFontIndirectA") == 0) {
+            static uint32_t s_next_font = 0xF0000;
+            ret_val = s_next_font++;
+        } else if (strcmp(fn, "MulDiv") == 0) {
+            // MulDiv(nNumber=args[0], nNumerator=args[1], nDenominator=args[2])
+            int32_t a = (int32_t)args[0];
+            int32_t b = (int32_t)args[1];
+            int32_t d = (int32_t)args[2];
+            if (d == 0) ret_val = (uint64_t)(int64_t)-1;
+            else ret_val = (uint64_t)(int64_t)((int64_t)a * b / d);
         } else if (strcmp(fn, "RegisterClassExW") == 0 ||
                    strcmp(fn, "RegisterClassExA") == 0 ||
                    strcmp(fn, "RegisterClassW") == 0 ||
