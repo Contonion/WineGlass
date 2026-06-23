@@ -1917,6 +1917,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // No environment set — always "not found"
             s_last_error = 203; // ERROR_ENVVAR_NOT_FOUND
             ret_val = 0;
+        } else if (strcmp(fn, "GetModuleHandleExW") == 0 ||
+                   strcmp(fn, "GetModuleHandleExA") == 0) {
+            // GetModuleHandleEx(dwFlags, lpModuleName, phModule)
+            // Write a module handle to *phModule
+            uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+            if (args[2]) {
+                uint32_t handle = (args[1] == 0) ? base : 0xBFFF0000u;
+                wg_blink_write_mem(engine->blink, args[2], &handle, 4);
+            }
+            ret_val = 1; // TRUE
         } else if (strcmp(fn, "OutputDebugStringA") == 0) {
             if (args[0]) {
                 char dbg[512] = {0};
