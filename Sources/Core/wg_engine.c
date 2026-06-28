@@ -2817,6 +2817,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
             wg_fill_random(engine->blink, args[0], args[1]);
             WG_LOGI(TAG, "RtlGenRandom(buf=0x%X, %u) -> TRUE", args[0], args[1]);
             ret_val = 1;
+        } else if (strcmp(fn, "CryptAcquireContextW") == 0 ||
+                   strcmp(fn, "CryptAcquireContextA") == 0) {
+            // CryptAcquireContext(phProv, container, provider, type, flags).
+            // OpenSSL/Steam TLS seeds RAND via the legacy CryptoAPI; the default
+            // auto-stub returned FALSE, so RAND_poll failed and the handshake
+            // aborted with internal_error before sending ClientHello.
+            if (args[0]) { uint32_t h = 0x43500001; wg_blink_write_mem(engine->blink, args[0], &h, 4); }
+            WG_LOGI(TAG, "%s -> TRUE (fake HCRYPTPROV)", fn);
+            ret_val = 1; // TRUE
+        } else if (strcmp(fn, "CryptGenRandom") == 0) {
+            // CryptGenRandom(hProv, dwLen=args[1], pbBuffer=args[2]) -> BOOL
+            wg_fill_random(engine->blink, args[2], args[1]);
+            WG_LOGI(TAG, "CryptGenRandom(buf=0x%X, %u) -> TRUE", args[2], args[1]);
+            ret_val = 1; // TRUE
+        } else if (strcmp(fn, "CryptReleaseContext") == 0) {
+            ret_val = 1; // TRUE
         } else if (strcmp(fn, "CreateFontW") == 0 ||
                    strcmp(fn, "CreateFontA") == 0 ||
                    strcmp(fn, "CreateFontIndirectW") == 0 ||

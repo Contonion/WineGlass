@@ -376,6 +376,18 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             *out_ret = WIN_SOCKET_ERROR;
         } else {
             WG_LOGI(TAG, "send(0x%X, %u) -> %zd [%s]", args[0], len, sent, hex);
+            // A TLS alert (record type 0x15) means the guest's TLS engine is
+            // bailing — dump the caller chain so we can find the failing site.
+            if (sent >= 1 && hex[0] == '1' && hex[1] == '5') {
+                uint32_t ebp = (uint32_t)wg_blink_get_reg(blink, 5);
+                for (int f = 0; f < 8 && ebp; f++) {
+                    uint32_t frame[2] = {0};
+                    wg_blink_read_mem(blink, ebp, frame, 8);
+                    WG_LOGW(TAG, "  TLS-alert frame[%d] ret=0x%X", f, frame[1]);
+                    if (frame[0] <= ebp) break; // stack grows down; stop on loop
+                    ebp = frame[0];
+                }
+            }
             *out_ret = (uint32_t)sent;
         }
         return true;

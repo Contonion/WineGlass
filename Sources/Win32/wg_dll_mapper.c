@@ -606,6 +606,11 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("cryptbase.dll", ProcessPrng, 2);
     R1S("bcrypt.dll", ProcessPrng, 2);
     R1S("ADVAPI32.dll", ProcessPrng, 2);
+    // Legacy CryptoAPI — OpenSSL-style TLS seeds RAND through these
+    R1S("ADVAPI32.dll", CryptAcquireContextW, 5);
+    R1S("ADVAPI32.dll", CryptAcquireContextA, 5);
+    R1S("ADVAPI32.dll", CryptGenRandom, 3);
+    R1S("ADVAPI32.dll", CryptReleaseContext, 2);
 
     // === vcruntime / ucrt ===
     // All standard CRT functions are __cdecl — caller cleans args (num_args=0).
