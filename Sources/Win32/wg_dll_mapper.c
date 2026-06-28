@@ -213,7 +213,7 @@ uint64_t wg_dll_mapper_resolve(WGDllMapper *mapper, const char *dll, const char 
         }
     }
 
-    WG_LOGD(TAG, "Auto-stub: %s!%s", dll, func);
+    WG_LOGI(TAG, "Auto-stub: %s!%s", dll, func);
     return wg_dll_mapper_register(mapper, dll, func, stub_default, 0);
 }
 
@@ -304,6 +304,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("KERNEL32.dll", lstrcmpiW, 2);
     R1S("KERNEL32.dll", SetFileTime, 4);
     R1S("KERNEL32.dll", CloseHandle, 1);
+    RS("KERNEL32.dll", GetOverlappedResult, 4);
     // Toolhelp process enumeration (used by the nsProcess plug-in). Registered
     // with correct stdcall arg counts so the stack stays balanced when the real
     // plug-in code runs; the default return 0 makes Process32First report no
@@ -318,6 +319,8 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("KERNEL32.dll", ExpandEnvironmentStringsW, 3);
     RS("KERNEL32.dll", lstrcmpW, 2);
     R("KERNEL32.dll", GetDiskFreeSpaceW, stub_GetDiskFreeSpaceW, 5);
+    RS("KERNEL32.dll", GetDiskFreeSpaceExW, 4);
+    RS("KERNEL32.dll", GetDiskFreeSpaceExA, 4);
     RS("KERNEL32.dll", lstrlenW, 1);
     RS("KERNEL32.dll", lstrcpynW, 3);
     R1S("KERNEL32.dll", GetExitCodeProcess, 2);
@@ -485,7 +488,18 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("KERNEL32.dll", Sleep, 1);
     RS ("KERNEL32.dll", ExitThread, 1);
     RS ("KERNEL32.dll", CreateIoCompletionPort, 4);
-    R1S("KERNEL32.dll", PostQueuedCompletionStatus, 4);
+    RS ("KERNEL32.dll", GetQueuedCompletionStatus, 5);
+    RS ("KERNEL32.dll", GetQueuedCompletionStatusEx, 6);
+    RS ("KERNEL32.dll", PostQueuedCompletionStatus, 4);
+    // -- thread pool --
+    RS ("KERNEL32.dll", QueueUserWorkItem, 3);
+    RS ("KERNEL32.dll", CreateThreadpoolWork, 3);
+    RS ("KERNEL32.dll", SubmitThreadpoolWork, 1);
+    RS ("KERNEL32.dll", CloseThreadpoolWork, 1);
+    RS ("KERNEL32.dll", WaitForThreadpoolWorkCallbacks, 2);
+    RS ("KERNEL32.dll", CreateThreadpoolTimer, 3);
+    RS ("KERNEL32.dll", SetThreadpoolTimer, 4);
+    RS ("KERNEL32.dll", CloseThreadpoolTimer, 1);
     // -- fibers --
     RS ("KERNEL32.dll", ConvertThreadToFiber, 1);
     R1S("KERNEL32.dll", ConvertFiberToThread, 0);
@@ -511,6 +525,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("KERNEL32.dll", GetCommandLineA, 0);
     RS ("KERNEL32.dll", SystemTimeToFileTime, 2);
     RS ("KERNEL32.dll", GetSystemTime, 1);
+    RS ("KERNEL32.dll", GetLocalTime, 1);
     RS ("KERNEL32.dll", GetSystemTimeAsFileTime, 1);
     RS ("KERNEL32.dll", GetSystemTimePreciseAsFileTime, 1);
     RS ("KERNEL32.dll", FileTimeToSystemTime, 2);
@@ -557,6 +572,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("USER32.dll", MonitorFromPoint, 3);
     R1S("USER32.dll", GetMonitorInfoW, 2);
     R1S("USER32.dll", PostThreadMessageW, 4);
+    R1S("USER32.dll", PostThreadMessageA, 4);
     RS ("USER32.dll", GetWindowThreadProcessId, 2);
     R1S("USER32.dll", EnumWindows, 2);
     R1S("USER32.dll", EnumChildWindows, 3);
@@ -566,6 +582,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("USER32.dll", KillTimer, 2);
     RS ("USER32.dll", LoadIconW, 2);
     RS ("USER32.dll", MsgWaitForMultipleObjects, 5);
+    RS ("USER32.dll", MsgWaitForMultipleObjectsEx, 6);
     R1S("USER32.dll", AllowSetForegroundWindow, 1);
     RS ("GDI32.dll", GetStockObject, 1);
     RS ("GDI32.dll", CreateFontW, 14);
@@ -579,6 +596,128 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("bcrypt.dll", BCryptGenRandom, 4);
     R1S("KERNEL32.dll", SystemFunction036, 2); // RtlGenRandom
     R1S("ADVAPI32.dll", SystemFunction036, 2);
+
+    // === vcruntime / ucrt ===
+    // All standard CRT functions are __cdecl — caller cleans args (num_args=0).
+    // Wrong num_args here causes double stack-cleanup → crash in CRT init.
+    RS ("vcruntime140.dll", memset, 0);
+    RS ("vcruntime140.dll", memcpy, 0);
+    RS ("vcruntime140.dll", memmove, 0);
+    RS ("vcruntime140.dll", memcmp, 0);
+    RS ("ucrtbase.dll", malloc, 0);
+    RS ("ucrtbase.dll", free, 0);
+    RS ("ucrtbase.dll", _initterm, 0);
+    RS ("ucrtbase.dll", _initterm_e, 0);
+    RS ("ucrtbase.dll", exit, 0);
+    RS ("ucrtbase.dll", _exit, 0);
+    RS ("msvcp140.dll", _Xbad_alloc, 0);
+    // CRT thread spawn — __cdecl (num_args=0). Engine handlers create real
+    // cooperative scheduler threads so MSVC-CRT apps' worker threads actually run.
+    RS ("ucrtbase.dll", _beginthreadex, 0);
+    RS ("ucrtbase.dll", _beginthread, 0);
+    RS ("ucrtbase.dll", _endthreadex, 0);
+    RS ("ucrtbase.dll", _endthread, 0);
+
+    // === WS2_32 extension functions (via WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER) ===
+    RS ("WS2_32.dll", ConnectEx, 7);
+    RS ("WS2_32.dll", DisconnectEx, 4);
+    RS ("WS2_32.dll", AcceptEx, 8);
+    RS ("WS2_32.dll", TransmitFile, 7);
+
+    // === iphlpapi.dll ===
+    RS ("IPHLPAPI.DLL", GetAdaptersAddresses, 5);
+    RS ("IPHLPAPI.DLL", GetAdaptersInfo, 2);
+    RS ("IPHLPAPI.DLL", GetNetworkParams, 2);
+    RS ("IPHLPAPI.DLL", GetBestInterface, 2);
+    RS ("IPHLPAPI.DLL", GetBestRoute, 3);
+    RS ("IPHLPAPI.DLL", GetIfTable, 3);
+
+    // === winhttp.dll ===
+    RS ("winhttp.dll", WinHttpOpen, 5);
+    RS ("winhttp.dll", WinHttpConnect, 4);
+    RS ("winhttp.dll", WinHttpOpenRequest, 7);
+    RS ("winhttp.dll", WinHttpSendRequest, 7);
+    RS ("winhttp.dll", WinHttpReceiveResponse, 2);
+    RS ("winhttp.dll", WinHttpQueryHeaders, 6);
+    RS ("winhttp.dll", WinHttpQueryDataAvailable, 2);
+    RS ("winhttp.dll", WinHttpReadData, 4);
+    RS ("winhttp.dll", WinHttpWriteData, 4);
+    RS ("winhttp.dll", WinHttpCloseHandle, 1);
+    RS ("winhttp.dll", WinHttpSetOption, 4);
+    RS ("winhttp.dll", WinHttpAddRequestHeaders, 4);
+    RS ("winhttp.dll", WinHttpCrackUrl, 4);
+    RS ("winhttp.dll", WinHttpSetStatusCallback, 4);
+    RS ("winhttp.dll", WinHttpSetTimeouts, 5);
+    RS ("winhttp.dll", WinHttpGetProxyForUrl, 4);
+    RS ("winhttp.dll", WinHttpGetDefaultProxyConfiguration, 1);
+    RS ("winhttp.dll", WinHttpGetIEProxyConfigForCurrentUser, 1);
+
+    // === wininet.dll ===
+    R1S("wininet.dll", InternetGetConnectedState, 2);
+    RS ("wininet.dll", InternetAttemptConnect, 1);
+    RS ("wininet.dll", InternetOpenA, 5);
+    RS ("wininet.dll", InternetOpenW, 5);
+    RS ("wininet.dll", InternetConnectA, 8);
+    RS ("wininet.dll", InternetConnectW, 8);
+    RS ("wininet.dll", HttpOpenRequestA, 8);
+    RS ("wininet.dll", HttpOpenRequestW, 8);
+    RS ("wininet.dll", HttpSendRequestA, 5);
+    RS ("wininet.dll", HttpSendRequestW, 5);
+    RS ("wininet.dll", HttpSendRequestExA, 5);
+    RS ("wininet.dll", HttpSendRequestExW, 5);
+    RS ("wininet.dll", HttpQueryInfoA, 5);
+    RS ("wininet.dll", HttpQueryInfoW, 5);
+    RS ("wininet.dll", InternetReadFile, 4);
+    RS ("wininet.dll", InternetCloseHandle, 1);
+    RS ("wininet.dll", InternetSetOptionA, 4);
+    RS ("wininet.dll", InternetSetOptionW, 4);
+    RS ("wininet.dll", InternetQueryOptionA, 4);
+    RS ("wininet.dll", InternetQueryOptionW, 4);
+    R1S("wininet.dll", InternetCheckConnectionA, 3);
+    R1S("wininet.dll", InternetCheckConnectionW, 3);
+    RS ("wininet.dll", InternetQueryDataAvailable, 4);
+    RS ("wininet.dll", InternetSetStatusCallbackA, 2);
+    RS ("wininet.dll", InternetSetStatusCallbackW, 2);
+    R1S("wininet.dll", InternetGetConnectedStateExW, 3);
+
+    // === crypt32.dll / secur32.dll ===
+    R1S("crypt32.dll", CertOpenSystemStoreW, 2);
+    R1S("crypt32.dll", CertOpenSystemStoreA, 2);
+    R1S("crypt32.dll", CertCloseStore, 2);
+    RS ("crypt32.dll", CertFreeCertificateContext, 1);
+    RS ("crypt32.dll", CertEnumCertificatesInStore, 2);
+    R1S("crypt32.dll", CertGetCertificateChain, 8);
+    RS ("crypt32.dll", CertFreeCertificateChain, 1);
+    R1S("crypt32.dll", CertVerifyCertificateChainPolicy, 4);
+    R1S("crypt32.dll", CryptProtectData, 7);
+    R1S("crypt32.dll", CryptUnprotectData, 7);
+    R1S("crypt32.dll", CryptStringToBinaryW, 7);
+    R1S("crypt32.dll", CryptBinaryToStringW, 5);
+    RS ("crypt32.dll", CertFindCertificateInStore, 6);
+    RS ("crypt32.dll", CertGetNameStringW, 5);
+    RS ("secur32.dll", InitSecurityInterfaceW, 0);
+    RS ("secur32.dll", InitSecurityInterfaceA, 0);
+    RS ("secur32.dll", AcquireCredentialsHandleW, 9);
+    RS ("secur32.dll", AcquireCredentialsHandleA, 9);
+    RS ("secur32.dll", FreeCredentialsHandle, 1);
+    RS ("secur32.dll", InitializeSecurityContextW, 12);
+    RS ("secur32.dll", InitializeSecurityContextA, 12);
+    RS ("secur32.dll", DeleteSecurityContext, 1);
+    RS ("secur32.dll", QueryContextAttributesW, 3);
+    RS ("secur32.dll", QueryContextAttributesA, 3);
+    RS ("secur32.dll", FreeContextBuffer, 1);
+    RS ("secur32.dll", EncryptMessage, 4);
+    RS ("secur32.dll", DecryptMessage, 4);
+    RS ("secur32.dll", CompleteAuthToken, 2);
+    RS ("secur32.dll", ApplyControlToken, 2);
+    RS ("sspicli.dll", AcquireCredentialsHandleW, 9);
+    RS ("sspicli.dll", InitializeSecurityContextW, 12);
+    RS ("sspicli.dll", DeleteSecurityContext, 1);
+    RS ("sspicli.dll", FreeCredentialsHandle, 1);
+    RS ("sspicli.dll", QueryContextAttributesW, 3);
+    RS ("sspicli.dll", FreeContextBuffer, 1);
+    RS ("sspicli.dll", EncryptMessage, 4);
+    RS ("sspicli.dll", DecryptMessage, 4);
 
     // === USER32.dll ===
     RS("USER32.dll", GetSystemMenu, 2);
@@ -760,9 +899,9 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("WS2_32.dll", Ordinal_22,  2);  // shutdown
     RS("WS2_32.dll", Ordinal_23,  3);  // socket
     RS("WS2_32.dll", Ordinal_52,  2);  // gethostbyname (legacy)
-    RS("WS2_32.dll", Ordinal_111, 3);  // WSAEnumNetworkEvents
-    RS("WS2_32.dll", Ordinal_112, 3);  // WSAEventSelect
-    RS("WS2_32.dll", Ordinal_113, 0);  // WSAGetLastError
+    RS("WS2_32.dll", Ordinal_111, 0);  // WSAGetLastError (0 args)
+    RS("WS2_32.dll", Ordinal_112, 1);  // WSASetLastError (1 arg)
+    RS("WS2_32.dll", Ordinal_113, 0);  // WSACancelBlockingCall (legacy)
     RS("WS2_32.dll", Ordinal_115, 2);  // WSAStartup
     RS("WS2_32.dll", Ordinal_116, 0);  // WSACleanup
     RS("WS2_32.dll", Ordinal_151, 4);  // WSARecvMsg or similar
@@ -777,14 +916,27 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("WS2_32.dll", WSARecvFrom, 9);
     RS("WS2_32.dll", WSASocketW, 6);
     RS("WS2_32.dll", WSASocketA, 6);
-    RS("WS2_32.dll", Ordinal_151, 4); // WSARecvMsg or similar
+    RS("WS2_32.dll", Ordinal_151, 2); // __WSAFDIsSet(s, fd_set*)
     RS("WS2_32.dll", WSAIoctl, 9);
     RS("WS2_32.dll", WSAEventSelect, 3);
     RS("WS2_32.dll", WSAEnumNetworkEvents, 3);
+    R1S("WS2_32.dll", WSACreateEvent, 0);   // non-null handle (0 = WSA_INVALID_EVENT)
+    R1S("WS2_32.dll", WSACloseEvent, 1);
+    R1S("WS2_32.dll", WSAResetEvent, 1);
+    R1S("WS2_32.dll", WSASetEvent, 1);
+    // WSAWaitForMultipleEvents: default-return 0 = WSA_WAIT_EVENT_0 so the app
+    // proceeds to WSAEnumNetworkEvents (which polls the real socket state).
+    RS ("WS2_32.dll", WSAWaitForMultipleEvents, 5);
     RS("WS2_32.dll", getaddrinfo, 4);
     RS("WS2_32.dll", freeaddrinfo, 1);
     RS("WS2_32.dll", socket, 3);
     RS("WS2_32.dll", closesocket, 1);
+    // __stdcall/4 — MUST be registered, else auto-stub (num_args=0) leaks 16
+    // bytes of guest stack and corrupts the NEXT socket call's args.
+    RS("WS2_32.dll", inet_ntop, 4);
+    RS("WS2_32.dll", inet_pton, 4);
+    RS("WS2_32.dll", InetNtopA, 4);
+    RS("WS2_32.dll", InetPtonA, 4);
     RS("WS2_32.dll", connect, 3);
     RS("WS2_32.dll", send, 4);
     RS("WS2_32.dll", recv, 4);

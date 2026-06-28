@@ -30,19 +30,29 @@ void wg_log_set_level(WGLogLevel minLevel) {
 void wg_log(WGLogLevel level, const char *tag, const char *fmt, ...) {
     if (level < s_minLevel) return;
 
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
+    // Guard against bad callers: an out-of-range level or NULL tag/fmt would
+    // otherwise crash inside fprintf (wild level_names[] read), which masks the
+    // real error and aborts the whole process during a crash flush.
+    int lvl = (level >= 0 && level <= WG_LOG_FATAL) ? (int)level : (int)WG_LOG_ERROR;
+    const char *safe_tag = tag ? tag : "?";
 
-    fprintf(stderr, "[%s/%s] %s\n", level_names[level], tag, buf);
+    char buf[512];
+    if (fmt) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+    } else {
+        buf[0] = '\0';
+    }
+
+    fprintf(stderr, "[%s/%s] %s\n", level_names[lvl], safe_tag, buf);
 
     pthread_mutex_lock(&s_mutex);
     if (s_callback) {
         char tagged[600];
-        snprintf(tagged, sizeof(tagged), "[%s] %s", tag, buf);
-        s_callback(level, tag, tagged, s_userdata);
+        snprintf(tagged, sizeof(tagged), "[%s] %s", safe_tag, buf);
+        s_callback((WGLogLevel)lvl, safe_tag, tagged, s_userdata);
     }
     pthread_mutex_unlock(&s_mutex);
 }

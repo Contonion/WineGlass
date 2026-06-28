@@ -12,6 +12,8 @@
 #include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
 #include "wg_winsock.h"
+#include "wg_winhttp.h"
+#include "wg_schannel.h"
 #include "wg_threading.h"
 #include <stdlib.h>
 #include <string.h>
@@ -287,11 +289,17 @@ static bool s_nsis_data_patched = false;
 #define WG_GUEST_HEAP_BASE 0x20000000u
 static uint32_t s_heap_ptr = WG_GUEST_HEAP_BASE;
 
-// Dynamic TLS (TlsAlloc/TlsGetValue/TlsSetValue). Single guest thread -> one
-// global slot array. Windows guarantees at least 1088 TLS slots.
-static uint32_t s_tls_slots[1088] = {0};
+// Dynamic TLS (TlsAlloc/TlsGetValue/TlsSetValue) and FLS. These are PER-THREAD:
+// the slot *index* is process-global, but each thread has its own value array.
+// A global array made the MSVC CRT's per-thread data block (kept in FLS slot 1)
+// shared across threads — so a worker thread used the main thread's _tiddata,
+// corrupting errno/locale/per-thread state. With per-thread arrays a new thread
+// reads 0 for an unset slot and the CRT lazily allocates its own block.
+// Indexed by scheduler thread slot (WG_MAX_THREADS rows). Windows guarantees
+// at least 1088 TLS slots.
+static uint32_t s_tls_slots[WG_MAX_THREADS][1088] = {{0}};
 static uint32_t s_tls_next = 0;
-static uint32_t s_fls_slots[1088] = {0};   // Fiber-Local Storage (CRT uses it)
+static uint32_t s_fls_slots[WG_MAX_THREADS][1088] = {{0}};   // Fiber-Local Storage
 static uint32_t s_fls_next = 0;
 
 // Fake event/mutex/semaphore handles. Single-threaded, so events are just
@@ -299,8 +307,111 @@ static uint32_t s_fls_next = 0;
 #define WG_EVENT_BASE   0x200u
 #define WG_MAX_EVENTS   256
 static bool s_event_signalled[WG_MAX_EVENTS];
+static bool s_event_manual[WG_MAX_EVENTS];   // true = manual-reset, false = auto-reset
 static uint32_t s_event_next = 0;
+
+// A satisfied wait on an AUTO-reset event consumes its signalled state. Without
+// this an auto-reset event stays signalled forever and waiters spin (the network
+// worker did exactly this on its job event). Manual-reset events are untouched.
+static void wg_event_consume(uint32_t h) {
+    if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS) {
+        uint32_t idx = h - WG_EVENT_BASE;
+        if (!s_event_manual[idx]) s_event_signalled[idx] = false;
+    }
+}
+
+// Fake IOCP (I/O Completion Ports).
+// Steam uses async sockets: bind socket to IOCP, call WSARecv/ConnectEx with
+// an OVERLAPPED, then GetQueuedCompletionStatus waits for the completion.
+// We do all I/O synchronously, but still need to post completions so GQCS
+// returns them.
+#define WG_IOCP_HANDLE      0x8500u
+#define WG_MAX_IOCP_SOCK    32
+#define WG_MAX_COMPLETIONS  64
+typedef struct { uint32_t sock_handle; uint32_t comp_key; } WGIocpBinding;
+typedef struct { uint32_t bytes; uint32_t comp_key; uint32_t overlapped; } WGCompletion;
+static WGIocpBinding  s_iocp_bindings[WG_MAX_IOCP_SOCK];
+static int            s_iocp_binding_count = 0;
+static WGCompletion   s_completions[WG_MAX_COMPLETIONS];
+static int            s_comp_head = 0, s_comp_tail = 0;
+static bool           s_iocp_created = false;
+// Force apps onto the synchronous select/send/recv path (we don't deliver real
+// IOCP socket completions). NOTE: had no effect on Steam — its BUseIOCP() is
+// OS-gated (always true on Win10), independent of CreateIoCompletionPort. Left
+// false (IOCP stubs active) as the neutral default.
+static bool           s_disable_iocp = false;
+
+// Thread pool work object table
+#define WG_TP_WORK_BASE  0x9000u
+#define WG_MAX_TP_WORK   16
+typedef struct { uint32_t callback; uint32_t ctx; uint32_t thread_handle; } WGTpWork;
+static WGTpWork  s_tp_work[WG_MAX_TP_WORK];
+static int       s_tp_work_count = 0;
+
+static uint32_t iocp_comp_key(uint32_t sock_handle) {
+    for (int i = 0; i < s_iocp_binding_count; i++)
+        if (s_iocp_bindings[i].sock_handle == sock_handle)
+            return s_iocp_bindings[i].comp_key;
+    return 0;
+}
+static void iocp_post(uint32_t bytes, uint32_t comp_key, uint32_t overlapped) {
+    int next = (s_comp_tail + 1) % WG_MAX_COMPLETIONS;
+    if (next == s_comp_head) return; // full — drop
+    s_completions[s_comp_tail] = (WGCompletion){bytes, comp_key, overlapped};
+    s_comp_tail = next;
+    WG_LOGI("IOCP", "Posted completion: bytes=%u key=0x%X ovl=0x%X", bytes, comp_key, overlapped);
+}
+static bool iocp_get(uint32_t *bytes, uint32_t *comp_key, uint32_t *overlapped) {
+    if (s_comp_head == s_comp_tail) return false;
+    *bytes    = s_completions[s_comp_head].bytes;
+    *comp_key = s_completions[s_comp_head].comp_key;
+    *overlapped = s_completions[s_comp_head].overlapped;
+    s_comp_head = (s_comp_head + 1) % WG_MAX_COMPLETIONS;
+    return true;
+}
+
+// Thread message queue for PostThreadMessageW / PeekMessageW.
+// Steam's download thread is message-driven: thread 0 posts work via
+// PostThreadMessageW; thread 1 retrieves it with PeekMessageW.
+#define WG_MAX_THREAD_MSGS 64
+static struct { uint32_t tid; uint32_t msg; uint32_t wparam; uint32_t lparam; }
+    s_thread_msgs[WG_MAX_THREAD_MSGS];
+static int s_tmsg_head = 0, s_tmsg_tail = 0;
+
+static void tmsg_push(uint32_t tid, uint32_t msg, uint32_t wp, uint32_t lp) {
+    int next = (s_tmsg_tail + 1) % WG_MAX_THREAD_MSGS;
+    if (next == s_tmsg_head) return; // full — drop
+    s_thread_msgs[s_tmsg_tail].tid = tid;
+    s_thread_msgs[s_tmsg_tail].msg = msg;
+    s_thread_msgs[s_tmsg_tail].wparam = wp;
+    s_thread_msgs[s_tmsg_tail].lparam = lp;
+    s_tmsg_tail = next;
+}
+static bool tmsg_pop(uint32_t tid, uint32_t *msg, uint32_t *wp, uint32_t *lp) {
+    for (int i = s_tmsg_head; i != s_tmsg_tail; i = (i + 1) % WG_MAX_THREAD_MSGS) {
+        if (s_thread_msgs[i].tid == tid) {
+            *msg = s_thread_msgs[i].msg;
+            *wp  = s_thread_msgs[i].wparam;
+            *lp  = s_thread_msgs[i].lparam;
+            // Compact: shift remaining entries down one slot
+            int j = i;
+            while (1) {
+                int next = (j + 1) % WG_MAX_THREAD_MSGS;
+                if (next == s_tmsg_tail) break;
+                s_thread_msgs[j] = s_thread_msgs[next];
+                j = next;
+            }
+            s_tmsg_tail = (s_tmsg_tail - 1 + WG_MAX_THREAD_MSGS) % WG_MAX_THREAD_MSGS;
+            return true;
+        }
+    }
+    return false;
+}
 static uint32_t s_main_teb = 0; // TEB address of main thread
+// Allocate a per-thread TEB (own TLS array, stack bounds, ClientId) sharing the
+// process PEB. Returns the TEB guest address, or 0 on failure. Defined later.
+static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
+                                    uint32_t stack_limit, uint32_t tid);
 static bool s_cmdpage_mapped = false;
 static uint32_t s_nsis_exe_data_offset = 0;
 static uint32_t s_nsis_data_tmp_handle = 0;    // handle to the NSIS data .tmp file
@@ -366,6 +477,8 @@ struct WGEngine {
     WGPEImage      *pe_image;
     WGDllMapper    *dll_mapper;
     WGWinsock          *winsock;
+    WGWinHttp          *winhttp;
+    WGSchannel         *schannel;
     WGThreadScheduler  *scheduler;
     uint64_t        tick_count;
     int             instructions_per_tick;
@@ -379,6 +492,8 @@ WGEngine *wg_engine_create(void) {
     e->instructions_per_tick = 100000;
     e->backend = WG_BACKEND_BLINK;
     e->winsock = wg_winsock_create();
+    e->winhttp = wg_winhttp_create();
+    e->schannel = wg_schannel_create();
     e->scheduler = wg_sched_create();
     return e;
 }
@@ -392,6 +507,8 @@ void wg_engine_destroy(WGEngine *engine) {
     if (engine->dll_mapper) wg_dll_mapper_destroy(engine->dll_mapper);
     if (engine->blink) wg_blink_destroy(engine->blink);
     if (engine->winsock) wg_winsock_destroy(engine->winsock);
+    if (engine->winhttp) wg_winhttp_destroy(engine->winhttp);
+    if (engine->schannel) wg_schannel_destroy(engine->schannel);
     if (engine->scheduler) wg_sched_destroy(engine->scheduler);
     free(engine);
 }
@@ -896,14 +1013,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
             "CharPrevW", "lstrcpynW", "lstrlenW", "lstrcatW",
             "lstrcmpiW", "GlobalAlloc", "GlobalFree",
             "ReadFile", "WriteFile",
-            "PeekMessageW", "lstrlenA", NULL
+            "PeekMessageW", "lstrlenA",
+            "Sleep", "SleepEx",  // spin-loop noise; watchdog covers stuck loops
+            "WaitForSingleObject", "WaitForSingleObjectEx", // poll-loop noise
+            "QueryPerformanceCounter", "GetSystemTimePreciseAsFileTime",
+            NULL
         };
         bool quiet = false;
         for (int i = 0; quiet_funcs[i]; i++) {
             if (strcmp(entry->func_name, quiet_funcs[i]) == 0) { quiet = true; break; }
         }
         if (!quiet) {
-            WG_LOGI(TAG, "Win32: %s!%s", entry->dll_name, entry->func_name);
+            uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
+            // Read first 3 args speculatively (safe — within the guest stack page)
+            uint64_t peek_rsp = wg_blink_get_reg(engine->blink, 4);
+            bool peek_32 = (engine->pe_image && !engine->pe_image->is_64bit);
+            uint32_t a0=0, a1=0, a2=0;
+            if (peek_32 && peek_rsp) {
+                wg_blink_read_mem(engine->blink, peek_rsp + 4,  &a0, 4);
+                wg_blink_read_mem(engine->blink, peek_rsp + 8,  &a1, 4);
+                wg_blink_read_mem(engine->blink, peek_rsp + 12, &a2, 4);
+            }
+            WG_LOGI(TAG, "[tid=%X] Win32: %s!%s(0x%X,0x%X,0x%X)",
+                    cur_tid, entry->dll_name, entry->func_name, a0, a1, a2);
         }
     }
 
@@ -1176,17 +1308,55 @@ static bool handle_blink_thunk(WGEngine *engine) {
                    strcmp(fn, "TranslateMessage") == 0 ||
                    strcmp(fn, "DispatchMessageW") == 0) {
             ret_val = 0;
-        } else if (strcmp(fn, "GetMessageW") == 0) {
-            // Blocking message pump. Zero the MSG (WM_NULL) so the guest's
-            // Translate/Dispatch are benign, return 1 to keep the loop alive,
-            // and pause so the window stays on screen for the user.
-            if (args[0]) {
-                uint8_t zero[28] = {0};
-                wg_blink_write_mem(engine->blink, args[0], zero, 28);
-            }
-            engine->state = WG_ENGINE_PAUSED;
-            WG_LOGI(TAG, "GetMessageW — window up, pausing for UI");
+        } else if (strcmp(fn, "PostThreadMessageW") == 0 ||
+                   strcmp(fn, "PostThreadMessageA") == 0) {
+            // PostThreadMessageW(dwThreadId, Msg, wParam, lParam)
+            tmsg_push(args[0], args[1], args[2], args[3]);
+            WG_LOGI(TAG, "PostThreadMessageW(tid=0x%X, msg=0x%X, wp=0x%X, lp=0x%X)",
+                    args[0], args[1], args[2], args[3]);
             ret_val = 1;
+        } else if (strcmp(fn, "GetMessageW") == 0 || strcmp(fn, "GetMessageA") == 0) {
+            // Real cooperative message pump. The old behavior froze the engine
+            // (PAUSED) on the first call, so the main thread's message loop body —
+            // which in apps like Steam pumps the network manager via RunFrame() —
+            // never executed, and worker threads polled forever for work that the
+            // main loop was supposed to drive. Instead: deliver a queued thread
+            // message (or WM_NULL), return 1 so the loop body runs, then YIELD so
+            // other threads (the download/poll thread) also make progress.
+            uint32_t gm_msg = 0, gm_wp = 0, gm_lp = 0;
+            uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
+            tmsg_pop(cur_tid, &gm_msg, &gm_wp, &gm_lp); // WM_NULL(0) if none
+            if (args[0]) {
+                // MSG: hwnd, message, wParam, lParam, time, pt.x, pt.y (28 bytes)
+                uint32_t msgbuf[7] = { 0, gm_msg, gm_wp, gm_lp, 0, 0, 0 };
+                wg_blink_write_mem(engine->blink, args[0], msgbuf, 28);
+            }
+            static int s_getmsg_log = 0;
+            if (s_getmsg_log++ < 3)
+                WG_LOGI(TAG, "GetMessageW: pump cycling (msg=0x%X), not freezing", gm_msg);
+            // Clean stack (4 stdcall args), return 1 (a message; 0 = WM_QUIT only),
+            // and yield to other threads — mirrors the Sleep handler epilogue.
+            uint64_t gm_rsp = rsp + ptr_size + (4 * ptr_size);
+            wg_blink_set_reg(engine->blink, 4, gm_rsp);
+            wg_blink_set_rip(engine->blink, ret_addr);
+            wg_blink_set_reg(engine->blink, 0, 1); // EAX = 1
+            // Yield so worker/poll threads run. If another thread is runnable,
+            // stay RUNNING (full speed, so the network pumps fast); if nothing
+            // else is runnable, idle (PAUSED) so a single-threaded app's loop
+            // doesn't spin at 100% CPU — it still cycles slowly via PAUSED ticks.
+            bool gm_switched = wg_sched_yield(engine->scheduler, engine->blink,
+                                              WG_THREAD_READY);
+            engine->state = gm_switched ? WG_ENGINE_RUNNING : WG_ENGINE_PAUSED;
+            return true;
+        } else if (strcmp(fn, "exit") == 0 || strcmp(fn, "_exit") == 0 ||
+                   strcmp(fn, "_cexit") == 0 || strcmp(fn, "_c_exit") == 0 ||
+                   strcmp(fn, "quick_exit") == 0 || strcmp(fn, "_o_exit") == 0) {
+            // CRT exit functions. Auto-stubs merely RETURN, so the CRT teardown
+            // runs off the end into garbage (RIP=0xffff crash). Halt the VM like
+            // ExitProcess so a normal console app terminates cleanly.
+            WG_LOGI(TAG, "%s(%u) -> halt", fn, args[0]);
+            wg_blink_set_rip(engine->blink, 0);
+            return true;
         } else if (strcmp(fn, "ExitProcess") == 0) {
             WG_LOGI(TAG, "ExitProcess(%u) called from 0x%llX",
                     args[0], (unsigned long long)ret_addr);
@@ -1284,19 +1454,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     ascii[i] = libname[i] < 128 ? (char)libname[i] : '?';
             }
             WG_LOGI(TAG, "%s('%s')", fn, ascii);
-            // Try to actually map the DLL from disk (NSIS plug-ins live in the
-            // bottle). On success we return its real load base so GetProcAddress
-            // + the call execute the plug-in's own code; otherwise (system DLLs
-            // we don't have) fall back to a fake handle.
-            uint32_t base = 0;
-            char mapbuf[512];
-            strncpy(mapbuf, ascii, sizeof(mapbuf) - 1);
-            mapbuf[sizeof(mapbuf) - 1] = '\0';
-            const char *real = wg_files_map_path(args[0], engine->blink,
-                                                 mapbuf, sizeof(mapbuf));
-            if (real) base = wg_load_dll(engine->blink, engine->dll_mapper, real, ascii);
-            ret_val = base ? base
-                           : 0x10000000 + (uint32_t)(engine->dll_mapper->count * 0x1000);
+            if (!ascii[0] || !args[0]) {
+                // Empty or NULL library name — return main module handle
+                ret_val = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+            } else {
+                // Try to actually map the DLL from disk (NSIS plug-ins live in the
+                // bottle). On success we return its real load base so GetProcAddress
+                // + the call execute the plug-in's own code; otherwise (system DLLs
+                // we don't have) fall back to a fake handle.
+                uint32_t base = 0;
+                char mapbuf[512];
+                strncpy(mapbuf, ascii, sizeof(mapbuf) - 1);
+                mapbuf[sizeof(mapbuf) - 1] = '\0';
+                const char *real = wg_files_map_path(args[0], engine->blink,
+                                                     mapbuf, sizeof(mapbuf));
+                if (real) base = wg_load_dll(engine->blink, engine->dll_mapper, real, ascii);
+                ret_val = base ? base
+                               : 0x10000000 + (uint32_t)(engine->dll_mapper->count * 0x1000);
+            }
         } else if (strcmp(fn, "GetModuleHandleA") == 0) {
             uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
             if (args[0] == 0) {
@@ -1319,6 +1494,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     strcasestr(modname, "bcrypt") ||
                     strcasestr(modname, "msvcrt") ||
                     strcasestr(modname, "ucrtbase") ||
+                    strcasestr(modname, "vcruntime") ||
+                    strcasestr(modname, "msvcp") ||
+                    strcasestr(modname, "iphlpapi") ||
+                    strcasestr(modname, "winhttp") ||
+                    strcasestr(modname, "wininet") ||
+                    strcasestr(modname, "secur32") ||
+                    strcasestr(modname, "schannel") ||
+                    strcasestr(modname, "sspicli") ||
                     strcasestr(modname, "api-ms-win")) {
                     ret_val = 0xBFFF0000u;
                 } else {
@@ -1359,6 +1542,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                            strcasestr(ascii, "bcrypt") ||
                            strcasestr(ascii, "msvcrt") ||
                            strcasestr(ascii, "ucrtbase") ||
+                           strcasestr(ascii, "vcruntime") ||
+                           strcasestr(ascii, "msvcp") ||
+                           strcasestr(ascii, "iphlpapi") ||
+                           strcasestr(ascii, "winhttp") ||
+                           strcasestr(ascii, "wininet") ||
+                           strcasestr(ascii, "secur32") ||
+                           strcasestr(ascii, "schannel") ||
                            strcasestr(ascii, "api-ms-win")) {
                     ret_val = 0xBFFF0000u;
                 } else {
@@ -1618,6 +1808,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = len;
+        } else if (strcmp(fn, "GetDiskFreeSpaceExW") == 0 ||
+                   strcmp(fn, "GetDiskFreeSpaceExA") == 0) {
+            // (lpDirectoryName, lpFreeBytesAvailableToCaller, lpTotalNumberOfBytes,
+            //  lpTotalNumberOfFreeBytes) — all ULARGE_INTEGER* (8-byte writes)
+            uint64_t total = (uint64_t)200 * 1024 * 1024 * 1024;  // 200 GB
+            uint64_t avail = (uint64_t)100 * 1024 * 1024 * 1024;  // 100 GB free
+            if (args[1]) wg_blink_write_mem(engine->blink, args[1], &avail, 8);
+            if (args[2]) wg_blink_write_mem(engine->blink, args[2], &total, 8);
+            if (args[3]) wg_blink_write_mem(engine->blink, args[3], &avail, 8);
+            ret_val = 1; // TRUE
         } else if (strcmp(fn, "GetWindowsDirectoryW") == 0) {
             // GetWindowsDirectoryW(lpBuffer=args[0], uSize=args[1] in chars).
             uint16_t windir[] = {'C',':','\\','W','i','n','d','o','w','s',0};
@@ -1644,7 +1844,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "GetDeviceCaps") == 0) {
             ret_val = 96; // LOGPIXELSX/Y
         } else if (strcmp(fn, "PeekMessageW") == 0) {
-            ret_val = 0; // no messages
+            // args[0]=lpMsg, args[1]=hWnd, args[2]=filterMin, args[3]=filterMax, args[4]=removeMsg
+            uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
+            if (!cur_tid) cur_tid = 1;
+            uint32_t tmsg = 0, twp = 0, tlp = 0;
+            if (args[0] && tmsg_pop(cur_tid, &tmsg, &twp, &tlp)) {
+                // Fill MSG struct: hwnd(4), message(4), wParam(4), lParam(4), time(4), pt.x(4), pt.y(4)
+                uint32_t msgbuf[7] = {0, tmsg, twp, tlp, 0, 0, 0};
+                wg_blink_write_mem(engine->blink, args[0], msgbuf, 28);
+                WG_LOGI(TAG, "PeekMessageW: delivered msg=0x%X to tid=0x%X", tmsg, cur_tid);
+                ret_val = 1;
+            } else {
+                ret_val = 0;
+            }
         } else if (strcmp(fn, "CharNextW") == 0) {
             // CharNextW(LPCWSTR p) — advance to next char, don't go past null
             if (args[0]) {
@@ -2045,6 +2257,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[0], rnd, args[1]);
             }
             ret_val = 1; // TRUE = success
+        } else if (strcmp(fn, "BCryptGenRandom") == 0) {
+            // BCryptGenRandom(hAlgorithm=args[0], pbBuffer=args[1], cbBuffer=args[2], dwFlags=args[3])
+            if (args[1] && args[2] > 0) {
+                uint32_t len = args[2] < 4096 ? args[2] : 4096;
+                uint8_t *rnd = malloc(len);
+                if (rnd) {
+                    for (uint32_t i = 0; i < len; i++)
+                        rnd[i] = (uint8_t)(arc4random() & 0xFF);
+                    wg_blink_write_mem(engine->blink, args[1], rnd, len);
+                    free(rnd);
+                }
+            }
+            ret_val = 0; // STATUS_SUCCESS
         } else if (strcmp(fn, "CreateFontW") == 0 ||
                    strcmp(fn, "CreateFontA") == 0 ||
                    strcmp(fn, "CreateFontIndirectW") == 0 ||
@@ -2173,28 +2398,104 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = n;
             }
         } else if (strcmp(fn, "TlsAlloc") == 0) {
-            // Dynamic TLS. Single guest thread, so one global slot array.
+            // TLS slot indices are process-global (shared across threads).
             ret_val = (s_tls_next < 1088) ? s_tls_next++ : 0xFFFFFFFF;
         } else if (strcmp(fn, "TlsGetValue") == 0) {
-            ret_val = (args[0] < 1088) ? s_tls_slots[args[0]] : 0;
+            int ti = (engine->scheduler && engine->scheduler->current >= 0)
+                     ? engine->scheduler->current : 0;
+            ret_val = (args[0] < 1088) ? s_tls_slots[ti][args[0]] : 0;
             s_last_error = 0;
         } else if (strcmp(fn, "TlsSetValue") == 0) {
-            if (args[0] < 1088) s_tls_slots[args[0]] = args[1];
+            int ti = (engine->scheduler && engine->scheduler->current >= 0)
+                     ? engine->scheduler->current : 0;
+            if (args[0] < 1088) s_tls_slots[ti][args[0]] = args[1];
             ret_val = 1;
         } else if (strcmp(fn, "TlsFree") == 0) {
             ret_val = 1;
         } else if (strcmp(fn, "FlsAlloc") == 0) {
-            // Fiber-Local Storage (the CRT uses it like TLS). args[0]=callback
-            // (ignored). Same single-thread slot model as Tls.
+            // FLS slot indices are process-global; values are per-thread.
             ret_val = (s_fls_next < 1088) ? s_fls_next++ : 0xFFFFFFFF;
         } else if (strcmp(fn, "FlsGetValue") == 0) {
-            ret_val = (args[0] < 1088) ? s_fls_slots[args[0]] : 0;
+            int fi = (engine->scheduler && engine->scheduler->current >= 0)
+                     ? engine->scheduler->current : 0;
+            ret_val = (args[0] < 1088) ? s_fls_slots[fi][args[0]] : 0;
             s_last_error = 0;
         } else if (strcmp(fn, "FlsSetValue") == 0) {
-            if (args[0] < 1088) s_fls_slots[args[0]] = args[1];
+            int fi = (engine->scheduler && engine->scheduler->current >= 0)
+                     ? engine->scheduler->current : 0;
+            if (args[0] < 1088) s_fls_slots[fi][args[0]] = args[1];
             ret_val = 1;
         } else if (strcmp(fn, "FlsFree") == 0) {
             ret_val = 1;
+        } else if (strcmp(fn, "GetStringTypeW") == 0 ||
+                   strcmp(fn, "GetStringTypeExW") == 0) {
+            // GetStringTypeW(dwInfoType, lpSrcStr, cchSrc, lpCharType)
+            // GetStringTypeExW(Locale, dwInfoType, lpSrcStr, cchSrc, lpCharType)
+            int ofs = (fn[13] == 'E') ? 1 : 0; // ExW has Locale as first arg
+            uint32_t info_type = args[0 + ofs];
+            uint32_t src_ptr = args[1 + ofs];
+            int32_t count = (int32_t)args[2 + ofs];
+            uint32_t out_ptr = args[3 + ofs];
+            if (count < 0 && src_ptr) {
+                count = 0;
+                uint16_t ch;
+                do { wg_blink_read_mem(engine->blink, src_ptr + count * 2, &ch, 2); count++; }
+                while (ch && count < 256);
+            }
+            if (out_ptr && count > 0 && count <= 512) {
+                uint16_t types[512];
+                memset(types, 0, count * 2);
+                if ((info_type & 1) && src_ptr) {
+                    uint16_t str[512];
+                    wg_blink_read_mem(engine->blink, src_ptr, str, (uint32_t)(count * 2));
+                    for (int i = 0; i < count; i++) {
+                        uint16_t c = str[i];
+                        if (c >= 'A' && c <= 'Z')      types[i] = 0x0181;
+                        else if (c >= 'a' && c <= 'z')  types[i] = 0x0182;
+                        else if (c >= '0' && c <= '9')  types[i] = 0x0084;
+                        else if (c == ' ')               types[i] = 0x0048;
+                        else if (c < 0x20)               types[i] = 0x0020;
+                        else if (c == 0)                 types[i] = 0x0020;
+                        else                             types[i] = 0x0010;
+                    }
+                }
+                wg_blink_write_mem(engine->blink, out_ptr, types, (uint32_t)(count * 2));
+            }
+            ret_val = 1;
+        } else if (strcmp(fn, "LCMapStringW") == 0 ||
+                   strcmp(fn, "LCMapStringA") == 0 ||
+                   strcmp(fn, "LCMapStringEx") == 0) {
+            // For LCMAP_LOWERCASE/UPPERCASE, just copy the string through
+            // For length query (dest=NULL or destLen=0), return source length
+            bool is_ex = (fn[11] == 'E');
+            int ofs = is_ex ? 1 : 0; // LCMapStringEx has locale name as first arg
+            uint32_t flags = args[1 + ofs];
+            uint32_t src = args[2 + ofs];
+            int32_t src_len = (int32_t)args[3 + ofs];
+            uint32_t dst = args[4 + ofs];
+            int32_t dst_len = (int32_t)args[5 + ofs];
+            if (src_len < 0 && src) {
+                src_len = 0;
+                if (fn[12] == 'A') {
+                    uint8_t ch; do { wg_blink_read_mem(engine->blink, src + src_len, &ch, 1); src_len++; } while (ch && src_len < 512);
+                } else {
+                    uint16_t ch; do { wg_blink_read_mem(engine->blink, src + src_len*2, &ch, 2); src_len++; } while (ch && src_len < 512);
+                }
+            }
+            if (dst == 0 || dst_len == 0) {
+                ret_val = (uint32_t)src_len; // return required length
+            } else if (src && dst && src_len > 0) {
+                int bpc = (fn[12] == 'A') ? 1 : 2;
+                int copy = src_len < dst_len ? src_len : dst_len;
+                uint8_t tmp[1024];
+                int bytes = copy * bpc;
+                if (bytes > 1024) bytes = 1024;
+                wg_blink_read_mem(engine->blink, src, tmp, (uint32_t)bytes);
+                wg_blink_write_mem(engine->blink, dst, tmp, (uint32_t)bytes);
+                ret_val = (uint32_t)copy;
+            } else {
+                ret_val = 0;
+            }
         } else if (strcmp(fn, "GetACP") == 0) {
             ret_val = 1252;   // Windows-1252; ACP=0 trips the CRT _invalid_parameter
         } else if (strcmp(fn, "GetOEMCP") == 0) {
@@ -2300,13 +2601,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (s_event_next < WG_MAX_EVENTS) {
                 uint32_t idx = s_event_next++;
                 s_event_signalled[idx] = (args[2] != 0);
+                s_event_manual[idx] = (args[1] != 0); // bManualReset
                 handle = WG_EVENT_BASE + idx;
             }
+            WG_LOGI(TAG, "CreateEvent(manualReset=%u, initState=%u) -> h=0x%X",
+                    args[1], args[2], handle);
             ret_val = handle;
         } else if (strcmp(fn, "SetEvent") == 0) {
             uint32_t h = args[0];
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = true;
+            WG_LOGI(TAG, "SetEvent(h=0x%X)", h);
             wg_sched_wake(engine->scheduler, h);
             ret_val = 1;
         } else if (strcmp(fn, "ResetEvent") == 0) {
@@ -2314,6 +2619,123 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = false;
             ret_val = 1;
+        } else if (strcmp(fn, "CreateIoCompletionPort") == 0) {
+            // CreateIoCompletionPort(FileHandle, ExistingPort, CompletionKey, NumberOfConcurrentThreads)
+            // FileHandle == INVALID_HANDLE_VALUE (-1 / 0xFFFFFFFF): create new IOCP
+            // else: associate FileHandle (socket) with existing IOCP + CompletionKey
+            uint32_t file_h = args[0];
+            uint32_t comp_key = args[2];
+            // We do NOT deliver real IOCP socket completions, so steering apps to
+            // IOCP-based async I/O leaves them in an inconsistent state (Steam's
+            // tcpconnection asserts !BUseIOCP() then send(0,0,0) and bails).
+            // Fail IOCP creation so the app uses the synchronous select/send/recv
+            // path, which we fully support.
+            if (s_disable_iocp) {
+                s_last_error = 50; // ERROR_NOT_SUPPORTED
+                WG_LOGI(TAG, "CreateIoCompletionPort -> 0 (IOCP disabled, force select path)");
+                ret_val = 0;
+            } else if (file_h == 0xFFFFFFFFu) {
+                s_iocp_created = true;
+                WG_LOGI(TAG, "CreateIoCompletionPort(new) -> 0x%X", WG_IOCP_HANDLE);
+                ret_val = WG_IOCP_HANDLE;
+            } else {
+                // Bind socket to IOCP with its completion key
+                if (s_iocp_binding_count < WG_MAX_IOCP_SOCK) {
+                    s_iocp_bindings[s_iocp_binding_count++] = (WGIocpBinding){file_h, comp_key};
+                }
+                WG_LOGI(TAG, "CreateIoCompletionPort(sock=0x%X, key=0x%X) -> 0x%X",
+                        file_h, comp_key, WG_IOCP_HANDLE);
+                ret_val = WG_IOCP_HANDLE;
+            }
+        } else if (strcmp(fn, "GetQueuedCompletionStatus") == 0 ||
+                   strcmp(fn, "GetQueuedCompletionStatusEx") == 0) {
+            // GQCS(iocp, lpBytes, lpKey, lpOverlapped, timeout)
+            // GQCSE(iocp, lpEntries, count, lpRemoved, timeout, alertable)
+            bool is_ex = (strcmp(fn, "GetQueuedCompletionStatusEx") == 0);
+            uint32_t timeout = is_ex ? args[4] : args[4];
+            uint32_t bytes_out = 0, key_out = 0, ovl_out = 0;
+            bool got = iocp_get(&bytes_out, &key_out, &ovl_out);
+            WG_LOGI(TAG, "%s(timeout=0x%X) got=%d bytes=%u key=0x%X ovl=0x%X",
+                    fn, timeout, (int)got, bytes_out, key_out, ovl_out);
+            if (got) {
+                if (!is_ex) {
+                    // Write results to guest
+                    if (args[1]) wg_blink_write_mem(engine->blink, args[1], &bytes_out, 4);
+                    if (args[2]) wg_blink_write_mem(engine->blink, args[2], &key_out, 4);
+                    if (args[3]) wg_blink_write_mem(engine->blink, args[3], &ovl_out, 4);
+                    // Write success into OVERLAPPED.Internal = 0 (STATUS_SUCCESS)
+                    if (ovl_out) {
+                        uint32_t zero = 0;
+                        wg_blink_write_mem(engine->blink, ovl_out, &zero, 4);
+                        wg_blink_write_mem(engine->blink, ovl_out + 4, &bytes_out, 4);
+                    }
+                } else {
+                    // OVERLAPPED_ENTRY: {lpCompletionKey, lpOverlapped, Internal, dwNumberOfBytesTransferred}
+                    uint32_t entry_ptr = args[1];
+                    if (entry_ptr) {
+                        wg_blink_write_mem(engine->blink, entry_ptr,      &key_out,   4);
+                        wg_blink_write_mem(engine->blink, entry_ptr + 4,  &ovl_out,   4);
+                        wg_blink_write_mem(engine->blink, entry_ptr + 8,  &bytes_out, 4);
+                        wg_blink_write_mem(engine->blink, entry_ptr + 12, &bytes_out, 4);
+                    }
+                    uint32_t one = 1;
+                    if (args[3]) wg_blink_write_mem(engine->blink, args[3], &one, 4);
+                }
+                ret_val = 1; // TRUE
+            } else if (timeout == 0) {
+                // WAIT_TIMEOUT — no completions available
+                s_last_error = 258; // WAIT_TIMEOUT
+                ret_val = 0; // FALSE
+            } else {
+                // Block (yield) until a completion arrives or another thread posts one
+                WGThread *cur = wg_sched_current(engine->scheduler);
+                if (cur) { cur->wait_handle = WG_IOCP_HANDLE; cur->wait_timeout = timeout; }
+                bool switched = wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_WAITING);
+                WG_LOGI(TAG, "GQCS yield switched=%d", (int)switched);
+                if (switched) return true;
+                // No other threads — pretend timeout
+                s_last_error = 258;
+                ret_val = 0;
+            }
+        } else if (strcmp(fn, "PostQueuedCompletionStatus") == 0) {
+            // PostQueuedCompletionStatus(iocp, bytes, key, overlapped)
+            iocp_post(args[1], args[2], args[3]);
+            wg_sched_wake(engine->scheduler, WG_IOCP_HANDLE);
+            ret_val = 1;
+        } else if (strcmp(fn, "CreateThreadpoolWork") == 0) {
+            // CreateThreadpoolWork(pfnwk, pv, pcbe) -> PTP_WORK handle
+            uint32_t cb  = args[0];
+            uint32_t ctx = args[1];
+            if (s_tp_work_count < WG_MAX_TP_WORK) {
+                int idx = s_tp_work_count++;
+                s_tp_work[idx] = (WGTpWork){cb, ctx, 0};
+                ret_val = WG_TP_WORK_BASE + idx;
+                WG_LOGI(TAG, "CreateThreadpoolWork(cb=0x%X ctx=0x%X) -> h=0x%X", cb, ctx, (uint32_t)ret_val);
+            } else {
+                ret_val = 0;
+            }
+        } else if (strcmp(fn, "SubmitThreadpoolWork") == 0) {
+            // SubmitThreadpoolWork(pwk) — create a thread to run the callback
+            uint32_t pwk = args[0];
+            if (pwk >= WG_TP_WORK_BASE && pwk < WG_TP_WORK_BASE + s_tp_work_count) {
+                int idx = (int)(pwk - WG_TP_WORK_BASE);
+                uint32_t cb  = s_tp_work[idx].callback;
+                uint32_t ctx = s_tp_work[idx].ctx;
+                if (cb) {
+                    uint32_t tid2 = 0;
+                    // PTP_WORK_CALLBACK(PTP_CALLBACK_INSTANCE, ctx, PTP_WORK) — 3 args
+                    // We pass ctx as the sole arg via a stub; the callback ignores inst/work.
+                    uint32_t h2 = wg_sched_create_thread(engine->scheduler, engine->blink,
+                                                          cb, ctx, 0, &tid2);
+                    if (h2) {
+                        s_tp_work[idx].thread_handle = h2;
+                        WG_LOGI(TAG, "SubmitThreadpoolWork(h=0x%X cb=0x%X) -> thread tid=0x%X", pwk, cb, tid2);
+                    } else {
+                        WG_LOGI(TAG, "SubmitThreadpoolWork(h=0x%X) scheduler full — skipped", pwk);
+                    }
+                }
+            }
+            ret_val = 0; // void return
         } else if (strcmp(fn, "WaitForSingleObject") == 0) {
             uint32_t h = args[0];
             uint32_t timeout = args[1];
@@ -2324,24 +2746,90 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Check if it's a thread handle that has exited
             WGThread *wt = wg_sched_find(engine->scheduler, h);
             if (wt && wt->state == WG_THREAD_EXITED) signalled = true;
+            // Dedup the poll spam: only log when handle or signalled state changes.
+            static uint32_t s_wfso_last_h = 0xFFFFFFFFu; static int s_wfso_last_sig = -1;
+            if (h != s_wfso_last_h || (int)signalled != s_wfso_last_sig) {
+                WG_LOGI(TAG, "WaitForSingleObject(h=0x%X, timeout=0x%X) signalled=%d thread_found=%d",
+                        h, timeout, (int)signalled, (wt != NULL));
+                s_wfso_last_h = h; s_wfso_last_sig = (int)signalled;
+            }
             if (signalled) {
+                wg_event_consume(h); // auto-reset events clear after a satisfied wait
                 ret_val = 0; // WAIT_OBJECT_0
             } else if (timeout == 0) {
                 ret_val = 258; // WAIT_TIMEOUT
             } else {
-                // Block and try to switch to another thread
+                // Finite timeout → cooperative POLL (yield READY, re-check next
+                // turn) since we have no real timer to fire timeouts; INFINITE →
+                // truly block (WAITING) until signalled. This lets timed waiters
+                // (e.g. the network worker's 250ms job wait) keep making progress
+                // instead of blocking forever, and avoids falsely reporting
+                // "signalled" when we're the only runnable thread.
+                WGThreadState blk = (timeout == 0xFFFFFFFFu)
+                                    ? WG_THREAD_WAITING : WG_THREAD_READY;
                 WGThread *cur = wg_sched_current(engine->scheduler);
                 if (cur) {
                     cur->wait_handle = h;
                     cur->wait_timeout = timeout;
                 }
-                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_WAITING)) {
+                bool switched = wg_sched_yield(engine->scheduler, engine->blink, blk);
+                if (switched) {
                     return true; // switched to another thread
                 }
-                ret_val = 0; // no other threads, just return signalled
+                ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258; // alone: INFINITE→OBJ_0, else TIMEOUT
             }
-        } else if (strcmp(fn, "WaitForMultipleObjects") == 0) {
-            ret_val = 0; // WAIT_OBJECT_0
+        } else if (strcmp(fn, "WaitForMultipleObjects") == 0 ||
+                   strcmp(fn, "WaitForMultipleObjectsEx") == 0 ||
+                   strcmp(fn, "MsgWaitForMultipleObjects") == 0 ||
+                   strcmp(fn, "MsgWaitForMultipleObjectsEx") == 0) {
+            // args: nCount, lpHandles, bWaitAll, dwMilliseconds [, dwWakeMask [, dwFlags]]
+            uint32_t ncount   = args[0];
+            uint32_t hptr     = args[1];
+            bool     wait_all = (args[2] != 0);
+            uint32_t timeout  = args[3];
+            if (ncount > 16) ncount = 16;
+            uint32_t handles[16] = {0};
+            if (hptr) wg_blink_read_mem(engine->blink, hptr, handles, ncount * 4);
+
+            int first_signalled = -1;
+            int nsig = 0;
+            for (uint32_t idx = 0; idx < ncount; idx++) {
+                uint32_t h = handles[idx];
+                bool sig = false;
+                if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+                    sig = s_event_signalled[h - WG_EVENT_BASE];
+                WGThread *wt2 = wg_sched_find(engine->scheduler, h);
+                if (wt2 && wt2->state == WG_THREAD_EXITED) sig = true;
+                if (sig) { nsig++; if (first_signalled < 0) first_signalled = (int)idx; }
+            }
+
+            if (ncount == 0) {
+                // MsgWait with no handles = pure message wait; pretend message arrived
+                ret_val = 0;
+            } else {
+                bool all_done = wait_all ? (nsig == (int)ncount) : (nsig > 0);
+                WG_LOGI(TAG, "%s(n=%u, waitAll=%d, timeout=0x%X) nsig=%d all_done=%d",
+                        fn, ncount, (int)wait_all, timeout, nsig, (int)all_done);
+                if (all_done) {
+                    // Consume auto-reset events that satisfied the wait.
+                    if (wait_all) {
+                        for (uint32_t idx = 0; idx < ncount; idx++) wg_event_consume(handles[idx]);
+                    } else if (first_signalled >= 0) {
+                        wg_event_consume(handles[first_signalled]);
+                    }
+                    ret_val = (first_signalled >= 0) ? (uint32_t)first_signalled : 0;
+                } else if (timeout == 0) {
+                    ret_val = 258; // WAIT_TIMEOUT
+                } else {
+                    WGThreadState blk = (timeout == 0xFFFFFFFFu)
+                                        ? WG_THREAD_WAITING : WG_THREAD_READY;
+                    WGThread *cur = wg_sched_current(engine->scheduler);
+                    if (cur) { cur->wait_handle = handles[0]; cur->wait_timeout = timeout; }
+                    bool switched = wg_sched_yield(engine->scheduler, engine->blink, blk);
+                    if (switched) return true;
+                    ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258;
+                }
+            }
         } else if (strcmp(fn, "CreateMutexW") == 0 ||
                    strcmp(fn, "CreateMutexA") == 0) {
             // Return a unique fake handle. Steam uses mutexes for single-instance.
@@ -2366,7 +2854,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[5] && tid) {
                 wg_blink_write_mem(engine->blink, args[5], &tid, 4);
             }
-            if (!hthread) {
+            if (hthread) {
+                // Give the new thread its own TEB (stack bounds, ClientId, TLS).
+                WGThread *nt = wg_sched_find(engine->scheduler, hthread);
+                if (nt) {
+                    uint32_t teb = wg_alloc_thread_teb(engine,
+                        nt->stack_base + nt->stack_size, nt->stack_base, tid);
+                    if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
+                }
+            } else {
                 // Fallback: run synchronously (for NSIS compatibility)
                 hthread = 0x7100;
                 uint64_t clean_rsp = rsp + ptr_size + (6 * ptr_size);
@@ -2379,11 +2875,121 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = hthread;
+        } else if (strcmp(fn, "_beginthreadex") == 0) {
+            // uintptr_t _beginthreadex(security, stack, start=args[2], arg=args[3],
+            //                          initflag=args[4], thrdaddr=args[5])  __cdecl.
+            // MSVC CRT thread spawn. Must create a REAL cooperative thread or the
+            // app's worker (e.g. Steam's network/download thread) never runs and
+            // the main thread polls forever. start is __stdcall, like CreateThread.
+            uint32_t start = args[2], param = args[3], flags = args[4];
+            uint32_t tid = 0;
+            uint32_t hthread = wg_sched_create_thread(
+                engine->scheduler, engine->blink, start, param, flags, &tid);
+            if (args[5] && tid)
+                wg_blink_write_mem(engine->blink, args[5], &tid, 4);
+            if (hthread) {
+                WGThread *nt = wg_sched_find(engine->scheduler, hthread);
+                if (nt) {
+                    uint32_t teb = wg_alloc_thread_teb(engine,
+                        nt->stack_base + nt->stack_size, nt->stack_base, tid);
+                    if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
+                }
+            }
+            WG_LOGI(TAG, "_beginthreadex(start=0x%X param=0x%X flags=0x%X) -> h=0x%X tid=0x%X",
+                    start, param, flags, hthread, tid);
+            ret_val = hthread; // 0 on failure (CRT maps to errno)
+        } else if (strcmp(fn, "_beginthread") == 0) {
+            // uintptr_t _beginthread(start=args[0], stack=args[1], arg=args[2]) __cdecl.
+            // Older CRT spawn; start is __cdecl but returns to RIP=0 sentinel either way.
+            uint32_t start = args[0], param = args[2];
+            uint32_t tid = 0;
+            uint32_t hthread = wg_sched_create_thread(
+                engine->scheduler, engine->blink, start, param, 0, &tid);
+            if (hthread) {
+                WGThread *nt = wg_sched_find(engine->scheduler, hthread);
+                if (nt) {
+                    uint32_t teb = wg_alloc_thread_teb(engine,
+                        nt->stack_base + nt->stack_size, nt->stack_base, tid);
+                    if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
+                }
+            }
+            WG_LOGI(TAG, "_beginthread(start=0x%X param=0x%X) -> h=0x%X tid=0x%X",
+                    start, param, hthread, tid);
+            ret_val = hthread;
+        } else if (strcmp(fn, "QueueUserWorkItem") == 0) {
+            // QueueUserWorkItem(Function, Context, Flags)
+            // Create a cooperative thread for the callback — same signature as CreateThread
+            uint32_t func  = args[0];
+            uint32_t ctx   = args[1];
+            if (func) {
+                uint32_t tid2 = 0;
+                uint32_t h2 = wg_sched_create_thread(engine->scheduler, engine->blink,
+                                                      func, ctx, 0, &tid2);
+                if (h2) {
+                    WG_LOGI(TAG, "QueueUserWorkItem(fn=0x%X, ctx=0x%X) -> thread h=0x%X tid=0x%X",
+                            func, ctx, h2, tid2);
+                    ret_val = 1; // TRUE
+                } else {
+                    // Fallback: run synchronously
+                    WG_LOGI(TAG, "QueueUserWorkItem(fn=0x%X, ctx=0x%X) -> sync", func, ctx);
+                    uint64_t clean_rsp = rsp + ptr_size + (3 * ptr_size);
+                    if (is_32bit) {
+                        wg_call_wndproc_ovr(engine, func, ctx, 0, 0, 0,
+                                            (uint32_t)ret_addr, (uint32_t)clean_rsp,
+                                            true, 0x7100);
+                        return true;
+                    }
+                    ret_val = 1;
+                }
+            } else {
+                ret_val = 0;
+            }
+        } else if (strcmp(fn, "WaitForSingleObjectEx") == 0) {
+            // WaitForSingleObjectEx(hObject, dwMilliseconds, bAlertable) — treat same as WaitForSingleObject
+            uint32_t h = args[0];
+            uint32_t timeout = args[1];
+            bool signalled = false;
+            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+                signalled = s_event_signalled[h - WG_EVENT_BASE];
+            WGThread *wt_ex = wg_sched_find(engine->scheduler, h);
+            if (wt_ex && wt_ex->state == WG_THREAD_EXITED) signalled = true;
+            WG_LOGI(TAG, "WaitForSingleObjectEx(h=0x%X, timeout=0x%X) signalled=%d",
+                    h, timeout, (int)signalled);
+            if (signalled) {
+                wg_event_consume(h);
+                ret_val = 0;
+            } else if (timeout == 0) {
+                ret_val = 258;
+            } else {
+                WGThreadState blk = (timeout == 0xFFFFFFFFu)
+                                    ? WG_THREAD_WAITING : WG_THREAD_READY;
+                WGThread *cur_ex = wg_sched_current(engine->scheduler);
+                if (cur_ex) { cur_ex->wait_handle = h; cur_ex->wait_timeout = timeout; }
+                bool sw = wg_sched_yield(engine->scheduler, engine->blink, blk);
+                if (sw) return true;
+                ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258;
+            }
+        } else if (strcmp(fn, "ResumeThread") == 0) {
+            uint32_t h = args[0];
+            WGThread *wt = wg_sched_find(engine->scheduler, h);
+            if (wt && wt->state == WG_THREAD_SUSPENDED) {
+                wt->state = WG_THREAD_READY;
+                WG_LOGI(TAG, "ResumeThread: h=0x%X id=0x%X now READY", h, wt->id);
+                ret_val = 1; // previous suspend count
+            } else {
+                ret_val = (uint32_t)-1; // error if not found
+            }
         } else if (strcmp(fn, "GetExitCodeThread") == 0) {
-            // The worker already ran to completion synchronously; report exit
-            // code 0 (not STILL_ACTIVE) so any wait loop sees it as finished.
-            if (args[1]) { uint32_t code = 0;
-                wg_blink_write_mem(engine->blink, args[1], &code, 4); }
+            uint32_t h = args[0];
+            WGThread *wt = wg_sched_find(engine->scheduler, h);
+            if (wt) {
+                uint32_t code = (wt->state == WG_THREAD_EXITED) ? wt->exit_code : 259 /*STILL_ACTIVE*/;
+                if (args[1]) wg_blink_write_mem(engine->blink, args[1], &code, 4);
+            } else {
+                // thread ran synchronously — report done
+                if (args[1]) { uint32_t code = 0;
+                    wg_blink_write_mem(engine->blink, args[1], &code, 4); }
+            }
             ret_val = 1;
         } else if (strcmp(fn, "CreateProcessW") == 0 ||
                    strcmp(fn, "CreateProcessA") == 0) {
@@ -2549,29 +3155,38 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 s_last_error = 0;
             }
         } else if (strcmp(fn, "PeekMessageW") == 0) {
-            // PeekMessageW — idle point in the message loop. If worker
-            // threads are READY, yield to them before returning.
-            bool has_ready = false;
-            for (int ti = 0; ti < WG_MAX_THREADS; ti++) {
-                if (engine->scheduler->threads[ti].state == WG_THREAD_READY) {
-                    has_ready = true;
-                    break;
+            // PeekMessageW(lpMsg, hWnd, filterMin, filterMax, removeMsg)
+            // First: check the thread message queue (PostThreadMessageW items).
+            uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
+            if (!cur_tid) cur_tid = 1;
+            uint32_t tmsg = 0, twp = 0, tlp = 0;
+            if (args[0] && tmsg_pop(cur_tid, &tmsg, &twp, &tlp)) {
+                uint32_t msgbuf[7] = {0, tmsg, twp, tlp, 0, 0, 0};
+                wg_blink_write_mem(engine->blink, args[0], msgbuf, 28);
+                WG_LOGI(TAG, "PeekMessageW: delivered msg=0x%X to tid=0x%X", tmsg, cur_tid);
+                ret_val = 1;
+            } else {
+                // Idle — yield to ready worker threads (e.g. NSIS install thread).
+                bool has_ready = false;
+                for (int ti = 0; ti < WG_MAX_THREADS; ti++) {
+                    if (engine->scheduler->threads[ti].state == WG_THREAD_READY) {
+                        has_ready = true; break;
+                    }
                 }
-            }
-            if (has_ready) {
-                // Yield to worker threads (e.g. NSIS install thread)
-                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
-                    return true; // switched to worker
+                if (has_ready) {
+                    if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
+                        return true; // switched to worker
+                    }
                 }
+                static int peek_count = 0;
+                peek_count++;
+                if (peek_count > 5) {
+                    peek_count = 0;
+                    engine->state = WG_ENGINE_PAUSED;
+                    WG_LOGI(TAG, "Message loop — pausing for UI");
+                }
+                ret_val = 0; // no messages
             }
-            static int peek_count = 0;
-            peek_count++;
-            if (peek_count > 5) {
-                peek_count = 0;
-                engine->state = WG_ENGINE_PAUSED;
-                WG_LOGI(TAG, "Message loop — pausing for UI");
-            }
-            ret_val = 0; // no messages
         } else if (strcmp(fn, "GetTickCount") == 0) {
             // Seed from a real clock so it varies across launches — NSIS
             // derives its temp-dir names from this, and a fixed seed makes
@@ -2582,20 +3197,302 @@ static bool handle_blink_thunk(WGEngine *engine) {
             s_tick += 16;
         } else if (strcmp(fn, "GetSystemTimeAsFileTime") == 0 ||
                    strcmp(fn, "GetSystemTimePreciseAsFileTime") == 0) {
-            // *args[0] = FILETIME (8 bytes). Jan 1 2024 00:00 UTC in 100ns ticks.
             if (args[0]) {
-                uint64_t ft = 133484064000000000ULL;
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                // Convert Unix time to FILETIME (100ns ticks since 1601-01-01).
+                uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL
+                            + (uint64_t)ts.tv_nsec / 100ULL
+                            + 116444736000000000ULL;
                 wg_blink_write_mem(engine->blink, args[0], &ft, 8);
+            }
+            ret_val = 0;
+        } else if (strcmp(fn, "GetSystemTime") == 0) {
+            if (args[0]) {
+                time_t t = time(NULL);
+                struct tm *tm = gmtime(&t);
+                uint16_t st[8] = {
+                    (uint16_t)(1900 + tm->tm_year), (uint16_t)(1 + tm->tm_mon),
+                    (uint16_t)tm->tm_wday, (uint16_t)tm->tm_mday,
+                    (uint16_t)tm->tm_hour, (uint16_t)tm->tm_min,
+                    (uint16_t)tm->tm_sec, 0
+                };
+                wg_blink_write_mem(engine->blink, args[0], st, 16);
+            }
+            ret_val = 0;
+        } else if (strcmp(fn, "GetLocalTime") == 0) {
+            if (args[0]) {
+                time_t t = time(NULL);
+                struct tm *tm = localtime(&t);
+                uint16_t st[8] = {
+                    (uint16_t)(1900 + tm->tm_year), (uint16_t)(1 + tm->tm_mon),
+                    (uint16_t)tm->tm_wday, (uint16_t)tm->tm_mday,
+                    (uint16_t)tm->tm_hour, (uint16_t)tm->tm_min,
+                    (uint16_t)tm->tm_sec, 0
+                };
+                wg_blink_write_mem(engine->blink, args[0], st, 16);
             }
             ret_val = 0;
         } else if (strcmp(fn, "GetCurrentThreadId") == 0) {
             ret_val = wg_sched_current_tid(engine->scheduler);
             if (!ret_val) ret_val = 1;
         } else if (strcmp(fn, "Sleep") == 0 || strcmp(fn, "SleepEx") == 0) {
-            // Try to yield to another thread during sleep
-            if (args[0] > 0 &&
-                wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
-                return true;
+            if (args[0] > 0) {
+                // On first few calls, dump guest call stack so we know what's looping.
+                static uint32_t s_sleep_loop_rip = 0;
+                static int      s_sleep_loop_cnt = 0;
+                uint32_t cur_rip = (uint32_t)ret_addr; // instruction after the Sleep call
+                if (cur_rip == s_sleep_loop_rip) {
+                    s_sleep_loop_cnt++;
+                } else {
+                    s_sleep_loop_rip = cur_rip;
+                    s_sleep_loop_cnt = 1;
+                }
+                if (s_sleep_loop_cnt <= 2) {
+                    uint32_t ebp0 = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                    uint32_t cur_tid2 = wg_sched_current_tid(engine->scheduler);
+                    WG_LOGI(TAG, "Sleep(%u) tid=0x%X ret=0x%X EBP=0x%X",
+                            args[0], cur_tid2, cur_rip, ebp0);
+                    // Dump 128 bytes BEFORE cur_rip to see the condition check and Sleep CALL
+                    // (cur_rip is the ret addr after Sleep — POP EBP; RET is at cur_rip itself)
+                    uint32_t dump_start = (cur_rip >= 128) ? cur_rip - 128 : 0;
+                    uint8_t loop_code[128] = {0};
+                    wg_blink_read_mem(engine->blink, dump_start, loop_code, 128);
+                    WG_LOGI(TAG, "  x86@0x%X [before ret=0x%X]:", dump_start, cur_rip);
+                    for (int di = 0; di < 8; di++) {
+                        int b = di * 16;
+                        WG_LOGI(TAG, "  0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                dump_start + (uint32_t)b,
+                                loop_code[b+0],loop_code[b+1],loop_code[b+2],loop_code[b+3],
+                                loop_code[b+4],loop_code[b+5],loop_code[b+6],loop_code[b+7],
+                                loop_code[b+8],loop_code[b+9],loop_code[b+10],loop_code[b+11],
+                                loop_code[b+12],loop_code[b+13],loop_code[b+14],loop_code[b+15]);
+                    }
+                    if (ebp0 > 0x10000 && ebp0 < 0xF0000000u) {
+                        uint32_t ovl_ptr = 0;
+                        wg_blink_read_mem(engine->blink, ebp0 + 16, &ovl_ptr, 4);
+                        if (ovl_ptr > 0x100000u && ovl_ptr < 0x80000000u) {
+                            uint32_t ovl[4] = {0};
+                            wg_blink_read_mem(engine->blink, ovl_ptr, ovl, 16);
+                            WG_LOGI(TAG, "  OVERLAPPED[0x%X]: Internal=0x%X InternalHigh=0x%X",
+                                    ovl_ptr, ovl[0], ovl[1]);
+                        }
+                    }
+                    // Walk guest EBP chain; on frame[0] dump the outer loop code
+                    uint32_t ebp = ebp0;
+                    uint32_t outer_loop_ra = 0; // ret addr of frame[0] = outer loop site
+                    for (int fi = 0; fi < 8 && ebp > 0x10000 && ebp < 0xF0000000u; fi++) {
+                        uint32_t frame_ra = 0, prev_ebp = 0;
+                        wg_blink_read_mem(engine->blink, ebp + 4, &frame_ra, 4);
+                        wg_blink_read_mem(engine->blink, ebp,     &prev_ebp, 4);
+                        WG_LOGI(TAG, "  [%d] EBP=0x%X ret=0x%X", fi, ebp, frame_ra);
+                        if (fi == 0 && frame_ra > 0x400000u && frame_ra < 0x80000000u) {
+                            outer_loop_ra = frame_ra;
+                            // Dump 96 bytes starting 32 before the outer loop ret address
+                            // to see the condition check and loop branch
+                            uint32_t ols = (frame_ra >= 32) ? frame_ra - 32 : 0;
+                            uint8_t olb[96] = {0};
+                            wg_blink_read_mem(engine->blink, ols, olb, 96);
+                            WG_LOGI(TAG, "  outer_loop@0x%X (dump from 0x%X):", frame_ra, ols);
+                            for (int oi = 0; oi < 6; oi++) {
+                                int ob = oi * 16;
+                                WG_LOGI(TAG, "  0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                        ols + (uint32_t)ob,
+                                        olb[ob+0],olb[ob+1],olb[ob+2],olb[ob+3],
+                                        olb[ob+4],olb[ob+5],olb[ob+6],olb[ob+7],
+                                        olb[ob+8],olb[ob+9],olb[ob+10],olb[ob+11],
+                                        olb[ob+12],olb[ob+13],olb[ob+14],olb[ob+15]);
+                            }
+                        }
+                        if (prev_ebp == ebp || prev_ebp == 0) break;
+                        ebp = prev_ebp;
+                    }
+                    // Dump locals + params of the innermost frame
+                    if (ebp0 > 0x10000 && ebp0 < 0xF0000000u) {
+                        // locals: EBP-44 .. EBP+0
+                        uint32_t locals[12] = {0};
+                        uint32_t lo = (ebp0 >= 44) ? ebp0 - 44 : 0;
+                        wg_blink_read_mem(engine->blink, lo, locals, 48);
+                        WG_LOGI(TAG, "  locals[EBP-44..EBP+4]:");
+                        for (int li = 0; li < 12; li++) {
+                            int off = (int)(lo + li*4) - (int)ebp0;
+                            WG_LOGI(TAG, "    [EBP%+d]=0x%08X", off, locals[li]);
+                        }
+                        // params: EBP+8 .. EBP+28
+                        uint32_t params[6] = {0};
+                        wg_blink_read_mem(engine->blink, ebp0 + 8, params, 24);
+                        WG_LOGI(TAG, "  params[EBP+8..EBP+28]: 0x%X 0x%X 0x%X 0x%X 0x%X 0x%X",
+                                params[0],params[1],params[2],params[3],params[4],params[5]);
+                        // Dump the two monitored heap objects from EBP-20 and EBP-24
+                        uint32_t ptr_a = locals[5] & ~1u; // EBP-24, strip tag
+                        uint32_t ptr_b = locals[6];       // EBP-20
+                        if (ptr_a > 0x1000000u && ptr_a < 0x80000000u) {
+                            uint8_t objA[32] = {0};
+                            wg_blink_read_mem(engine->blink, ptr_a, objA, 32);
+                            WG_LOGI(TAG, "  [0x%X] A[0..31]: %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    ptr_a,
+                                    objA[0],objA[1],objA[2],objA[3], objA[4],objA[5],objA[6],objA[7],
+                                    objA[8],objA[9],objA[10],objA[11], objA[12],objA[13],objA[14],objA[15]);
+                            WG_LOGI(TAG, "                     %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    objA[16],objA[17],objA[18],objA[19], objA[20],objA[21],objA[22],objA[23],
+                                    objA[24],objA[25],objA[26],objA[27], objA[28],objA[29],objA[30],objA[31]);
+                        }
+                        if (ptr_b > 0x1000000u && ptr_b < 0x80000000u) {
+                            uint8_t objB[64] = {0};
+                            wg_blink_read_mem(engine->blink, ptr_b, objB, 64);
+                            WG_LOGI(TAG, "  [0x%X] B[0..31]: %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    ptr_b,
+                                    objB[0],objB[1],objB[2],objB[3], objB[4],objB[5],objB[6],objB[7],
+                                    objB[8],objB[9],objB[10],objB[11], objB[12],objB[13],objB[14],objB[15]);
+                            WG_LOGI(TAG, "                     %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    objB[16],objB[17],objB[18],objB[19], objB[20],objB[21],objB[22],objB[23],
+                                    objB[24],objB[25],objB[26],objB[27], objB[28],objB[29],objB[30],objB[31]);
+                            WG_LOGI(TAG, "             B[32..63]: %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    objB[32],objB[33],objB[34],objB[35], objB[36],objB[37],objB[38],objB[39],
+                                    objB[40],objB[41],objB[42],objB[43], objB[44],objB[45],objB[46],objB[47]);
+                            WG_LOGI(TAG, "                        %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X  %02X %02X %02X %02X",
+                                    objB[48],objB[49],objB[50],objB[51], objB[52],objB[53],objB[54],objB[55],
+                                    objB[56],objB[57],objB[58],objB[59], objB[60],objB[61],objB[62],objB[63]);
+                            // Dump vtable at B[0] — 8 function pointers
+                            uint32_t vtbl_addr = 0;
+                            memcpy(&vtbl_addr, objB, 4); // B[0] = vtable ptr
+                            if (vtbl_addr > 0x400000u && vtbl_addr < 0x80000000u) {
+                                uint32_t vfns[8] = {0};
+                                wg_blink_read_mem(engine->blink, vtbl_addr, vfns, 32);
+                                WG_LOGI(TAG, "  vtable[0x%X]: fn0=0x%X fn1=0x%X fn2=0x%X fn3=0x%X",
+                                        vtbl_addr, vfns[0], vfns[1], vfns[2], vfns[3]);
+                                WG_LOGI(TAG, "                fn4=0x%X fn5=0x%X fn6=0x%X fn7=0x%X",
+                                        vfns[4], vfns[5], vfns[6], vfns[7]);
+                                // Dump first 32 bytes at each fn to see what it does
+                                for (int vi = 0; vi < 4 && vfns[vi] > 0x400000u && vfns[vi] < 0x80000000u; vi++) {
+                                    uint8_t fn_bytes[16] = {0};
+                                    wg_blink_read_mem(engine->blink, vfns[vi], fn_bytes, 16);
+                                    WG_LOGI(TAG, "  vtable[%d]=0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                            vi, vfns[vi],
+                                            fn_bytes[0],fn_bytes[1],fn_bytes[2],fn_bytes[3],
+                                            fn_bytes[4],fn_bytes[5],fn_bytes[6],fn_bytes[7],
+                                            fn_bytes[8],fn_bytes[9],fn_bytes[10],fn_bytes[11],
+                                            fn_bytes[12],fn_bytes[13],fn_bytes[14],fn_bytes[15]);
+                                }
+                            }
+                        }
+                    }
+                    // Dump all scheduler threads
+                    static const char *state_names[] = {"FREE","RUNNING","READY","WAITING","SUSPENDED","EXITED","?"};
+                    WG_LOGI(TAG, "  Scheduler threads (%d):", engine->scheduler->count);
+                    for (int ti = 0; ti < WG_MAX_THREADS; ti++) {
+                        WGThread *t = &engine->scheduler->threads[ti];
+                        if (t->state == WG_THREAD_FREE) continue;
+                        int sn = (t->state <= WG_THREAD_EXITED) ? (int)t->state : 6;
+                        WG_LOGI(TAG, "    [%d] id=0x%X h=0x%X state=%s start=0x%X wait=0x%X rip=0x%X",
+                                ti, t->id, t->handle, state_names[sn],
+                                t->start_addr, t->wait_handle, t->regs.rip);
+                    }
+                }
+
+
+                // Loop at 0x461F67 tests EBX (this), not object B:
+                //   1) [EBX+0x38]->vtable[7]() != 0  -> exit (network pump)
+                //   2) [EBX+0x4C] (byte) != 0        -> exit
+                //   3) [EBX+0x18C] (dword) != 0      -> exit (result object)
+                // It loops while ALL are "keep going". Probe EBX and the pump method.
+                if (s_sleep_loop_cnt == 5) {
+                    uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                    WG_LOGI(TAG, "Loop-probe@5: EBX(this)=0x%X", ebx);
+                    if (ebx > 0x1000000u && ebx < 0x80000000u) {
+                        uint32_t subobj = 0, f4c = 0, f18c = 0, f188 = 0;
+                        wg_blink_read_mem(engine->blink, ebx + 0x38, &subobj, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x4C, &f4c, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x188, &f188, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x18C, &f18c, 4);
+                        WG_LOGI(TAG, "Loop-probe@5: [EBX+0x38]subobj=0x%X [EBX+0x4C]=0x%X [EBX+0x188]=0x%X [EBX+0x18C]=0x%X",
+                                subobj, f4c, f188, f18c);
+                        // subobj is a PE-data global (e.g. 0x7D7CB8), so accept the
+                        // whole guest-mapped range, not just heap.
+                        if (subobj >= 0x400000u && subobj < 0x80000000u) {
+                            uint32_t vtbl = 0, m7 = 0;
+                            wg_blink_read_mem(engine->blink, subobj, &vtbl, 4);
+                            if (vtbl >= 0x400000u && vtbl < 0x80000000u) {
+                                wg_blink_read_mem(engine->blink, vtbl + 0x1C, &m7, 4);
+                                WG_LOGI(TAG, "Loop-probe@5: subobj vtable=0x%X pump=vtable[7]=0x%X", vtbl, m7);
+                                if (m7 >= 0x400000u && m7 < 0x80000000u) {
+                                    uint8_t mb[64] = {0};
+                                    wg_blink_read_mem(engine->blink, m7, mb, 64);
+                                    for (int mi = 0; mi < 4; mi++) {
+                                        int b = mi * 16;
+                                        WG_LOGI(TAG, "Loop-probe@5: pump@0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                                m7 + (uint32_t)b,
+                                                mb[b+0],mb[b+1],mb[b+2],mb[b+3],mb[b+4],mb[b+5],mb[b+6],mb[b+7],
+                                                mb[b+8],mb[b+9],mb[b+10],mb[b+11],mb[b+12],mb[b+13],mb[b+14],mb[b+15]);
+                                    }
+                                    // Follow every relative CALL (E8 rel32) in the first
+                                    // 64 bytes — names the real routines the pump invokes.
+                                    for (int k = 0; k < 59; k++) {
+                                        if (mb[k] == 0xE8) {
+                                            int32_t rel = (int32_t)(mb[k+1] | (mb[k+2]<<8) | (mb[k+3]<<16) | (mb[k+4]<<24));
+                                            uint32_t tgt = m7 + (uint32_t)k + 5 + (uint32_t)rel;
+                                            WG_LOGI(TAG, "Loop-probe@5:   pump CALL@+0x%X -> 0x%X", k, tgt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Watchdog: if a thread spins on the same Sleep loop for a long
+                // time, log it periodically (read-only) so a genuine deadlock is
+                // visible. Includes the pump disasm so we don't have to scroll up to
+                // the one-shot iter-5 probe in a huge log.
+                if (s_sleep_loop_cnt > 0 && s_sleep_loop_cnt % 200 == 0) {
+                    uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                    WG_LOGW(TAG, "Sleep spin watchdog: ret=0x%X spun %d times, EBX(this)=0x%X",
+                            cur_rip, s_sleep_loop_cnt, ebx);
+                    if (ebx >= 0x400000u && ebx < 0x80000000u) {
+                        uint32_t subobj = 0, f4c = 0, f18c = 0;
+                        wg_blink_read_mem(engine->blink, ebx + 0x38, &subobj, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x4C, &f4c, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x18C, &f18c, 4);
+                        WG_LOGW(TAG, "  [EBX+0x38]subobj=0x%X [EBX+0x4C]=0x%X [EBX+0x18C]=0x%X",
+                                subobj, f4c, f18c);
+                        if (subobj >= 0x400000u && subobj < 0x80000000u) {
+                            uint32_t vtbl = 0, m7 = 0;
+                            wg_blink_read_mem(engine->blink, subobj, &vtbl, 4);
+                            if (vtbl >= 0x400000u && vtbl < 0x80000000u) {
+                                wg_blink_read_mem(engine->blink, vtbl + 0x1C, &m7, 4);
+                                WG_LOGW(TAG, "  pump=vtable[7]=0x%X (vtable=0x%X)", m7, vtbl);
+                                if (m7 >= 0x400000u && m7 < 0x80000000u) {
+                                    uint8_t mb[64] = {0};
+                                    wg_blink_read_mem(engine->blink, m7, mb, 64);
+                                    for (int mi = 0; mi < 4; mi++) {
+                                        int b = mi * 16;
+                                        WG_LOGW(TAG, "  pump@0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                                m7 + (uint32_t)b,
+                                                mb[b+0],mb[b+1],mb[b+2],mb[b+3],mb[b+4],mb[b+5],mb[b+6],mb[b+7],
+                                                mb[b+8],mb[b+9],mb[b+10],mb[b+11],mb[b+12],mb[b+13],mb[b+14],mb[b+15]);
+                                    }
+                                    for (int k = 0; k < 59; k++) {
+                                        if (mb[k] == 0xE8) {
+                                            int32_t rel = (int32_t)(mb[k+1] | (mb[k+2]<<8) | (mb[k+3]<<16) | (mb[k+4]<<24));
+                                            uint32_t tgt = m7 + (uint32_t)k + 5 + (uint32_t)rel;
+                                            WG_LOGW(TAG, "    pump CALL@+0x%X -> 0x%X", k, tgt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                int sleep_nargs = (strcmp(fn, "SleepEx") == 0) ? 2 : 1;
+                uint64_t new_rsp = rsp + ptr_size + ((uint64_t)sleep_nargs * ptr_size);
+                wg_blink_set_reg(engine->blink, 4, new_rsp);
+                wg_blink_set_rip(engine->blink, ret_addr);
+                wg_blink_set_reg(engine->blink, 0, 0); // EAX = 0 (void)
+                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY)) {
+                    return true; // switched; state saved at ret_addr
+                }
+                return true; // no other threads; state already cleaned
             }
             ret_val = 0;
         } else if (strcmp(fn, "ExitThread") == 0) {
@@ -2610,6 +3507,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
             return true;
         } else if (strcmp(fn, "GetCurrentProcess") == 0) {
             ret_val = (uint64_t)-1;
+        } else if (strcmp(fn, "GetOverlappedResult") == 0) {
+            // GetOverlappedResult(hFile, lpOverlapped, lpBytesTransferred, bWait)
+            // Read InternalHigh (offset 4 in OVERLAPPED) as the byte count.
+            if (args[1] && args[2]) {
+                uint32_t bytes = 0;
+                wg_blink_read_mem(engine->blink, args[1] + 4, &bytes, 4);
+                wg_blink_write_mem(engine->blink, args[2], &bytes, 4);
+            }
+            ret_val = 1; // TRUE
         } else if (strcmp(fn, "CloseHandle") == 0) {
             wg_files_close(args[0]);
             ret_val = 1;
@@ -2703,6 +3609,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t nbytes = args[2];
             uint32_t bytes_written_addr = args[3];
             if (nbytes > 0x100000) nbytes = 0x100000;
+            // stdout/stderr (from GetStdHandle) — accept the write silently
+            if (handle == 0xF1 || handle == 0xF2 || handle == 0x00007301) {
+                if (bytes_written_addr)
+                    wg_blink_write_mem(engine->blink, bytes_written_addr, &nbytes, 4);
+                ret_val = 1;
+                goto wf_done;
+            }
             // Ignore writes to the pre-filled NSIS data tmp — our native
             // decompression already put the correct full data there; the
             // guest's own (truncated) decode would corrupt it.
@@ -2728,15 +3641,48 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     }
                     ret_val = 1;
                     WG_LOGI(TAG, "WriteFile(0x%X, %u bytes) -> wrote %u", handle, nbytes, nwritten);
+                    if (nwritten > 0 && nwritten <= 512) {
+                        char pv[514]; uint32_t pl = nwritten < 513 ? nwritten : 512;
+                        memcpy(pv, tmpbuf, pl); pv[pl] = '\0';
+                        for (uint32_t j = 0; j < pl; j++)
+                            if ((unsigned char)pv[j] < 0x20 && pv[j] != '\n') pv[j] = '.';
+                        WG_LOGI(TAG, "  >> %s", pv);
+                    }
                 } else {
-                    WG_LOGE(TAG, "WriteFile(0x%X, %u bytes) FAILED", handle, nbytes);
+                    // Succeed silently for unknown handles to prevent thread crashes
+                    if (bytes_written_addr)
+                        wg_blink_write_mem(engine->blink, bytes_written_addr, &nbytes, 4);
+                    ret_val = 1;
+                    WG_LOGW(TAG, "WriteFile(0x%X, %u bytes) -> sink (unknown handle)", handle, nbytes);
                 }
                 free(tmpbuf);
             }
             wf_done:;
+        } else if (strcmp(fn, "GetFileType") == 0) {
+            uint32_t h = args[0];
+            if (h >= 0x100 && h < 0x200)
+                ret_val = 1; // FILE_TYPE_DISK for real file handles
+            else
+                ret_val = 0; // FILE_TYPE_UNKNOWN for everything else
         } else if (strcmp(fn, "GetFileSize") == 0) {
             ret_val = wg_files_get_size(args[0]);
+            // lpFileSizeHigh (arg1) gets the high dword if provided (we only have 32-bit sizes)
+            if (args[1] > 0x10000u && args[1] < 0xF0000000u) {
+                uint32_t hi = 0;
+                wg_blink_write_mem(engine->blink, args[1], &hi, 4);
+            }
             WG_LOGI(TAG, "GetFileSize(0x%X) -> %u", args[0], (uint32_t)ret_val);
+        } else if (strcmp(fn, "GetFileSizeEx") == 0) {
+            // BOOL GetFileSizeEx(HANDLE, PLARGE_INTEGER lpFileSize)
+            // R1S stub never wrote the size — caller read stack garbage and
+            // tried to allocate it (Steam: 563MB OOM). Write the real size.
+            uint32_t sz = wg_files_get_size(args[0]);
+            if (args[1] > 0x10000u && args[1] < 0xF0000000u) {
+                uint64_t sz64 = (uint64_t)sz; // low + high dwords
+                wg_blink_write_mem(engine->blink, args[1], &sz64, 8);
+            }
+            ret_val = 1;
+            WG_LOGI(TAG, "GetFileSizeEx(0x%X) -> %u bytes", args[0], sz);
         } else if (strcmp(fn, "SetFilePointer") == 0) {
             // Detect when NSIS finishes its truncated copy and patch the .tmp
             // Track seeks on the data .tmp to know extraction offsets.
@@ -2957,21 +3903,281 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     case 22: ws_fn = "shutdown"; break;
                     case 23: ws_fn = "socket"; break;
                     case 52: ws_fn = "gethostbyname"; break;
-                    case 111: ws_fn = "WSAEnumNetworkEvents"; break;
-                    case 112: ws_fn = "WSAEventSelect"; break;
-                    case 113: ws_fn = "WSAGetLastError"; break;
+                    // WS2_32 fixed ordinals (Microsoft): 111=WSAGetLastError,
+                    // 112=WSASetLastError. WSAEnumNetworkEvents/WSAEventSelect are
+                    // imported by NAME, not these ordinals — the old mapping made
+                    // Steam's post-connect WSAGetLastError() run the wrong handler
+                    // and crash.
+                    case 111: ws_fn = "WSAGetLastError"; break;
+                    case 112: ws_fn = "WSASetLastError"; break;
+                    case 151: ws_fn = "__WSAFDIsSet"; break; // FD_ISSET backing fn
                     case 115: ws_fn = "WSAStartup"; break;
                     case 116: ws_fn = "WSACleanup"; break;
                     case 1142: ws_fn = "WSAStartup"; break; // WSOCK32
                     default: break;
                 }
             }
-            uint64_t ws_ret = 0;
-            WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
-            if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
-                ret_val = ws_ret;
+            // Intercept WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER
+            // to return thunk addresses for ConnectEx, DisconnectEx, etc.
+            bool ws_handled = false;
+            if (strcmp(ws_fn, "WSAIoctl") == 0 && args[1] == 0xC8000006) {
+                uint8_t guid[16] = {0};
+                if (args[2] && args[3] >= 16)
+                    wg_blink_read_mem(engine->blink, args[2], guid, 16);
+                static const uint8_t CONNECTEX_GUID[]    = {0xb9,0x07,0xa2,0x25,0xf3,0xdd,0x60,0x46,0x8e,0xe9,0x76,0xe5,0x8c,0x74,0x06,0x3e};
+                static const uint8_t DISCONNECTEX_GUID[] = {0x11,0x2e,0xda,0x7f,0x30,0x86,0x6f,0x43,0xa0,0x31,0xf5,0x36,0xa6,0xee,0xc1,0x57};
+                static const uint8_t ACCEPTEX_GUID[]     = {0xb5,0x36,0x7e,0xb1,0x11,0xab,0x0f,0x00,0xd9,0xc9,0x00,0xa0,0x24,0x16,0x09,0x93};
+                const char *ext = NULL;
+                if (memcmp(guid, CONNECTEX_GUID, 16) == 0)    ext = "ConnectEx";
+                else if (memcmp(guid, DISCONNECTEX_GUID, 16) == 0) ext = "DisconnectEx";
+                else if (memcmp(guid, ACCEPTEX_GUID, 16) == 0)     ext = "AcceptEx";
+                if (ext) {
+                    uint64_t thunk = wg_dll_mapper_find_any(engine->dll_mapper, ext);
+                    if (!thunk) thunk = wg_dll_mapper_resolve(engine->dll_mapper, "WS2_32.dll", ext);
+                    if (thunk >= 0xC00000 && thunk < 0xC20000) {
+                        uint8_t hlt = 0xF4;
+                        wg_blink_write_mem(engine->blink, (uint32_t)thunk, &hlt, 1);
+                    }
+                    uint32_t addr = (uint32_t)thunk;
+                    if (args[4] && args[5] >= 4)
+                        wg_blink_write_mem(engine->blink, args[4], &addr, 4);
+                    if (args[6]) { uint32_t r = 4; wg_blink_write_mem(engine->blink, args[6], &r, 4); }
+                    WG_LOGI(TAG, "WSAIoctl: %s -> thunk 0x%X", ext, addr);
+                    ret_val = 0;
+                    ws_handled = true;
+                }
+            }
+
+            if (!ws_handled) {
+                uint64_t ws_ret = 0;
+                WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
+                // Diagnostic: a send on socket 0 is the symptom of Steam's TCP
+                // layer bailing. Dump the guest caller chain so we can see which
+                // code path issues it (real TLS send vs assert/cleanup).
+                if (strcmp(ws_fn, "send") == 0 && args[0] == 0) {
+                    uint32_t ebp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                    WG_LOGW(TAG, "send(s=0!) buf=0x%X len=0x%X flags=0x%X — caller chain:",
+                            args[1], args[2], args[3]);
+                    for (int fi = 0; fi < 12 && ebp > 0x10000 && ebp < 0xF0000000u; fi++) {
+                        uint32_t ra = 0, prev = 0;
+                        wg_blink_read_mem(engine->blink, ebp + 4, &ra, 4);
+                        wg_blink_read_mem(engine->blink, ebp, &prev, 4);
+                        WG_LOGW(TAG, "  [%d] EBP=0x%X ret=0x%X", fi, ebp, ra);
+                        if (prev <= ebp || prev == 0) break;
+                        ebp = prev;
+                    }
+                }
+                if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
+                    ret_val = ws_ret;
+                    // If the socket has an OVERLAPPED argument and the call succeeded,
+                    // post an IOCP completion so GetQueuedCompletionStatus fires.
+                    // ConnectEx: args[6]=overlapped, success = ret==1
+                    if (strcmp(ws_fn, "ConnectEx") == 0 && ws_ret == 1 && args[6]) {
+                        uint32_t ckey = iocp_comp_key(args[0]);
+                        iocp_post(0, ckey, args[6]);
+                        wg_sched_wake(engine->scheduler, WG_IOCP_HANDLE);
+                        // Write STATUS_SUCCESS to OVERLAPPED so polling code sees completion.
+                        uint32_t zero = 0;
+                        wg_blink_write_mem(engine->blink, args[6] + 0, &zero, 4); // Internal
+                        wg_blink_write_mem(engine->blink, args[6] + 4, &zero, 4); // InternalHigh
+                        // Windows ConnectEx with IOCP returns FALSE + ERROR_IO_PENDING
+                        wg_winsock_set_last_error(engine->winsock, 997 /*ERROR_IO_PENDING*/);
+                        ret_val = 0; // FALSE = async
+                    }
+                    // WSASend: args[0]=socket, args[5]=overlapped, success = ret==0
+                    else if ((strcmp(ws_fn, "WSASend") == 0 || strcmp(ws_fn, "WSASendTo") == 0)
+                             && ws_ret == 0 && args[5]) {
+                        uint32_t bytes = 0;
+                        if (args[3]) wg_blink_read_mem(engine->blink, args[3], &bytes, 4);
+                        uint32_t ckey = iocp_comp_key(args[0]);
+                        iocp_post(bytes, ckey, args[5]);
+                        wg_sched_wake(engine->scheduler, WG_IOCP_HANDLE);
+                        uint32_t zero = 0;
+                        wg_blink_write_mem(engine->blink, args[5] + 0, &zero, 4);
+                        wg_blink_write_mem(engine->blink, args[5] + 4, &bytes, 4);
+                        wg_winsock_set_last_error(engine->winsock, 997);
+                        ret_val = (uint64_t)(uint32_t)-1; // SOCKET_ERROR
+                    }
+                    // WSARecv: args[0]=socket, args[5]=overlapped, success = ret==0
+                    else if ((strcmp(ws_fn, "WSARecv") == 0 || strcmp(ws_fn, "WSARecvFrom") == 0)
+                             && ws_ret == 0 && args[5]) {
+                        uint32_t bytes = 0;
+                        if (args[3]) wg_blink_read_mem(engine->blink, args[3], &bytes, 4);
+                        uint32_t ckey = iocp_comp_key(args[0]);
+                        iocp_post(bytes, ckey, args[5]);
+                        wg_sched_wake(engine->scheduler, WG_IOCP_HANDLE);
+                        uint32_t zero = 0;
+                        wg_blink_write_mem(engine->blink, args[5] + 0, &zero, 4);
+                        wg_blink_write_mem(engine->blink, args[5] + 4, &bytes, 4);
+                        wg_winsock_set_last_error(engine->winsock, 997);
+                        ret_val = (uint64_t)(uint32_t)-1; // SOCKET_ERROR
+                    }
+                } else {
+                    WG_LOGW(TAG, "WS2_32 unhandled: %s", ws_fn);
+                }
+            }
+        }
+
+        // WINHTTP.dll dispatch
+        if (engine->winhttp && entry && entry->dll_name &&
+            strcasecmp(entry->dll_name, "winhttp.dll") == 0) {
+            uint64_t wh_ret = 0;
+            if (wg_winhttp_handle(engine->winhttp, fn, args, &wh_ret, engine->blink)) {
+                ret_val = wh_ret;
             } else {
-                WG_LOGW(TAG, "WS2_32 unhandled: %s", ws_fn);
+                WG_LOGW(TAG, "WINHTTP unhandled: %s", fn);
+            }
+        }
+
+        // SECUR32.dll / SCHANNEL dispatch — TLS via SecureTransport
+        if (engine->schannel && entry && entry->dll_name &&
+            (strcasecmp(entry->dll_name, "secur32.dll") == 0 ||
+             strcasecmp(entry->dll_name, "sspicli.dll") == 0 ||
+             strcasecmp(entry->dll_name, "schannel.dll") == 0)) {
+            uint64_t sc_ret = 0;
+            if (wg_schannel_handle(engine->schannel, fn, args, &sc_ret, engine->blink)) {
+                ret_val = sc_ret;
+            } else {
+                WG_LOGW(TAG, "SECUR32 unhandled: %s", fn);
+            }
+        }
+
+        // WININET.dll dispatch — connectivity checks + HTTP via WinHTTP backend
+        if (entry && entry->dll_name &&
+            strcasecmp(entry->dll_name, "wininet.dll") == 0) {
+            WG_LOGI(TAG, "WININET: %s", fn);
+            if (strcmp(fn, "InternetGetConnectedState") == 0 ||
+                strcmp(fn, "InternetGetConnectedStateExW") == 0) {
+                // Report "connected via LAN"
+                if (args[0]) {
+                    uint32_t flags = 0x01; // INTERNET_CONNECTION_LAN
+                    wg_blink_write_mem(engine->blink, args[0], &flags, 4);
+                }
+                ret_val = 1; // TRUE = connected
+            } else if (strcmp(fn, "InternetAttemptConnect") == 0) {
+                ret_val = 0; // ERROR_SUCCESS
+            } else if (strcmp(fn, "InternetCheckConnectionA") == 0 ||
+                       strcmp(fn, "InternetCheckConnectionW") == 0) {
+                ret_val = 1; // TRUE = connected
+            } else if (strcmp(fn, "InternetOpenA") == 0 ||
+                       strcmp(fn, "InternetOpenW") == 0) {
+                uint64_t wh_ret = 0;
+                const char *mapped_fn = "WinHttpOpen";
+                if (engine->winhttp && wg_winhttp_handle(engine->winhttp, mapped_fn, args, &wh_ret, engine->blink))
+                    ret_val = wh_ret;
+                else
+                    ret_val = 0x5000; // fake session handle
+            } else if (strcmp(fn, "InternetConnectA") == 0 ||
+                       strcmp(fn, "InternetConnectW") == 0) {
+                uint64_t wh_ret = 0;
+                if (engine->winhttp && wg_winhttp_handle(engine->winhttp, "WinHttpConnect", args, &wh_ret, engine->blink))
+                    ret_val = wh_ret;
+                else
+                    ret_val = 0x5001;
+            } else if (strcmp(fn, "InternetCloseHandle") == 0) {
+                uint64_t wh_ret = 0;
+                if (engine->winhttp) wg_winhttp_handle(engine->winhttp, "WinHttpCloseHandle", args, &wh_ret, engine->blink);
+                ret_val = 1;
+            } else if (strcmp(fn, "InternetSetStatusCallbackA") == 0 ||
+                       strcmp(fn, "InternetSetStatusCallbackW") == 0) {
+                ret_val = 0; // NULL = no previous callback
+            }
+        }
+
+        // IPHLPAPI.dll dispatch — network adapter enumeration
+        if (entry && entry->dll_name &&
+            strcasecmp(entry->dll_name, "IPHLPAPI.DLL") == 0) {
+            WG_LOGI(TAG, "IPHLPAPI: %s", fn);
+            if (strcmp(fn, "GetAdaptersAddresses") == 0) {
+                // GetAdaptersAddresses(Family, Flags, Reserved, AdapterAddresses, SizePointer)
+                // args[3]=pAdapterAddresses, args[4]=pSizePointer
+                // Build a minimal IP_ADAPTER_ADDRESSES at args[3]
+                uint32_t size_ptr = args[4];
+                uint32_t buf_ptr = args[3];
+                uint32_t avail = 0;
+                if (size_ptr) wg_blink_read_mem(engine->blink, size_ptr, &avail, 4);
+                uint32_t needed = 376; // approximate IP_ADAPTER_ADDRESSES size (32-bit)
+                if (!buf_ptr || avail < needed) {
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 111; // ERROR_BUFFER_OVERFLOW — tell caller how much to allocate
+                } else {
+                    // Write a fake adapter: Ethernet, status UP, has IPv4
+                    uint8_t aa[376];
+                    memset(aa, 0, sizeof(aa));
+                    // Length (offset 0)
+                    uint32_t len = needed;
+                    memcpy(aa + 0, &len, 4);
+                    // IfIndex (offset 4)
+                    uint32_t idx = 1;
+                    memcpy(aa + 4, &idx, 4);
+                    // Next (offset 8) = NULL (only one adapter)
+                    // AdapterName (offset 12) = pointer (we'll skip string pointers)
+                    // IfType (offset 260) = 6 (IF_TYPE_ETHERNET_CSMACD)
+                    uint32_t iftype = 6;
+                    memcpy(aa + 260, &iftype, 4);
+                    // OperStatus (offset 264) = 1 (IfOperStatusUp)
+                    uint32_t oper = 1;
+                    memcpy(aa + 264, &oper, 4);
+                    wg_blink_write_mem(engine->blink, buf_ptr, aa, needed);
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 0; // NO_ERROR
+                }
+            } else if (strcmp(fn, "GetAdaptersInfo") == 0) {
+                // GetAdaptersInfo(pAdapterInfo, pOutBufLen)
+                uint32_t size_ptr = args[1];
+                uint32_t buf_ptr = args[0];
+                uint32_t avail = 0;
+                if (size_ptr) wg_blink_read_mem(engine->blink, size_ptr, &avail, 4);
+                uint32_t needed = 640; // IP_ADAPTER_INFO size
+                if (!buf_ptr || avail < needed) {
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 111; // ERROR_BUFFER_OVERFLOW
+                } else {
+                    uint8_t ai[640];
+                    memset(ai, 0, sizeof(ai));
+                    // Type (offset 260) = MIB_IF_TYPE_ETHERNET (6)
+                    uint32_t iftype = 6;
+                    memcpy(ai + 260, &iftype, 4);
+                    // IpAddressList.IpAddress (offset 432) = "192.168.1.100"
+                    const char *ip = "192.168.1.100";
+                    memcpy(ai + 432, ip, strlen(ip));
+                    // IpAddressList.IpMask (offset 448) = "255.255.255.0"
+                    const char *mask = "255.255.255.0";
+                    memcpy(ai + 448, mask, strlen(mask));
+                    // GatewayList.IpAddress (offset 472) = "192.168.1.1"
+                    const char *gw = "192.168.1.1";
+                    memcpy(ai + 472, gw, strlen(gw));
+                    wg_blink_write_mem(engine->blink, buf_ptr, ai, needed);
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 0; // NO_ERROR
+                }
+            } else if (strcmp(fn, "GetNetworkParams") == 0) {
+                // GetNetworkParams(pFixedInfo, pOutBufLen)
+                uint32_t size_ptr = args[1];
+                uint32_t buf_ptr = args[0];
+                uint32_t avail = 0;
+                if (size_ptr) wg_blink_read_mem(engine->blink, size_ptr, &avail, 4);
+                uint32_t needed = 312; // FIXED_INFO size
+                if (!buf_ptr || avail < needed) {
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 111;
+                } else {
+                    uint8_t fi[312];
+                    memset(fi, 0, sizeof(fi));
+                    // DnsServerList.IpAddress (offset 260) = "8.8.8.8"
+                    const char *dns = "8.8.8.8";
+                    memcpy(fi + 260, dns, strlen(dns));
+                    wg_blink_write_mem(engine->blink, buf_ptr, fi, needed);
+                    if (size_ptr) wg_blink_write_mem(engine->blink, size_ptr, &needed, 4);
+                    ret_val = 0;
+                }
+            } else if (strcmp(fn, "GetBestInterface") == 0) {
+                // GetBestInterface(dwDestAddr, pdwBestIfIndex)
+                if (args[1]) {
+                    uint32_t ifidx = 1;
+                    wg_blink_write_mem(engine->blink, args[1], &ifidx, 4);
+                }
+                ret_val = 0; // NO_ERROR
             }
         }
     }
@@ -3127,6 +4333,60 @@ static void wg_setup_win32_teb(WGEngine *engine) {
     WG_LOGI(TAG, "Win32 TEB@0x%X PEB@0x%X fs-base set", teb, peb);
 }
 
+// Allocate a TEB for a newly-created thread. Each Windows thread MUST have its
+// own TEB: it carries the thread's stack bounds, ClientId, LastError, and TLS
+// pointer. Sharing the main TEB (the old behavior) corrupted per-thread state.
+// Shares the process PEB (read from the main TEB) and re-instantiates the static
+// TLS data block so __declspec(thread) data is per-thread too.
+static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
+                                    uint32_t stack_limit, uint32_t tid) {
+    WGPEImage *pe = engine->pe_image;
+    if (!pe || pe->is_64bit || !s_main_teb) return 0;
+
+    uint32_t teb = wg_guest_alloc(engine, 0x1000);
+    uint32_t tls_array = wg_guest_alloc(engine, 0x400);   // 256 TLS slots
+    if (!teb || !tls_array) return 0;
+
+    // Share the process PEB with the main thread.
+    uint32_t peb = 0;
+    wg_blink_read_mem(engine->blink, s_main_teb + 0x30, &peb, 4);
+
+    uint32_t v;
+    v = 0xFFFFFFFF; wg_blink_write_mem(engine->blink, teb + 0x00, &v, 4); // ExceptionList
+    wg_blink_write_mem(engine->blink, teb + 0x04, &stack_base, 4);        // StackBase
+    wg_blink_write_mem(engine->blink, teb + 0x08, &stack_limit, 4);       // StackLimit
+    wg_blink_write_mem(engine->blink, teb + 0x18, &teb, 4);               // Self
+    v = 0x1000; wg_blink_write_mem(engine->blink, teb + 0x20, &v, 4);     // ClientId.UniqueProcess
+    wg_blink_write_mem(engine->blink, teb + 0x24, &tid, 4);               // ClientId.UniqueThread
+    wg_blink_write_mem(engine->blink, teb + 0x2C, &tls_array, 4);         // ThreadLocalStoragePointer
+    wg_blink_write_mem(engine->blink, teb + 0x30, &peb, 4);               // PEB
+    v = 0; wg_blink_write_mem(engine->blink, teb + 0x34, &v, 4);          // LastErrorValue
+
+    // Per-thread static TLS data block (__declspec(thread)). Re-instantiate from
+    // the PE TLS directory template so each thread has its own copy.
+    if (pe->tls_rva) {
+        uint32_t image_base = (uint32_t)pe->image_base;
+        uint32_t tls[6] = {0};
+        wg_blink_read_mem(engine->blink, image_base + pe->tls_rva, tls, 24);
+        uint32_t raw_start = tls[0], raw_end = tls[1], zerofill = tls[4];
+        uint32_t tpl = (raw_end > raw_start) ? raw_end - raw_start : 0;
+        uint32_t data_size = tpl + zerofill; if (!data_size) data_size = 4;
+        uint32_t tls_data = wg_guest_alloc(engine, data_size);
+        if (tls_data && tpl) {
+            uint8_t *tmp = malloc(tpl);
+            if (tmp) {
+                wg_blink_read_mem(engine->blink, raw_start, tmp, tpl);
+                wg_blink_write_mem(engine->blink, tls_data, tmp, tpl);
+                free(tmp);
+            }
+        }
+        wg_blink_write_mem(engine->blink, tls_array, &tls_data, 4);   // array[0]
+    }
+
+    WG_LOGI(TAG, "Thread TEB@0x%X tid=0x%X stack=0x%X-0x%X", teb, tid, stack_limit, stack_base);
+    return teb;
+}
+
 static bool load_pe_blink(WGEngine *engine) {
     WGPEImage *pe = engine->pe_image;
 
@@ -3202,6 +4462,18 @@ static bool load_pe_blink(WGEngine *engine) {
     // Set up the Win32 thread environment (TEB/PEB/TLS + FS base) so real MSVC
     // CRT startup (steam.exe) doesn't fault reading fs:[…].
     wg_setup_win32_teb(engine);
+
+    // Map the getaddrinfo result scratch region (1MB @ 0xB00000) for THIS VM.
+    // wg_winsock serializes addrinfo chains here; it must be mapped per VM (the
+    // blink VM is recreated per PE load, so a one-shot static flag in winsock
+    // would skip re-mapping on the 2nd load and the guest faults reading it).
+    {
+        uint8_t *zeros = calloc(1, 0x100000);
+        if (zeros) {
+            wg_blink_load_code(engine->blink, 0x00B00000u, zeros, 0x100000u, 0);
+            free(zeros);
+        }
+    }
 
     // Map zero pages so reads from unmapped addresses return 0 instead of
     // faulting. Real Windows catches these via SEH; without it, programs
@@ -3347,6 +4619,12 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     memset(s_fls_slots, 0, sizeof(s_fls_slots));
     s_event_next = 0;
     memset(s_event_signalled, 0, sizeof(s_event_signalled));
+    memset(s_event_manual, 0, sizeof(s_event_manual));
+    s_tmsg_head = 0; s_tmsg_tail = 0;
+    s_comp_head = 0; s_comp_tail = 0;
+    s_iocp_binding_count = 0;
+    s_iocp_created = false;
+    s_tp_work_count = 0;
     s_alloc_count = 0;
     s_cmdpage_mapped = false;
     wg_bitmap_reset_all();

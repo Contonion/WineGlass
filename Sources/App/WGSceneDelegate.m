@@ -233,7 +233,20 @@
 // Run the emulator on a dedicated high-priority thread at full speed, decoupled
 // from the 60 Hz render loop (previously the engine only ticked once per frame).
 - (void)startEngineThread {
-    _engineThreadRunning = NO;            // signal any prior loop to exit
+    // Signal any prior engine loop to exit AND wait for it to actually finish
+    // before starting a new one. Without the wait, the old thread never observes
+    // the stop flag (it gets reset to YES on the next line) and keeps ticking the
+    // same blink VM as the new thread — a data race on the guest heap that
+    // corrupts libsystem_malloc (EXC_BREAKPOINT) and double-runs the program.
+    _engineThreadRunning = NO;
+    NSThread *prior = _engineThread;
+    if (prior && prior != [NSThread currentThread]) {
+        // Bounded wait so a wedged tick can't freeze the UI indefinitely.
+        for (int i = 0; i < 2000 && !prior.isFinished; i++)
+            usleep(1000); // up to ~2s
+        if (!prior.isFinished)
+            WG_LOGW("App", "Prior engine thread did not stop in time — proceeding");
+    }
     _engineThreadRunning = YES;
     _engineThread = [[NSThread alloc] initWithTarget:self
                                             selector:@selector(engineLoop)

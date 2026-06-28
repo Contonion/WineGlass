@@ -26,11 +26,13 @@ Native iOS (Metal rendering, file I/O, UIKit)
 ## Build System
 
 - **Xcode project** generated via `xcodegen` from `project.yml`
+- **IMPORTANT**: Run `xcodegen generate` after adding any new source files — missing files cause null-symbol crashes masked by `-undefined dynamic_lookup`
 - **Blink** is a separate build: clone github.com/jart/blink, configure with `--disable-jit --disable-threads --disable-sockets`, cross-compile for iOS arm64
 - **blink.a** + **wg_blink_impl.o** go in `Vendor/blink/lib/`
 - Blink headers in `Vendor/blink/include/blink/`
 - Link flags: `-force_load` is NOT used (causes blinkenlights symbols); use direct .o + .a in OTHER_LDFLAGS
 - `-Xlinker -undefined -Xlinker dynamic_lookup` for pthread_jit symbols
+- **Security.framework** linked for SecureTransport (SSL/TLS)
 
 ## Key Design Decisions
 
@@ -46,6 +48,39 @@ Native iOS (Metal rendering, file I/O, UIKit)
 - `wsprintfW`/`wsprintfA` are cdecl (0 callee-cleaned args)
 - `handle_blink_thunk()` reads 32-bit stack args, dispatches by function name
 - Return value in EAX, stack cleaned: `RSP += ptr_size + (num_args * ptr_size)`
+- **Auto-stubs** for unknown functions get `num_args=0` — correct for cdecl but causes stack leak for stdcall functions with args (each call leaks 4*N bytes). Register critical functions with correct arg counts.
+
+### SSL/TLS Networking Stack (added 2026-06-23)
+Three-layer approach for HTTPS support:
+
+1. **WinHTTP** (`wg_winhttp.c`) — High-level HTTP client backed by raw sockets + Apple SecureTransport for TLS. Handles WinHttpOpen/Connect/OpenRequest/SendRequest/ReceiveResponse/ReadData. Follows redirects (301/302/303/307/308). Used when Steam calls WinHTTP directly.
+
+2. **Schannel/SSPI** (`wg_schannel.c`) — Windows SSPI interface for TLS, backed by SecureTransport with buffer-based IO. Handles AcquireCredentialsHandleW, InitializeSecurityContextW (incremental TLS handshake via buffered read/write callbacks), EncryptMessage, DecryptMessage. Used when Steam does raw socket + Schannel TLS.
+
+3. **Winsock extensions** — `ConnectEx` (async connect via `WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER`), `DisconnectEx`, `AcceptEx`. Steam uses `ConnectEx` instead of plain `connect()` for async TCP connections.
+
+**SecureTransport** is deprecated (iOS 13+) but still functional. Pragmas suppress warnings. The C API is the only TLS option from plain C code without Objective-C bridging.
+
+### Steam Bootstrapper Requirements (discovered 2026-06-23)
+Steam's bootstrapper (steam.exe) performs these checks before attempting downloads:
+1. **Directory writable** — Opens `C:\package\.writable`, calls `GetFileType`. Must return `FILE_TYPE_DISK` (1), not `FILE_TYPE_UNKNOWN` (0).
+2. **Network adapter present** — Calls `GetAdaptersAddresses` or `GetAdaptersInfo` from `IPHLPAPI.DLL`. Must return at least one adapter with OperStatus=UP.
+3. **Disk space** — Calls `GetDiskFreeSpaceExW`. Must return non-zero free space.
+4. **Network connectivity** — May call `InternetGetConnectedState` from `wininet.dll`.
+
+If ANY check fails, Steam logs the error to `C:\package\bootstrap_log.txt` (handle 0x112) and exits with code -1 (~61196 ticks).
+
+Steam downloads from: `https://cdn.steamstatic.com/client/steam_client_win32`
+
+### CRT Initialization Requirements
+Steam's MSVC CRT calls many functions during initialization that MUST write to output buffers (not just return success):
+- **`GetStringTypeW`** — Must write character type classification (CT_CTYPE1) to output WORD array. Crash if output is garbage.
+- **`LCMapStringW/Ex`** — Must copy/transform string to output buffer and return length.
+- **`GetCPInfo`** — Must write CPINFO struct (MaxCharSize, DefaultChar, LeadByte).
+- **`GetStartupInfoW`** — Must write zeroed STARTUPINFOW (68 bytes) with cb field set.
+- **`InitOnceBeginInitialize`** — R1S stub is OK (fPending stays as stack value, happens to work). DO NOT add engine handler that writes fPending=TRUE — it changes CRT init path and causes crashes.
+- **`InitializeCriticalSectionEx`** — R1S stub is OK. DO NOT add engine handler that writes to CRITICAL_SECTION — it corrupts adjacent data.
+- **`LoadLibraryExW('')`** — Empty string must return main module handle (image_base), NOT a fake DLL handle.
 
 ### NSIS Installer Data Decompression
 - NSIS uses one continuous LZMA stream for the outer compression
@@ -62,6 +97,13 @@ Native iOS (Metal rendering, file I/O, UIKit)
 - Auto-creates parent directories for CREATE_ALWAYS/OPEN_ALWAYS
 - `GetTempFileNameW` creates the actual file on disk (Windows behavior NSIS depends on)
 - Null handles (`fp == NULL`) silently discard writes, return zeros on read
+- **WriteFile** succeeds silently for unknown handles (stdout 0xF1, stderr 0xF2, pipes 0x7301) to prevent thread crashes
+- **GetFileType** returns `FILE_TYPE_DISK` (1) for handles in range 0x100-0x1FF
+
+### Bottle System
+- Persistent `drive_c` prefix at `{Documents}/Bottle/drive_c/`
+- All `C:\` paths map under the bottle
+- Steam installs go there, not scattered temp
 
 ### Window Management & Rendering
 - `WGWindowManager` tracks HWNDs, positions, sizes, titles, visibility
@@ -85,7 +127,7 @@ Native iOS (Metal rendering, file I/O, UIKit)
 ## Source File Guide
 
 ### Sources/Core/
-- `wg_engine.c` (1043 lines) — Main orchestrator. PE loading, blink VM lifecycle, Win32 thunk dispatch, NSIS data patching. Contains ALL explicit Win32 API handlers.
+- `wg_engine.c` — Main orchestrator. PE loading, blink VM lifecycle, Win32 thunk dispatch, NSIS data patching. Contains ALL explicit Win32 API handlers including networking dispatch (WS2_32, WinHTTP, Schannel, WinINet, IPHLPAPI).
 - `wg_blink_bridge.c` — Bridge between WineGlass and blink. Extern declarations for WGBlinkVM_* symbols. Abort recovery via sigsetjmp.
 - `wg_blink_stubs.c` — Overrides for blink's Abort() and TerminateSignal(). WriteErrorString capture.
 - `wg_selftest.c` — 66 tests: decoder, interpreter, PE parser, blink execution, PE with imports
@@ -100,10 +142,16 @@ Native iOS (Metal rendering, file I/O, UIKit)
 - `wg_x86_state.c` — CPU state: 16 GPRs, RFLAGS, XMM, FPU. Flag computation for add/sub/logic.
 
 ### Sources/Win32/
-- `wg_dll_mapper.c` — Win32 stub registry. 190+ functions across 7 DLLs. Each entry has name, thunk address, handler function, num_args.
+- `wg_dll_mapper.c` — Win32 stub registry. 600+ functions across 15+ DLLs. Each entry has name, thunk address, handler function, num_args.
+- `wg_winsock.c` — Winsock (WS2_32/WSOCK32) implementation. Real BSD sockets mapped via handle table. Supports socket/connect/send/recv/select/getaddrinfo/ConnectEx. Handle base 0x1000, max 128 sockets.
+- `wg_winhttp.c` — WinHTTP API implementation. HTTP client with TLS via SecureTransport. Handle table at base 0x3000, max 16 slots. Supports WinHttpOpen through WinHttpReadData + URL cracking + redirects.
+- `wg_schannel.c` — Schannel/SSPI implementation. TLS via SecureTransport with buffer-based IO callbacks bridging SSPI's incremental handshake model. Supports AcquireCredentialsHandle, InitializeSecurityContext, EncryptMessage, DecryptMessage.
 - `wg_win32_windows.c` — Window manager. HWND table, create/show/destroy/set_text.
 - `wg_win32_files.c` — File handle table backed by fopen/fread/fwrite. Path mapping, null handles, NSIS data prepopulation.
-- `wg_nsis_extract.c` — Native NSIS file extraction. Outer LZMA stream decompression via Apple Compression framework. Individual file block extraction.
+- `wg_win32_gdi.c` — GDI stubs.
+- `wg_win32_bitmap.c` — Bitmap handling.
+- `wg_nsis_extract.c` — Native NSIS file extraction. Outer LZMA stream decompression via Apple Compression framework.
+- `wg_threading.c` — Thread scheduler. Cooperative multithreading with per-thread TEB, stack, register save/restore. Max 8 threads.
 
 ### Sources/Graphics/
 - `WGCompositor.m` — Metal compositor. Renders window rectangles with title bars, close buttons, shadows. Text via UIGraphicsImageRenderer → Metal texture.
@@ -122,62 +170,37 @@ Native iOS (Metal rendering, file I/O, UIKit)
 - `lib/wg_blink_impl.o` — Prebuilt bridge object (not in git)
 - `include/` — Blink headers (83 files)
 
+## DLL Stub Registry
+
+### Registered DLLs (wg_dll_mapper.c)
+- KERNEL32.dll (~200 functions)
+- USER32.dll (~70 functions)
+- GDI32.dll (~20 functions)
+- ADVAPI32.dll (~15 functions)
+- SHELL32.dll, ole32.dll, OLEAUT32.dll, COMCTL32.dll
+- WS2_32.dll / WSOCK32.dll (~30 functions + ConnectEx/DisconnectEx/AcceptEx)
+- winhttp.dll (18 functions)
+- wininet.dll (26 functions)
+- crypt32.dll (14 functions)
+- secur32.dll / sspicli.dll / schannel.dll (SSPI functions)
+- bcrypt.dll (BCryptGenRandom with real arc4random)
+- IPHLPAPI.DLL (GetAdaptersAddresses/Info, GetNetworkParams, GetBestInterface)
+- vcruntime140.dll, ucrtbase.dll, msvcp140.dll (VC++ runtime stubs)
+- VERSION.dll, PSAPI.DLL
+
 ## Known Issues
 
 1. **CALL/RET test failure** (2 tests): TerminateSignal longjmp during RET-to-address-0 doesn't preserve register state for the instructions between CALL return and RET. Cosmetic — real programs use ExitProcess.
 
-2. **RESOLVED 2026-06-20 — blink decodes LZMA correctly.** The "interpreter
-   desync" theory below was DISPROVEN: CPU and memory conformance probes
-   (Tests/cpu_probe.c → 0x1FFFF all-pass; Tests/mem_probe.c → 0x800007FF
-   all-pass, including a 12MB allocation) showed blink's 32-bit interpreter is
-   accurate for every instruction class LZMA uses, AND for large allocations.
-   With our native-extraction interference removed and the GlobalAlloc
-   threshold raised so the 8MB LZMA dictionary allocates, SteamSetup's solid
-   stream decompresses correctly (full 32768-byte chunks, no corrupt sizes).
-   The real cause of every "Error decompressing data" was OUR own band-aids
-   (null handles discarding blink's correct output), not the emulator. The
-   installer now extracts data and reaches plug-in directory setup. Next
-   blockers are Win32 completeness (plug-in dir init, then the real UI).
-   The probes (WGProbe.exe/WGMem.exe) remain bundled, loadable via picker.
-
-   [HISTORICAL / WRONG] LZMA decompression desync — THE core blocker:
-   - SteamSetup.exe uses a SOLID raw-LZMA stream (props `5d`, 8MB dict). The
-     stream is 100% standard: Python's `lzma.FORMAT_RAW` decodes it cleanly to
-     7,931,223 bytes (203,614 header + 7,727,609 file data).
-   - blink decodes the EARLY part correctly (the dialog, control IDs, strings,
-     fonts all come from the decompressed header and render fine) then desyncs
-     DETERMINISTICALLY — same wrong value (`GlobalAlloc(2174029109)`) every run.
-   - It is NOT JIT: blink.a was built with DISABLE_JIT (exports
-     `_JitlessDispatch`, no Jitter symbols). It runs the INTERPRETER. So the
-     desync is an interpreter accuracy bug on some instruction in LZMA's hot
-     loop, data-dependent, only hit by heavy decode work.
-   - Apple's `COMPRESSION_LZMA` only reads the .xz/.lzma CONTAINER, NOT a raw
-     NSIS stream — native bypass via libcompression is impossible. Would need
-     to bundle LzmaDec.c (LZMA SDK, public domain) for native decode.
-   - Output-redirection CANNOT fix it: NSIS reads its control values (block
-     sizes, file table) directly from the decoder's output, so a desynced
-     decoder makes NSIS take wrong branches regardless of what's written to
-     disk. The only real fixes are (a) fix blink's interpreter, or (b) fully
-     reimplement NSIS extraction natively (and skip running its x86 extractor).
-   - The previous "native extraction" interception was REMOVED — it returned
-     null handles that discarded blink's (correct, early) output and made
-     things worse.
-
-3. **VALIDATED 2026-06-20**: The window + GDI + Metal compositor + message-loop
-   pipeline works end-to-end on device. `Tests/gdi_test.c` (a controlled
-   straight-line 32-bit PE built with mingw-w64 i686) renders a window with
-   FillRect/TextOutW/LineTo content on the iPhone. This proves blink's 32-bit
-   interpreter is correct for straight-line code; only the heavy LZMA loop
-   desyncs. Build it with: `i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib
-   -fno-builtin -e _start_ -Wl,--subsystem,windows -o WGTest.exe gdi_test.c
-   -lkernel32 -luser32 -lgdi32`. It is bundled in the app (Resources/) and
-   loaded preferentially by tryLoadBundledPE during this validation phase.
+2. **Steam networking in progress**: Steam reaches "Checking for available update" and creates a download thread. WSAStartup, socket creation, and ConnectEx resolution work. Next: verify ConnectEx TCP connections complete and Schannel TLS handshake succeeds for `cdn.steamstatic.com:443`.
 
 3. **System.dll loading**: NSIS extracts System.dll successfully (23KB) but can't LoadLibrary it (we return a fake module handle). System::Call functionality is stubbed.
 
 4. **First-run warm-up**: First x86 execution on a new blink VM triggers an abort (page fault during JIT init even with JIT disabled). Absorbed by a NOP+RET warm-up before real execution.
 
 5. **GlobalAlloc heap exhaustion**: Static heap pointer at 0x10000000 never resets within a session. Large allocations (>16MB) are failed to prevent corrupt-size crashes.
+
+6. **CRT init sensitivity**: Adding engine handlers for InitOnceBeginInitialize, InitializeCriticalSectionEx, or EnterCriticalSection causes crashes by changing CRT initialization paths. The R1S/RS stub defaults work. Only add engine handlers for functions that MUST write output buffers (GetStringTypeW, GetCPInfo, LCMapStringW, GetStartupInfoW).
 
 ## Testing
 
@@ -193,33 +216,25 @@ xcodegen generate
 # Open WineGlass.xcodeproj, set team, build for device
 ```
 
-## Steam Installer Execution Trace
+## Steam Bootstrapper Execution Trace
 
-SteamSetup.exe (32-bit NSIS installer, 2.3MB) executes ~10,000 ticks:
-1. SetErrorMode, GetVersion — init
-2. GetProcAddress(SetDefaultDllDirectories) — security
-3. LoadLibraryExW × 9 — system DLL loading
-4. GetProcAddress(GetFileVersionInfoW, SHGetFolderPathW) — version/shell
-5. OleInitialize, SHGetFileInfoW — COM init
-6. CreateFileW('C:\a.exe') → opens real .exe on iOS filesystem
-7. GetFileSize → 2,380,800 bytes
-8. ReadFile × hundreds — reads installer data (512-byte blocks, then 32KB chunks)
-9. WriteFile × many — decompresses and writes data to .tmp
-10. CreateDialogParamW × 7, ShowWindow × 7 — creates installer UI
-11. GlobalAlloc (200KB + 52KB + 8MB) — decompression buffers
-12. GetUserDefaultUILanguage — language detection
-13. SetWindowTextW — sets "Steam Setup" title
-14. RegOpenKeyExW, RegQueryValueExW — registry checks
-15. CreateDirectoryW — creates plugin directory
-16. System.dll extracted (23,400 bytes) ← LZMA decompression works for this file
-17. DialogBoxParamW → calls dialog proc with WM_INITDIALOG
-18. GetDlgItem, SetDlgItemTextW, CreateFontIndirectW — populates dialog controls
-19. modern-header.bmp extraction (fails due to LZMA state corruption)
-20. "Steam Setup" window rendered via Metal compositor on iPhone screen
+Steam.exe (32-bit PE, ~4MB, 5 sections) executes as follows:
+1. CRT init: LoadLibraryExW(api-ms-win-core-*), GetProcAddress for InitializeCriticalSectionEx/FlsAlloc/FlsSetValue
+2. CRT locale: GetACP→1252, GetCPInfo, GetStringTypeW, LCMapStringEx, MultiByteToWideChar
+3. Startup: GetCommandLineA/W, GetStartupInfoW, GetStdHandle×3
+4. UI setup: CreateWindowExW, SetWindowTextW("Updating Steam..."), SetDlgItemTextW("Checking for available update...")
+5. Pre-flight checks:
+   - CreateFileW("C:\package\.writable") + GetFileType → must return FILE_TYPE_DISK
+   - GetDiskFreeSpaceExW → must return non-zero space
+   - IPHLPAPI GetAdaptersAddresses → must return active adapter
+6. Download thread: CreateThread → WSAStartup → socket → WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER/ConnectEx)
+7. Manifest download: ConnectEx to cdn.steamstatic.com:443 → Schannel TLS → HTTP GET /client/steam_client_win32
+8. Thread 1 polls via Sleep loop waiting for download completion
 
 ## Environment
 
 - macOS (Tahoe/Sequoia) with Xcode 27 beta
-- iOS 27 on iPhone 15 Pro (A17 Pro, Apple GPU family 9)
+- iOS 27 on iPhone (A17 Pro, Apple GPU family 9)
 - Blink from github.com/jart/blink (ISC license)
 - Apple Compression framework for native LZMA
+- Apple Security framework for SecureTransport TLS

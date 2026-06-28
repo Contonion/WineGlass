@@ -127,11 +127,14 @@ bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink) {
         int idx = (start + i) % WG_MAX_THREADS;
         WGThread *t = &sched->threads[idx];
         if (t->state == WG_THREAD_READY) {
+            int prev = sched->current;
             sched->current = idx;
             t->state = WG_THREAD_RUNNING;
             restore_regs(&t->regs, blink);
-            WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
-                    idx, t->id, t->regs.rip);
+            // Only log real context switches, not self-reswitches in a spin loop.
+            if (prev != idx)
+                WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
+                        idx, t->id, t->regs.rip);
             return true;
         }
     }

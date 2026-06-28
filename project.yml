@@ -56,4 +56,5 @@ targets:
       - UIKit.framework
       - GameController.framework
       - CoreHaptics.framework
+      - Security.framework
     libraries: []

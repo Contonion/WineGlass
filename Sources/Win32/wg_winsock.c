@@ -78,6 +78,7 @@ struct WGWinsock {
     // Map Windows SOCKET values to real fds. Windows SOCKETs in 32-bit
     // are unsigned ints; we use a small table indexed by (handle - base).
     int  fds[WG_MAX_SOCKETS]; // -1 = unused
+    bool connect_reported[WG_MAX_SOCKETS]; // FD_CONNECT delivered once per socket
 };
 
 #define SOCK_BASE 0x1000u
@@ -140,35 +141,66 @@ static int errno_to_wsa(int e) {
 }
 
 // ── Win32 sockaddr ↔ BSD sockaddr conversion ────────────────────────
-// Windows sockaddr_in is identical to BSD (sa_family at +0 as uint16_t,
-// port at +2, addr at +4). sockaddr_in6 is also layout-compatible.
+// Windows sockaddr_in has a 16-bit sa_family at +0 (no length byte). BSD/iOS
+// sockaddr_in has sin_len@0 + sin_family@1. port@2 and addr@4 match. So a raw
+// copy turns Win32 family=2 into BSD sin_len=2, sin_family=0 (AF_UNSPEC) — which
+// makes connect()/bind() fail with af=0. Convert the family field explicitly.
 
 static void read_sockaddr(void *blink, uint32_t guest_ptr, int len,
                           struct sockaddr_storage *out, socklen_t *outlen) {
     memset(out, 0, sizeof(*out));
     if (!guest_ptr || len <= 0) { *outlen = 0; return; }
     if (len > (int)sizeof(*out)) len = (int)sizeof(*out);
-    wg_blink_read_mem(blink, guest_ptr, out, len);
-    // Windows AF_INET6 = 23, BSD AF_INET6 = 30 (on macOS/iOS)
-    if (((struct sockaddr *)out)->sa_family == WIN_AF_INET6)
-        ((struct sockaddr *)out)->sa_family = AF_INET6;
-    *outlen = (socklen_t)len;
+    uint8_t buf[sizeof(struct sockaddr_storage)] = {0};
+    wg_blink_read_mem(blink, guest_ptr, buf, len);
+    uint16_t win_fam = (uint16_t)(buf[0] | (buf[1] << 8)); // Win32 16-bit family
+    memcpy(out, buf, len);                                  // port@2 / addr@4 align
+    if (win_fam == 2) { // AF_INET
+        struct sockaddr_in *si = (struct sockaddr_in *)out;
+        si->sin_len = sizeof(struct sockaddr_in);
+        si->sin_family = AF_INET;
+        *outlen = sizeof(struct sockaddr_in);
+    } else if (win_fam == WIN_AF_INET6) { // Win AF_INET6=23 -> BSD 30
+        struct sockaddr_in6 *si6 = (struct sockaddr_in6 *)out;
+        si6->sin6_len = sizeof(struct sockaddr_in6);
+        si6->sin6_family = AF_INET6;
+        *outlen = sizeof(struct sockaddr_in6);
+    } else {
+        ((struct sockaddr *)out)->sa_family = (sa_family_t)win_fam;
+        *outlen = (socklen_t)len;
+    }
 }
 
 static void write_sockaddr(void *blink, uint32_t guest_ptr, uint32_t guest_len_ptr,
                            const struct sockaddr_storage *sa, socklen_t salen) {
     if (!guest_ptr || !guest_len_ptr) return;
-    // Fix AF back to Windows convention
-    struct sockaddr_storage tmp;
-    memcpy(&tmp, sa, salen > sizeof(tmp) ? sizeof(tmp) : salen);
-    if (((struct sockaddr *)&tmp)->sa_family == AF_INET6)
-        ((struct sockaddr *)&tmp)->sa_family = WIN_AF_INET6;
+    // Build a WIN32-layout sockaddr (2-byte family, no sin_len byte). A raw copy
+    // of the BSD struct would leave sin_len@0, so the guest reads family=0x0210.
+    uint8_t wsa[sizeof(struct sockaddr_storage)] = {0};
+    uint32_t wlen = salen;
+    if (sa->ss_family == AF_INET) {
+        const struct sockaddr_in *si = (const struct sockaddr_in *)sa;
+        wsa[0] = 2; wsa[1] = 0;                 // AF_INET (16-bit)
+        memcpy(wsa + 2, &si->sin_port, 2);      // port (net order) — offset matches
+        memcpy(wsa + 4, &si->sin_addr, 4);      // addr — offset matches
+        wlen = 16;
+    } else if (sa->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *si6 = (const struct sockaddr_in6 *)sa;
+        wsa[0] = (uint8_t)(WIN_AF_INET6 & 0xFF);
+        wsa[1] = (uint8_t)(WIN_AF_INET6 >> 8);  // family (23)
+        memcpy(wsa + 2,  &si6->sin6_port, 2);
+        memcpy(wsa + 4,  &si6->sin6_flowinfo, 4);
+        memcpy(wsa + 8,  &si6->sin6_addr, 16);
+        memcpy(wsa + 24, &si6->sin6_scope_id, 4);
+        wlen = 28;
+    } else {
+        memcpy(wsa, sa, salen > sizeof(wsa) ? sizeof(wsa) : salen);
+    }
     uint32_t buflen = 0;
     wg_blink_read_mem(blink, guest_len_ptr, &buflen, 4);
-    uint32_t copy = salen < buflen ? salen : buflen;
-    wg_blink_write_mem(blink, guest_ptr, &tmp, copy);
-    uint32_t written = salen;
-    wg_blink_write_mem(blink, guest_len_ptr, &written, 4);
+    uint32_t copy = wlen < buflen ? wlen : buflen;
+    wg_blink_write_mem(blink, guest_ptr, wsa, copy);
+    wg_blink_write_mem(blink, guest_len_ptr, &wlen, 4);
 }
 
 // ── Handler ─────────────────────────────────────────────────────────
@@ -209,6 +241,39 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     if (strcmp(fn, "WSASetLastError") == 0) {
         ws->last_error = (int)args[0];
         *out_ret = 0;
+        return true;
+    }
+
+    // ── inet_ntop(af, src, dst, size) -> dst (or NULL) ───────────────
+    // __stdcall/4 args. Must be handled (not auto-stubbed) or the wrong arg
+    // cleanup corrupts the guest stack for the NEXT call (e.g. connect af=0).
+    if (strcmp(fn, "inet_ntop") == 0 || strcmp(fn, "InetNtopA") == 0) {
+        int bsd_af = (args[0] == WIN_AF_INET6) ? AF_INET6 : (int)args[0];
+        int alen = (bsd_af == AF_INET6) ? 16 : 4;
+        uint8_t addr[16] = {0};
+        wg_blink_read_mem(blink, args[1], addr, alen);
+        char tmp[64] = {0};
+        if (inet_ntop(bsd_af, addr, tmp, sizeof(tmp))) {
+            uint32_t len = (uint32_t)strlen(tmp) + 1;
+            if (args[2] && len <= args[3]) {
+                wg_blink_write_mem(blink, args[2], tmp, len);
+                *out_ret = args[2]; // returns the dst pointer
+            } else { ws->last_error = WSAEINVAL; *out_ret = 0; }
+        } else { ws->last_error = WSAEINVAL; *out_ret = 0; }
+        WG_LOGI(TAG, "inet_ntop(af=%u) -> %s", args[0], tmp[0] ? tmp : "(fail)");
+        return true;
+    }
+
+    // ── inet_pton(af, src_str, dst) -> 1/0/-1 ────────────────────────
+    if (strcmp(fn, "inet_pton") == 0 || strcmp(fn, "InetPtonA") == 0) {
+        int bsd_af = (args[0] == WIN_AF_INET6) ? AF_INET6 : (int)args[0];
+        char str[128] = {0};
+        wg_blink_read_mem(blink, args[1], str, sizeof(str) - 1);
+        uint8_t addr[16] = {0};
+        int r2 = inet_pton(bsd_af, str, addr);
+        if (r2 == 1 && args[2])
+            wg_blink_write_mem(blink, args[2], addr, (bsd_af == AF_INET6) ? 16 : 4);
+        *out_ret = (uint32_t)r2;
         return true;
     }
 
@@ -255,9 +320,18 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         }
         int r = connect(fd, (struct sockaddr *)&sa, salen);
         if (r < 0) {
-            ws->last_error = errno_to_wsa(errno);
+            // Windows convention: a non-blocking connect that can't finish
+            // immediately reports WSAEWOULDBLOCK (BSD uses EINPROGRESS). Apps
+            // poll for FD_CONNECT after this; mapping it wrong looks like a hard
+            // failure and aborts the connection.
+            if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)
+                ws->last_error = WSAEWOULDBLOCK;
+            else
+                ws->last_error = errno_to_wsa(errno);
+            WG_LOGI(TAG, "connect -> in-progress/err errno=%d wsa=%u", errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
+            WG_LOGI(TAG, "connect -> immediate success");
             *out_ret = 0;
         }
         return true;
@@ -308,11 +382,55 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── select(nfds, readfds, writefds, exceptfds, timeout) ─────────
     if (strcmp(fn, "select") == 0) {
-        // Windows fd_set: { u_int fd_count; SOCKET fd_array[FD_SETSIZE]; }
-        // We only support small sets. For now, return immediately with
-        // all sockets ready (non-blocking check).
-        // TODO: proper select with real fd_sets
-        *out_ret = 1;
+        // Windows fd_set: { u_int fd_count; SOCKET fd_array[FD_SETSIZE(=64)]; }.
+        // select(nfds, readfds, writefds, exceptfds, timeout). Windows modifies
+        // each set in place to contain ONLY the ready sockets; the app then uses
+        // __WSAFDIsSet to test membership. We poll the real fds and rebuild each
+        // set. (Old stub returned 1 without marking which fd -> infinite re-select.)
+        uint32_t set_ptrs[3] = { args[1], args[2], args[3] }; // read, write, except
+        int total = 0;
+        for (int si = 0; si < 3; si++) {
+            if (!set_ptrs[si]) continue;
+            uint32_t fd_count = 0;
+            wg_blink_read_mem(blink, set_ptrs[si], &fd_count, 4);
+            if (fd_count > 64) fd_count = 64;
+            uint32_t arr[64] = {0};
+            if (fd_count) wg_blink_read_mem(blink, set_ptrs[si] + 4, arr, fd_count * 4);
+            uint32_t ready[64]; uint32_t rc = 0;
+            for (uint32_t i = 0; i < fd_count; i++) {
+                int fd = lookup_fd(ws, arr[i]);
+                if (fd < 0) continue;
+                struct pollfd pfd = { .fd = fd,
+                    .events = (short)(si == 0 ? POLLIN : si == 1 ? POLLOUT : POLLPRI),
+                    .revents = 0 };
+                poll(&pfd, 1, 0);
+                bool rdy = (si == 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) ||
+                           (si == 1 && (pfd.revents & POLLOUT)) ||
+                           (si == 2 && (pfd.revents & (POLLPRI | POLLERR)));
+                if (rdy) ready[rc++] = arr[i];
+            }
+            wg_blink_write_mem(blink, set_ptrs[si], &rc, 4);
+            if (rc) wg_blink_write_mem(blink, set_ptrs[si] + 4, ready, rc * 4);
+            total += (int)rc;
+        }
+        WG_LOGD(TAG, "select -> %d ready", total);
+        *out_ret = (uint32_t)total;
+        return true;
+    }
+
+    // ── __WSAFDIsSet(s, fd_set*) -> nonzero if s is a member ─────────
+    if (strcmp(fn, "__WSAFDIsSet") == 0) {
+        int found = 0;
+        if (args[1]) {
+            uint32_t fd_count = 0;
+            wg_blink_read_mem(blink, args[1], &fd_count, 4);
+            if (fd_count > 64) fd_count = 64;
+            uint32_t arr[64] = {0};
+            if (fd_count) wg_blink_read_mem(blink, args[1] + 4, arr, fd_count * 4);
+            for (uint32_t i = 0; i < fd_count; i++)
+                if (arr[i] == args[0]) { found = 1; break; }
+        }
+        *out_ret = (uint32_t)found;
         return true;
     }
 
@@ -325,6 +443,13 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         // Map Windows constants to BSD
         if (level == WIN_SOL_SOCKET) level = SOL_SOCKET;
         if (level == WIN_IPPROTO_TCP) level = IPPROTO_TCP;
+        // SO_UPDATE_CONNECT_CONTEXT (0x7010) — Windows-only, required after ConnectEx.
+        // We connect synchronously so no kernel state to update; just succeed.
+        if (level == SOL_SOCKET && opt == 0x7010) {
+            WG_LOGI(TAG, "setsockopt(SO_UPDATE_CONNECT_CONTEXT) -> 0 (no-op)");
+            *out_ret = 0;
+            return true;
+        }
         // Map option names
         int bsd_opt = opt;
         if (level == SOL_SOCKET) {
@@ -338,7 +463,11 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
                 case WIN_SO_SNDTIMEO:  bsd_opt = SO_SNDTIMEO; break;
                 case WIN_SO_RCVTIMEO:  bsd_opt = SO_RCVTIMEO; break;
                 case WIN_SO_ERROR:     bsd_opt = SO_ERROR; break;
-                default: break;
+                default:
+                    // Unknown Windows SOL_SOCKET option — silently succeed
+                    WG_LOGD(TAG, "setsockopt: unknown SOL_SOCKET opt=0x%X, ignoring", opt);
+                    *out_ret = 0;
+                    return true;
             }
         } else if (level == IPPROTO_TCP) {
             if (opt == WIN_TCP_NODELAY) bsd_opt = TCP_NODELAY;
@@ -511,11 +640,14 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             return true;
         }
 
-        // Serialize addrinfo chain into guest memory. Layout per node:
-        // Win32 addrinfo (32 bytes) + sockaddr data
-        // We'll use a bump allocator in a reserved guest region.
-        static uint32_t s_gai_ptr = 0xB00000;
-        uint32_t ptr = s_gai_ptr;
+        // Serialize addrinfo chain into the guest scratch region (1MB @
+        // 0xB00000). The ENGINE maps this region per VM load (load_pe_blink), so
+        // it's always valid for the current VM — a winsock-side one-shot static
+        // flag would skip re-mapping after a VM recreation and the guest would
+        // fault reading the result. Bump from the base each call (results are
+        // short-lived / freed before the next lookup).
+        #define WG_GAI_BASE 0x00B00000u
+        uint32_t ptr = WG_GAI_BASE;
         uint32_t prev_next = 0;
 
         for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
@@ -537,13 +669,35 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             aih[7] = next_ptr;
             wg_blink_write_mem(blink, node_base, aih, 32);
 
-            // Write sockaddr
+            // Write sockaddr in WIN32 layout. BSD/iOS sockaddr_in has a leading
+            // sin_len byte that Win32 lacks, so a raw copy misaligns sin_family
+            // (guest reads 0x0210 instead of 2 → treats addr as invalid → 0.0.0.0).
+            // Build the Win32 sockaddr explicitly. Port/addr offsets already match.
             if (ai->ai_addr && sa_len > 0) {
-                struct sockaddr_storage tmp;
-                memcpy(&tmp, ai->ai_addr, sa_len);
-                if (((struct sockaddr *)&tmp)->sa_family == AF_INET6)
-                    ((struct sockaddr *)&tmp)->sa_family = WIN_AF_INET6;
-                wg_blink_write_mem(blink, sa_ptr, &tmp, sa_len);
+                uint8_t wsa[28] = {0};
+                if (ai->ai_family == AF_INET && sa_len >= (uint32_t)sizeof(struct sockaddr_in)) {
+                    struct sockaddr_in *si = (struct sockaddr_in *)ai->ai_addr;
+                    wsa[0] = 2; wsa[1] = 0;                  // AF_INET (16-bit family)
+                    memcpy(wsa + 2, &si->sin_port, 2);       // port (network order)
+                    memcpy(wsa + 4, &si->sin_addr, 4);       // IPv4 address
+                    sa_len = 16;
+                } else if (ai->ai_family == AF_INET6 && sa_len >= (uint32_t)sizeof(struct sockaddr_in6)) {
+                    struct sockaddr_in6 *si6 = (struct sockaddr_in6 *)ai->ai_addr;
+                    wsa[0] = (uint8_t)(WIN_AF_INET6 & 0xFF);
+                    wsa[1] = (uint8_t)(WIN_AF_INET6 >> 8);   // family (23)
+                    memcpy(wsa + 2,  &si6->sin6_port, 2);    // port
+                    memcpy(wsa + 4,  &si6->sin6_flowinfo, 4);
+                    memcpy(wsa + 8,  &si6->sin6_addr, 16);   // IPv6 address
+                    memcpy(wsa + 24, &si6->sin6_scope_id, 4);
+                    sa_len = 28;
+                }
+                wg_blink_write_mem(blink, sa_ptr, wsa, sa_len);
+                // Keep addrinfo ai_addrlen consistent with what we wrote.
+                wg_blink_write_mem(blink, node_base + 16, &sa_len, 4);
+                char ipdbg[64] = {0};
+                if (ai->ai_family == AF_INET)
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)ai->ai_addr)->sin_addr, ipdbg, sizeof(ipdbg));
+                WG_LOGI(TAG, "getaddrinfo: node fam=%d -> %s", ai->ai_family, ipdbg[0] ? ipdbg : "?");
             }
 
             if (prev_next) {
@@ -554,13 +708,12 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             ptr = next_ptr ? next_ptr : (sa_ptr + ((sa_len + 3) & ~3u));
         }
 
-        // Write pointer to first node
+        // Write pointer to first node (always the region base).
         if (args[3]) {
-            uint32_t first = s_gai_ptr;
+            uint32_t first = WG_GAI_BASE;
             wg_blink_write_mem(blink, args[3], &first, 4);
         }
-
-        s_gai_ptr = ptr;
+        (void)ptr;
         freeaddrinfo(res);
         WG_LOGI(TAG, "getaddrinfo -> OK");
         *out_ret = 0;
@@ -576,21 +729,154 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── WSASend / WSARecv / WSASendTo / WSARecvFrom ─────────────────
     // These use WSABUF structures. For now, stub them.
+    // ── WSASend(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSASend") == 0 || strcmp(fn, "WSASendTo") == 0) {
-        ws->last_error = WSAENOTCONN;
-        *out_ret = WIN_SOCKET_ERROR;
+        int fd = lookup_fd(ws, args[0]);
+        if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
+        uint32_t buf_count = args[2];
+        if (buf_count == 0 || !args[1]) { ws->last_error = WSAEINVAL; *out_ret = WIN_SOCKET_ERROR; return true; }
+        if (buf_count > 16) buf_count = 16;
+        // Gather WSABUF entries: each is { u32 len; u32 ptr } (8 bytes in 32-bit)
+        size_t total = 0;
+        for (uint32_t i = 0; i < buf_count; i++) {
+            uint32_t e[2]; wg_blink_read_mem(blink, args[1] + i * 8, e, 8);
+            total += e[0];
+        }
+        if (total == 0) { if (args[3]) { uint32_t z = 0; wg_blink_write_mem(blink, args[3], &z, 4); } *out_ret = 0; return true; }
+        uint8_t *buf = malloc(total);
+        size_t off = 0;
+        for (uint32_t i = 0; i < buf_count; i++) {
+            uint32_t e[2]; wg_blink_read_mem(blink, args[1] + i * 8, e, 8);
+            if (e[0] && e[1]) { wg_blink_read_mem(blink, e[1], buf + off, e[0]); off += e[0]; }
+        }
+        ssize_t sent = send(fd, buf, total, 0);
+        free(buf);
+        if (sent < 0) {
+            ws->last_error = errno_to_wsa(errno);
+            WG_LOGW(TAG, "WSASend(0x%X, %zu) failed: %s", args[0], total, strerror(errno));
+            *out_ret = WIN_SOCKET_ERROR;
+        } else {
+            if (args[3]) { uint32_t bs = (uint32_t)sent; wg_blink_write_mem(blink, args[3], &bs, 4); }
+            if (args[5]) { uint32_t bs = (uint32_t)sent; wg_blink_write_mem(blink, args[5] + 4, &bs, 4); }
+            WG_LOGD(TAG, "WSASend(0x%X, %zu) -> %zd", args[0], total, sent);
+            *out_ret = 0;
+        }
         return true;
     }
+    // ── WSARecv(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSARecv") == 0 || strcmp(fn, "WSARecvFrom") == 0) {
-        ws->last_error = WSAENOTCONN;
-        *out_ret = WIN_SOCKET_ERROR;
+        int fd = lookup_fd(ws, args[0]);
+        if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
+        uint32_t buf_count = args[2];
+        if (buf_count == 0 || !args[1]) { ws->last_error = WSAEINVAL; *out_ret = WIN_SOCKET_ERROR; return true; }
+        if (buf_count > 16) buf_count = 16;
+        // Compute total capacity across WSABUF entries
+        size_t total_cap = 0;
+        for (uint32_t i = 0; i < buf_count; i++) {
+            uint32_t e[2]; wg_blink_read_mem(blink, args[1] + i * 8, e, 8);
+            total_cap += e[0];
+        }
+        if (total_cap > 65536) total_cap = 65536;
+        uint8_t *buf = malloc(total_cap);
+        ssize_t got = recv(fd, buf, total_cap, 0);
+        if (got < 0) {
+            free(buf);
+            ws->last_error = errno_to_wsa(errno);
+            WG_LOGW(TAG, "WSARecv(0x%X) failed: %s", args[0], strerror(errno));
+            *out_ret = WIN_SOCKET_ERROR;
+        } else {
+            // Scatter received bytes into WSABUF entries
+            size_t off = 0;
+            for (uint32_t i = 0; i < buf_count && off < (size_t)got; i++) {
+                uint32_t e[2]; wg_blink_read_mem(blink, args[1] + i * 8, e, 8);
+                uint32_t copy = e[0];
+                if (copy > (uint32_t)((size_t)got - off)) copy = (uint32_t)((size_t)got - off);
+                if (e[1] && copy > 0) wg_blink_write_mem(blink, e[1], buf + off, copy);
+                off += copy;
+            }
+            free(buf);
+            if (args[3]) { uint32_t bg = (uint32_t)got; wg_blink_write_mem(blink, args[3], &bg, 4); }
+            if (args[5]) { uint32_t bg = (uint32_t)got; wg_blink_write_mem(blink, args[5] + 4, &bg, 4); }
+            WG_LOGD(TAG, "WSARecv(0x%X) -> %zd", args[0], got);
+            *out_ret = 0;
+        }
         return true;
     }
 
     // ── WSAIoctl ────────────────────────────────────────────────────
     if (strcmp(fn, "WSAIoctl") == 0) {
-        *out_ret = WIN_SOCKET_ERROR;
-        ws->last_error = WSAEINVAL;
+        // WSAIoctl(s, code, inBuf, inLen, outBuf, outLen, bytesRet, overlapped, completionRoutine)
+        // We handle SIO_GET_EXTENSION_FUNCTION_POINTER in the engine dispatch.
+        // For other IOCTLs, return success with 0 bytes.
+        if (args[6]) {
+            uint32_t z = 0;
+            wg_blink_write_mem(blink, args[6], &z, 4);
+        }
+        *out_ret = 0;
+        return true;
+    }
+
+    // ── ConnectEx(s, name, namelen, sendBuf, sendLen, bytesSent, overlapped)
+    if (strcmp(fn, "ConnectEx") == 0) {
+        int fd = lookup_fd(ws, args[0]);
+        if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = 0; return true; }
+        struct sockaddr_storage sa; socklen_t salen;
+        read_sockaddr(blink, args[1], (int)args[2], &sa, &salen);
+        char ipstr[64] = {0};
+        uint16_t port = 0;
+        if (sa.ss_family == AF_INET) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)&sa;
+            inet_ntop(AF_INET, &s4->sin_addr, ipstr, sizeof(ipstr));
+            port = ntohs(s4->sin_port);
+        }
+        WG_LOGI(TAG, "ConnectEx(0x%X -> %s:%u)", args[0], ipstr, port);
+        // Use non-blocking connect + select() with 15s timeout, then switch
+        // socket to blocking for subsequent TLS I/O (send/recv block cleanly).
+        int cur_flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, cur_flags | O_NONBLOCK);
+        int r = connect(fd, (struct sockaddr *)&sa, salen);
+        if (r < 0 && errno == EINPROGRESS) {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_SET(fd, &wfds);
+            FD_ZERO(&efds); FD_SET(fd, &efds);
+            struct timeval tv = {15, 0};
+            int sr = select(fd + 1, NULL, &wfds, &efds, &tv);
+            if (sr > 0) {
+                int err = 0; socklen_t elen = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                if (err != 0) {
+                    ws->last_error = errno_to_wsa(err);
+                    WG_LOGW(TAG, "ConnectEx failed: %s", strerror(err));
+                    *out_ret = 0;
+                    return true;
+                }
+                r = 0;
+            } else {
+                ws->last_error = WSAETIMEDOUT;
+                WG_LOGW(TAG, "ConnectEx timed out");
+                *out_ret = 0;
+                return true;
+            }
+        }
+        // Restore blocking mode for TLS I/O
+        fcntl(fd, F_SETFL, cur_flags & ~O_NONBLOCK);
+        if (r < 0) {
+            ws->last_error = errno_to_wsa(errno);
+            WG_LOGW(TAG, "ConnectEx failed: %s", strerror(errno));
+            *out_ret = 0;
+        } else {
+            WG_LOGI(TAG, "ConnectEx connected %s:%u", ipstr, port);
+            if (args[5]) { uint32_t z = 0; wg_blink_write_mem(blink, args[5], &z, 4); }
+            *out_ret = 1;
+        }
+        return true;
+    }
+
+    // ── DisconnectEx(s, overlapped, flags, reserved) ───────────────
+    if (strcmp(fn, "DisconnectEx") == 0) {
+        int fd = lookup_fd(ws, args[0]);
+        if (fd >= 0) shutdown(fd, SHUT_RDWR);
+        *out_ret = 1;
         return true;
     }
 
@@ -612,11 +898,37 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     }
 
     // ── WSAEnumNetworkEvents(s, hEvent, lpNetworkEvents) ────────────
+    // WSANETWORKEVENTS { long lNetworkEvents; int iErrorCode[FD_MAX_EVENTS=10]; }
+    // = 4 + 40 = 44 bytes. Bits: FD_READ=0x01, FD_WRITE=0x02, FD_CONNECT=0x10,
+    // FD_CLOSE=0x20. iErrorCode index for FD_CONNECT is bit 4 -> offset 4 + 4*4.
     if (strcmp(fn, "WSAEnumNetworkEvents") == 0) {
-        if (args[2]) {
-            uint8_t zero[36] = {0}; // WSANETWORKEVENTS
-            wg_blink_write_mem(blink, args[2], zero, 36);
+        int fd = lookup_fd(ws, args[0]);
+        uint32_t events = 0;
+        int connect_err = 0;
+        if (fd >= 0) {
+            struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLOUT, .revents = 0 };
+            poll(&pfd, 1, 0);
+            uint32_t sidx = args[0] - SOCK_BASE;
+            // Connection completion: socket becomes writable. Report FD_CONNECT
+            // exactly once (a connected socket stays writable forever otherwise).
+            if ((pfd.revents & POLLOUT) && sidx < WG_MAX_SOCKETS &&
+                !ws->connect_reported[sidx]) {
+                int soerr = 0; socklen_t sl = sizeof(soerr);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+                connect_err = soerr ? errno_to_wsa(soerr) : 0;
+                events |= 0x10; // FD_CONNECT
+                ws->connect_reported[sidx] = true;
+            }
+            if (pfd.revents & POLLIN)  events |= 0x01;             // FD_READ
+            if (pfd.revents & (POLLHUP | POLLERR)) events |= 0x20; // FD_CLOSE
         }
+        if (args[2]) {
+            uint8_t ev[44] = {0};
+            memcpy(ev, &events, 4);
+            if (connect_err) memcpy(ev + 4 + 4 * 4, &connect_err, 4); // iErrorCode[FD_CONNECT_BIT]
+            wg_blink_write_mem(blink, args[2], ev, 44);
+        }
+        WG_LOGI(TAG, "WSAEnumNetworkEvents(0x%X) -> events=0x%X err=%d", args[0], events, connect_err);
         *out_ret = 0;
         return true;
     }
@@ -635,3 +947,6 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     return false; // not handled
 }
+
+uint32_t wg_winsock_get_last_error(WGWinsock *ws) { return ws ? (uint32_t)ws->last_error : 0; }
+void     wg_winsock_set_last_error(WGWinsock *ws, uint32_t err) { if (ws) ws->last_error = (int)err; }

@@ -23,3 +23,6 @@ Vendor/blink/lib/*.o
 
 # OS
 .DS_Store
+
+# Claude Code local memory / session data
+.claude/

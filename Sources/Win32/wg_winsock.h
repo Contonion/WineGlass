@@ -16,4 +16,8 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
                        uint32_t *args, uint64_t *out_ret,
                        void *blink);
 
+// Access to last Winsock error (set by failed calls).
+uint32_t wg_winsock_get_last_error(WGWinsock *ws);
+void     wg_winsock_set_last_error(WGWinsock *ws, uint32_t err);
+
 #endif

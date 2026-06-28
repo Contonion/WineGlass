@@ -11,6 +11,7 @@
 		153C41A95FA511C94CBB8FD6 /* WGAppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 226AD25F32031E477E58E6E4 /* WGAppDelegate.m */; };
 		20EB43F1DB3F21F10283E9E0 /* WGCompositor.m in Sources */ = {isa = PBXBuildFile; fileRef = DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */; };
 		2FD4BA58266ECC2070F84E68 /* wg_log.c in Sources */ = {isa = PBXBuildFile; fileRef = C2E7451659F90F1881744FD7 /* wg_log.c */; };
+		317B19FF35D4EEC8C8F781C5 /* wg_winhttp.c in Sources */ = {isa = PBXBuildFile; fileRef = E34BB822637517989EE3C436 /* wg_winhttp.c */; };
 		4C46330254DF76387D4B0C6C /* wg_memory.c in Sources */ = {isa = PBXBuildFile; fileRef = 9B7C6CA02B6DFA3DC5F82359 /* wg_memory.c */; };
 		4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */ = {isa = PBXBuildFile; fileRef = A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */; };
 		5494348BA4CC03DFE4DFB7F0 /* WGMetalView.m in Sources */ = {isa = PBXBuildFile; fileRef = 042AC091820A57501F4AF53C /* WGMetalView.m */; };
@@ -30,6 +31,7 @@
 		D27D524AA6A09BDB50A924EE /* WGSceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = 4133B5F24164662A9E7B2BF0 /* WGSceneDelegate.m */; };
 		DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */ = {isa = PBXBuildFile; fileRef = BD62DFB283E953060FB6F2B4 /* wg_selftest.c */; };
 		DE48CAB52C304F62F5C45C8D /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 84466C30852AB61143363D30 /* main.m */; };
+		E65EEA043C69625888F77FAF /* wg_schannel.c in Sources */ = {isa = PBXBuildFile; fileRef = C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */; };
 		ED40774431FAD40D5F0AFABE /* wg_winsock.c in Sources */ = {isa = PBXBuildFile; fileRef = 6E7BD0669D0C63DA944073BE /* wg_winsock.c */; };
 		FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */ = {isa = PBXBuildFile; fileRef = B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */; };
 		FF0C10672178332D27C8A826 /* wg_threading.c in Sources */ = {isa = PBXBuildFile; fileRef = CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */; };
@@ -58,9 +60,11 @@
 		B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_files.c; sourceTree = "<group>"; };
 		BD62DFB283E953060FB6F2B4 /* wg_selftest.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_selftest.c; sourceTree = "<group>"; };
 		C2E7451659F90F1881744FD7 /* wg_log.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_log.c; sourceTree = "<group>"; };
+		C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_schannel.c; sourceTree = "<group>"; };
 		CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_threading.c; sourceTree = "<group>"; };
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		E34BB822637517989EE3C436 /* wg_winhttp.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_winhttp.c; sourceTree = "<group>"; };
 		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitkeep; sourceTree = "<group>"; };
 		F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_nsis_extract.c; sourceTree = "<group>"; };
@@ -105,11 +109,13 @@
 			children = (
 				AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */,
 				F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */,
+				C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */,
 				CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */,
 				A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */,
 				B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */,
 				3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */,
 				A695F4AD386205BBF3906750 /* wg_win32_windows.c */,
+				E34BB822637517989EE3C436 /* wg_winhttp.c */,
 				6E7BD0669D0C63DA944073BE /* wg_winsock.c */,
 			);
 			path = Win32;
@@ -276,12 +282,14 @@
 				4C46330254DF76387D4B0C6C /* wg_memory.c in Sources */,
 				B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */,
 				6F440B002DECA62AC5C07C6A /* wg_pe_loader.c in Sources */,
+				E65EEA043C69625888F77FAF /* wg_schannel.c in Sources */,
 				DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */,
 				FF0C10672178332D27C8A826 /* wg_threading.c in Sources */,
 				4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */,
 				FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */,
 				7880F90BE3616E67CD6E01D5 /* wg_win32_gdi.c in Sources */,
 				7BD37F605CABC45939057EE7 /* wg_win32_windows.c in Sources */,
+				317B19FF35D4EEC8C8F781C5 /* wg_winhttp.c in Sources */,
 				ED40774431FAD40D5F0AFABE /* wg_winsock.c in Sources */,
 				B99F42AC783F3C7CFE7C0261 /* wg_x86_decode.c in Sources */,
 				8F26D5DB3E0CACB7F1E65DB6 /* wg_x86_interp.c in Sources */,
