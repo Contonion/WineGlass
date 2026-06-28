@@ -27,6 +27,7 @@ typedef int sig_atomic_t_placeholder_;
 struct WGBlinkVM {
     struct Machine *m;
     struct System  *s;
+    int last_stop;   // last siglongjmp code from onhalt (kMachine* / -1 halt)
 };
 
 static int s_blink_initialized = 0;
@@ -185,6 +186,7 @@ int WGBlinkVM_Step(struct WGBlinkVM *vm) {
     wg_blink_set_onhalt(&vm->m->onhalt);
 
     if (rc) {
+        vm->last_stop = rc;
         vm->m->canhalt = false;
         wg_blink_set_onhalt(NULL);
         return 1; // any signal/halt = stop
@@ -193,6 +195,7 @@ int WGBlinkVM_Step(struct WGBlinkVM *vm) {
     LoadInstruction(vm->m, GetPc(vm->m));
     ExecuteInstruction(vm->m);
 
+    vm->last_stop = 0;
     vm->m->canhalt = false;
     wg_blink_set_onhalt(NULL);
 
@@ -209,6 +212,7 @@ int WGBlinkVM_Run(struct WGBlinkVM *vm, int max_insns) {
     wg_blink_set_onhalt(&vm->m->onhalt);
 
     if (rc) {
+        vm->last_stop = rc;
         vm->m->canhalt = false;
         wg_blink_set_onhalt(NULL);
         return 1; // halt/signal
@@ -216,6 +220,7 @@ int WGBlinkVM_Run(struct WGBlinkVM *vm, int max_insns) {
 
     for (int i = 0; i < max_insns; i++) {
         if (vm->m->ip == 0) {
+            vm->last_stop = 0;
             vm->m->canhalt = false;
             wg_blink_set_onhalt(NULL);
             return 1;
@@ -224,6 +229,7 @@ int WGBlinkVM_Run(struct WGBlinkVM *vm, int max_insns) {
         ExecuteInstruction(vm->m);
     }
 
+    vm->last_stop = 0;
     vm->m->canhalt = false;
     wg_blink_set_onhalt(NULL);
     return 0;
@@ -245,6 +251,18 @@ unsigned long long WGBlinkVM_GetRIP(struct WGBlinkVM *vm) {
 
 void WGBlinkVM_SetRIP(struct WGBlinkVM *vm, unsigned long long rip) {
     if (vm) vm->m->ip = rip;
+}
+
+// Last stop reason: 0 = ran/clean, -1 = halt, kMachineSegmentationFault (-4),
+// kMachineProtectionFault (-8), etc. Lets the engine tell a memory fault (which
+// should become a guest exception) from a normal halt.
+int WGBlinkVM_GetStopReason(struct WGBlinkVM *vm) {
+    return vm ? vm->last_stop : 0;
+}
+
+// Faulting guest virtual address recorded on the last memory fault.
+unsigned long long WGBlinkVM_GetFaultAddr(struct WGBlinkVM *vm) {
+    return vm ? (unsigned long long)vm->m->faultaddr : 0;
 }
 
 int WGBlinkVM_WriteMem(struct WGBlinkVM *vm, unsigned long long addr,

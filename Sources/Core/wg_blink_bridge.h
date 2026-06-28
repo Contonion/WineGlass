@@ -40,6 +40,11 @@ void     wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val);
 uint64_t wg_blink_get_rip(WGBlinkInstance *inst);
 void     wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip);
 
+// Last blink stop reason (0 clean, -1 halt, -4 segfault, -8 #GP) and the
+// faulting guest address from the last memory fault.
+int      wg_blink_get_stop_reason(WGBlinkInstance *inst);
+uint64_t wg_blink_get_fault_addr(WGBlinkInstance *inst);
+
 // Set the FS (32-bit TEB) / GS (64-bit TEB) segment base linear address.
 void     wg_blink_set_fs_base(WGBlinkInstance *inst, uint64_t base);
 void     wg_blink_set_gs_base(WGBlinkInstance *inst, uint64_t base);

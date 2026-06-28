@@ -561,6 +561,7 @@ static void map_thunks_to_blink(WGEngine *engine) {
 //  Modal dialogs + control rendering (NSIS wizard UI)
 // ============================================================
 #define WG_DLG_SENTINEL    0xC10000u    // dlgproc return trap (HLT-filled page)
+#define WG_SEH_SENTINEL    0xC10020u    // SEH handler return trap (HLT-filled)
 #define WG_CTRL_HWND_BASE  0x00C70000u  // synthetic control HWND range
 
 static bool     s_dlg_active = false;
@@ -1190,6 +1191,99 @@ static void wg_build_fake_com(WGEngine *engine) {
     wg_blink_write_mem(engine->blink, s_com_persistfile, &pfv, 4);
 }
 
+// ===== Guest exception (SEH) dispatch ===================================
+// On a guest memory fault we synthesize a Windows STATUS_ACCESS_VIOLATION and
+// walk the fs:[0] EXCEPTION_REGISTRATION chain, calling each handler until one
+// handles it. MSVC's _except_handler3 calls RtlUnwind (our thunk) then jumps
+// into __except, so a handled exception never returns to WG_SEH_SENTINEL.
+// Enables Steam's bootstrapper to recover from the NULL-connection deref the
+// way it does on Windows (instead of our zero-page map masking it).
+#define WG_CTX_SIZE  0x2CC
+#define WG_CTX_FLAGS 0x00
+#define WG_CTX_EDI   0x9C
+#define WG_CTX_ESI   0xA0
+#define WG_CTX_EBX   0xA4
+#define WG_CTX_EDX   0xA8
+#define WG_CTX_ECX   0xAC
+#define WG_CTX_EAX   0xB0
+#define WG_CTX_EBP   0xB4
+#define WG_CTX_EIP   0xB8
+#define WG_CTX_CS    0xBC
+#define WG_CTX_EFL   0xC0
+#define WG_CTX_ESP   0xC4
+#define WG_CTX_SS    0xC8
+
+static bool     s_enable_guest_seh = false; // fault-hook auto-dispatch (off:
+                                            // page 0 stays mapped; we trigger
+                                            // SEH surgically at the send site)
+static bool     s_seh_trigger_send = false; // raise AV at Steam's send-on-NULL
+                                            // (off: Steam's handlers don't catch
+                                            // it — the NULL conn is upstream)
+static int      s_seh_send_triggers = 0;    // limit re-triggers (avoid loops)
+static bool     s_seh_active = false;
+static uint32_t s_seh_frame  = 0;   // current EXCEPTION_REGISTRATION_RECORD
+static uint32_t s_seh_excrec = 0;   // guest EXCEPTION_RECORD
+static uint32_t s_seh_ctx    = 0;   // guest CONTEXT
+static uint32_t s_seh_dispctx= 0;   // DispatcherContext scratch
+static int      s_seh_depth  = 0;   // nested-fault guard
+
+static void wg_seh_call_handler(WGEngine *engine, uint32_t handler, uint32_t frame) {
+    // handler(ExceptionRecord, EstablisherFrame, ContextRecord, DispatcherContext)
+    // -> returns disposition in EAX to WG_SEH_SENTINEL.
+    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+    uint32_t new_rsp = esp - 20;
+    uint32_t sd[5] = { WG_SEH_SENTINEL, s_seh_excrec, frame, s_seh_ctx, s_seh_dispctx };
+    wg_blink_write_mem(engine->blink, new_rsp, sd, 20);
+    wg_blink_set_reg(engine->blink, 4, new_rsp);
+    wg_blink_set_rip(engine->blink, handler);
+    wg_blink_set_reg(engine->blink, 0, 0);
+}
+
+// Raise `code` (STATUS_ACCESS_VIOLATION) at fault_rip and dispatch it to the
+// guest SEH chain. Returns true if a handler chain exists (engine keeps RUNNING).
+static bool wg_raise_guest_exception(WGEngine *engine, uint32_t code,
+                                     uint32_t fault_addr, uint32_t fault_rip,
+                                     bool is_write) {
+    if (s_seh_depth > 8) return false; // runaway fault loop
+    uint32_t seh = 0;
+    wg_blink_read_mem(engine->blink, s_main_teb + 0, &seh, 4);
+    if (seh <= 0x1000u || seh >= 0xFFFFFFFEu) return false; // no SEH chain
+
+    uint32_t ctx = wg_guest_alloc(engine, WG_CTX_SIZE);
+    uint32_t rec = wg_guest_alloc(engine, 0x50);
+    uint32_t dispctx = wg_guest_alloc(engine, 16);
+    if (!ctx || !rec || !dispctx) return false;
+
+    uint32_t flags = 0x10007 /*CONTEXT_FULL*/, t;
+    wg_blink_write_mem(engine->blink, ctx + WG_CTX_FLAGS, &flags, 4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,7); wg_blink_write_mem(engine->blink,ctx+WG_CTX_EDI,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,6); wg_blink_write_mem(engine->blink,ctx+WG_CTX_ESI,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,3); wg_blink_write_mem(engine->blink,ctx+WG_CTX_EBX,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,2); wg_blink_write_mem(engine->blink,ctx+WG_CTX_EDX,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,1); wg_blink_write_mem(engine->blink,ctx+WG_CTX_ECX,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,0); wg_blink_write_mem(engine->blink,ctx+WG_CTX_EAX,&t,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,5); wg_blink_write_mem(engine->blink,ctx+WG_CTX_EBP,&t,4);
+    wg_blink_write_mem(engine->blink,ctx+WG_CTX_EIP,&fault_rip,4);
+    t=(uint32_t)wg_blink_get_reg(engine->blink,4); wg_blink_write_mem(engine->blink,ctx+WG_CTX_ESP,&t,4);
+    t=0x202; wg_blink_write_mem(engine->blink,ctx+WG_CTX_EFL,&t,4);
+    t=0x1b;  wg_blink_write_mem(engine->blink,ctx+WG_CTX_CS,&t,4);
+    t=0x23;  wg_blink_write_mem(engine->blink,ctx+WG_CTX_SS,&t,4);
+
+    uint32_t er[7] = { code, 0, 0, fault_rip, 2, (uint32_t)(is_write?1:0), fault_addr };
+    wg_blink_write_mem(engine->blink, rec, er, 28);
+
+    s_seh_excrec = rec; s_seh_ctx = ctx; s_seh_dispctx = dispctx;
+    s_seh_frame = seh; s_seh_active = true; s_seh_depth++;
+
+    uint32_t handler = 0;
+    wg_blink_read_mem(engine->blink, seh + 4, &handler, 4);
+    WG_LOGW(TAG, "SEH: raise 0x%X addr=0x%X rip=0x%X -> handler 0x%X frame 0x%X",
+            code, fault_addr, fault_rip, handler, seh);
+    if (handler <= 0x1000u) { s_seh_active = false; return false; }
+    wg_seh_call_handler(engine, handler, seh);
+    return true;
+}
+
 // Check if RIP is in the thunk range and handle the Win32 API call.
 // Returns true if a thunk was handled.
 static bool handle_blink_thunk(WGEngine *engine) {
@@ -1200,6 +1294,45 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
     if (rip >= WG_THUNK_BASE && rip < WG_THUNK_BASE + 0x20000) in_thunk_range = true;
     if (!in_thunk_range) return false;
+
+    // SEH handler returned a disposition: advance the chain or resume.
+    if (rip == WG_SEH_SENTINEL) {
+        uint32_t disp = (uint32_t)wg_blink_get_reg(engine->blink, 0); // EAX
+        WG_LOGW(TAG, "SEH: handler disposition=%d", (int)disp);
+        if (disp == 0 /*ExceptionContinueExecution*/) {
+            // Resume from the (handler-modified) CONTEXT.
+            uint32_t eip=0, esp=0, r;
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EIP,&eip,4);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_ESP,&esp,4);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EAX,&r,4); wg_blink_set_reg(engine->blink,0,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_ECX,&r,4); wg_blink_set_reg(engine->blink,1,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EDX,&r,4); wg_blink_set_reg(engine->blink,2,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EBX,&r,4); wg_blink_set_reg(engine->blink,3,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EBP,&r,4); wg_blink_set_reg(engine->blink,5,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_ESI,&r,4); wg_blink_set_reg(engine->blink,6,r);
+            wg_blink_read_mem(engine->blink, s_seh_ctx+WG_CTX_EDI,&r,4); wg_blink_set_reg(engine->blink,7,r);
+            wg_blink_set_reg(engine->blink, 4, esp);
+            wg_blink_set_rip(engine->blink, eip);
+            s_seh_active = false; s_seh_depth = 0;
+            return true;
+        }
+        // ExceptionContinueSearch (1) / other: go to the next registration.
+        uint32_t next = 0;
+        wg_blink_read_mem(engine->blink, s_seh_frame + 0, &next, 4);
+        if (next > 0x1000u && next < 0xFFFFFFFEu && next > s_seh_frame) {
+            uint32_t handler = 0;
+            wg_blink_read_mem(engine->blink, next + 4, &handler, 4);
+            if (handler > 0x1000u) {
+                s_seh_frame = next;
+                wg_seh_call_handler(engine, handler, next);
+                return true;
+            }
+        }
+        WG_LOGE(TAG, "SEH: unhandled exception — terminating");
+        s_seh_active = false; s_seh_depth = 0;
+        wg_blink_set_rip(engine->blink, 0); // halt
+        return true;
+    }
 
     // Modal-dialog return trap: the dlgproc has returned from WM_INITDIALOG, so
     // the dialog is now up. Paint its controls and pause (modal) — we stay here
@@ -2439,6 +2572,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[2], tmp, (n + 1) * 2);
             }
             ret_val = n;
+        } else if (strcmp(fn, "RtlUnwind") == 0) {
+            // RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue).
+            // _except_handler3 calls this (via _global_unwind2) to unwind to the
+            // __try frame before running __except. We unlink the SEH chain down
+            // to TargetFrame and commit the in-flight exception; the stdcall
+            // return lands at TargetIp (== the call's return address in
+            // _global_unwind2). Intermediate __finally handlers are skipped for
+            // now (iteration 1).
+            uint32_t target_frame = args[0];
+            if (target_frame > 0x1000u && target_frame < 0xFFFFFFFEu)
+                wg_blink_write_mem(engine->blink, s_main_teb + 0, &target_frame, 4);
+            s_seh_active = false; s_seh_depth = 0;
+            WG_LOGW(TAG, "RtlUnwind(target=0x%X) -> fs:[0] set; SEH committed", target_frame);
+            ret_val = args[3];
         } else if (strcmp(fn, "GetWindowTextW") == 0) {
             // GetWindowTextW(hWnd=args[0], lpString=args[1], nMaxCount=args[2]).
             // For a control handle return its stored text (the directory edit's
@@ -4450,6 +4597,18 @@ static bool handle_blink_thunk(WGEngine *engine) {
                         if (prev <= ebp || prev == 0) break;
                         ebp = prev;
                     }
+                    // socket 0 == NULL connection. On Windows the earlier
+                    // this->m_socket read (this=NULL) faults into Steam's active
+                    // __except, which abandons this send and recovers. Our
+                    // zero-page map masked that read, so deliver the AV here
+                    // instead: dispatch STATUS_ACCESS_VIOLATION to the fs:[0]
+                    // chain. If a handler exists, skip the doomed send.
+                    if (s_seh_trigger_send && !s_seh_active && s_seh_send_triggers < 64) {
+                        s_seh_send_triggers++;
+                        if (wg_raise_guest_exception(engine, 0xC0000005u, 0,
+                                                     (uint32_t)ret_addr, false))
+                            return true; // SEH dispatched; bypass the send
+                    }
                 }
                 if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
                     ret_val = ws_ret;
@@ -4970,7 +5129,12 @@ static bool load_pe_blink(WGEngine *engine) {
     {
         uint8_t *zp = calloc(1, 0x10000);
         if (zp) {
-            // NULL dereferences
+            // NULL dereferences. The zero-page map is load-bearing: it absorbs
+            // NULL reads that come from our own 0-returning stubs (where real
+            // Windows would have a valid pointer) during CRT init. Unmapping it
+            // globally turns those into fatal faults, so we keep it mapped and
+            // instead deliver a guest AV only at the specific Steam send-on-NULL
+            // site (see the WS2_32 send handler -> wg_raise_guest_exception).
             wg_blink_load_code(engine->blink, 0, zp, 0x10000, 0);
             // Stale DLL pointers: map specific 4KB pages covering known
             // addresses from steam's .rdata (0x53572073 etc.)
@@ -5260,6 +5424,21 @@ void wg_engine_tick(WGEngine *engine) {
                             wg_blink_set_reg(engine->blink, 4, esp + 4);
                             wg_blink_set_rip(engine->blink, ret);
                             break;
+                        }
+                    }
+                    // A real memory fault (e.g. NULL deref): raise a Windows
+                    // STATUS_ACCESS_VIOLATION into the guest's SEH chain so it
+                    // recovers like on Windows. This is what lets Steam's
+                    // bootstrapper survive its NULL-connection dereference
+                    // instead of our zero-page map silently swallowing it.
+                    {
+                        int stop = wg_blink_get_stop_reason(engine->blink);
+                        if (s_enable_guest_seh && (stop == -4 /*segfault*/ ||
+                                                    stop == -8 /*#GP*/)) {
+                            uint32_t fa = (uint32_t)wg_blink_get_fault_addr(engine->blink);
+                            if (wg_raise_guest_exception(engine, 0xC0000005u, fa,
+                                                         (uint32_t)halt_rip, false))
+                                break;
                         }
                     }
                     WG_LOGE(TAG, "Crash at RIP=0x%llx (SIGSEGV — bad pointer or unmapped memory)",

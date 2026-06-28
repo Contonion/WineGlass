@@ -29,6 +29,8 @@ extern int WGBlinkVM_SetupStack(WGBlinkVM *vm, unsigned long long entry_rip);
 extern void WGBlinkVM_SwitchTo32(WGBlinkVM *vm);
 extern void WGBlinkVM_SetFsBase(WGBlinkVM *vm, unsigned long long base);
 extern void WGBlinkVM_SetGsBase(WGBlinkVM *vm, unsigned long long base);
+extern int WGBlinkVM_GetStopReason(WGBlinkVM *vm);
+extern unsigned long long WGBlinkVM_GetFaultAddr(WGBlinkVM *vm);
 
 // From wg_blink_stubs.c — our Abort() override recovery point
 extern void wg_blink_set_abort_recovery(sigjmp_buf *buf);
@@ -195,6 +197,19 @@ void wg_blink_set_reg(WGBlinkInstance *inst, int reg_index, uint64_t val) {
 uint64_t wg_blink_get_rip(WGBlinkInstance *inst) {
     if (!inst || !inst->vm) return 0;
     return WGBlinkVM_GetRIP(inst->vm);
+}
+
+// Last stop reason (0 clean, -1 halt, -4 segfault, -8 #GP, ...) and the
+// faulting address — used to turn a guest memory fault into a Windows
+// STATUS_ACCESS_VIOLATION dispatched through the guest's SEH chain.
+int wg_blink_get_stop_reason(WGBlinkInstance *inst) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_GetStopReason(inst->vm);
+}
+
+uint64_t wg_blink_get_fault_addr(WGBlinkInstance *inst) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_GetFaultAddr(inst->vm);
 }
 
 void wg_blink_set_rip(WGBlinkInstance *inst, uint64_t rip) {
