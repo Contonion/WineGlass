@@ -319,19 +319,38 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             WG_LOGI(TAG, "connect(0x%X, af=%d)", args[0], sa.ss_family);
         }
         int r = connect(fd, (struct sockaddr *)&sa, salen);
+        if (r < 0 && (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)) {
+            // The socket is non-blocking (the app set FIONBIO), so connect can't
+            // finish immediately. Rather than hand back WSAEWOULDBLOCK and rely
+            // on the app's connect-completion poll (Steam's bootstrapper waits on
+            // it but never sees it complete, then declares itself offline), wait
+            // for completion here via select() — same as ConnectEx — then restore
+            // blocking mode for the TLS I/O that follows, and report success.
+            int saved = fcntl(fd, F_GETFL, 0);
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_SET(fd, &wfds);
+            FD_ZERO(&efds); FD_SET(fd, &efds);
+            struct timeval tv = {15, 0};
+            int sr = select(fd + 1, NULL, &wfds, &efds, &tv);
+            if (sr > 0) {
+                int err = 0; socklen_t elen = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                r = err ? -1 : 0;
+                if (err) errno = err;
+            } else {
+                r = -1; ws->last_error = WSAETIMEDOUT;
+                WG_LOGW(TAG, "connect: timed out waiting for completion");
+                *out_ret = WIN_SOCKET_ERROR;
+                return true;
+            }
+            fcntl(fd, F_SETFL, saved); // restore the mode the app set (non-blocking)
+        }
         if (r < 0) {
-            // Windows convention: a non-blocking connect that can't finish
-            // immediately reports WSAEWOULDBLOCK (BSD uses EINPROGRESS). Apps
-            // poll for FD_CONNECT after this; mapping it wrong looks like a hard
-            // failure and aborts the connection.
-            if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EALREADY)
-                ws->last_error = WSAEWOULDBLOCK;
-            else
-                ws->last_error = errno_to_wsa(errno);
-            WG_LOGI(TAG, "connect -> in-progress/err errno=%d wsa=%u", errno, ws->last_error);
+            ws->last_error = errno_to_wsa(errno);
+            WG_LOGI(TAG, "connect -> err errno=%d wsa=%u", errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
-            WG_LOGI(TAG, "connect -> immediate success");
+            WG_LOGI(TAG, "connect -> success (%s)", ipstr);
             *out_ret = 0;
         }
         return true;
@@ -998,6 +1017,8 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             int flags = fcntl(fd, F_GETFL, 0);
             fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         }
+        WG_LOGI(TAG, "WSAEventSelect(sock=0x%X, hEvent=0x%X, mask=0x%X)",
+                args[0], args[1], args[2]);
         *out_ret = 0;
         return true;
     }
