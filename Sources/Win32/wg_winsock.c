@@ -377,15 +377,21 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         } else {
             WG_LOGI(TAG, "send(0x%X, %u) -> %zd [%s]", args[0], len, sent, hex);
             // A TLS alert (record type 0x15) means the guest's TLS engine is
-            // bailing — dump the caller chain so we can find the failing site.
+            // bailing. The TLS code omits frame pointers, so an EBP walk misses
+            // it — instead SCAN the raw stack for dwords that point into
+            // steam.exe .text (0x401000..0x6E1000), i.e. return addresses. That
+            // reveals the BoringSSL/handshake call chain that produced the alert.
             if (sent >= 1 && hex[0] == '1' && hex[1] == '5') {
-                uint32_t ebp = (uint32_t)wg_blink_get_reg(blink, 5);
-                for (int f = 0; f < 8 && ebp; f++) {
-                    uint32_t frame[2] = {0};
-                    wg_blink_read_mem(blink, ebp, frame, 8);
-                    WG_LOGW(TAG, "  TLS-alert frame[%d] ret=0x%X", f, frame[1]);
-                    if (frame[0] <= ebp) break; // stack grows down; stop on loop
-                    ebp = frame[0];
+                uint32_t esp = (uint32_t)wg_blink_get_reg(blink, 4);
+                uint32_t stk[256] = {0};
+                wg_blink_read_mem(blink, esp, stk, sizeof(stk));
+                int printed = 0;
+                for (int i = 0; i < 256 && printed < 40; i++) {
+                    uint32_t v = stk[i];
+                    if (v >= 0x401000 && v < 0x6E1000) {
+                        WG_LOGW(TAG, "  TLS-alert stk[+0x%X] ret=0x%X", i*4, v);
+                        printed++;
+                    }
                 }
             }
             *out_ret = (uint32_t)sent;

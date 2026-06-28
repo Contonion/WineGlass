@@ -1284,6 +1284,12 @@ static bool wg_raise_guest_exception(WGEngine *engine, uint32_t code,
     return true;
 }
 
+// DIAG: one-shot trap on steam.exe's ERR_error_string_n to surface the exact
+// OpenSSL error that aborts the TLS handshake.
+static uint32_t s_errstr_bp = 0x5FDFC0;
+static uint8_t  s_errstr_orig = 0;
+static bool     s_errstr_armed = false;
+
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
 // (BoringSSL) can build its ClientHello random.
@@ -4206,8 +4212,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t nbytes = args[2];
             uint32_t bytes_written_addr = args[3];
             if (nbytes > 0x100000) nbytes = 0x100000;
-            // stdout/stderr (from GetStdHandle) — accept the write silently
+            // stdout/stderr (from GetStdHandle) / pipes — surface the content;
+            // Steam's networking spew (incl. the OpenSSL handshake error string
+            // "COpenSSLConnection ... Error: %d - %s") goes here, not to the
+            // bootstrap log, so we need to see it to diagnose the TLS failure.
             if (handle == 0xF1 || handle == 0xF2 || handle == 0x00007301) {
+                if (nbytes > 0) {
+                    uint32_t pl = nbytes < 512 ? nbytes : 512;
+                    char *pv = malloc(pl + 1);
+                    if (pv) {
+                        wg_blink_read_mem(engine->blink, buf_addr, pv, pl);
+                        pv[pl] = 0;
+                        for (uint32_t i = 0; i < pl; i++) if (pv[i] == '\r') pv[i] = ' ';
+                        WG_LOGI(TAG, "spew[0x%X]: %s", handle, pv);
+                        free(pv);
+                    }
+                }
                 if (bytes_written_addr)
                     wg_blink_write_mem(engine->blink, bytes_written_addr, &nbytes, 4);
                 ret_val = 1;
@@ -5481,6 +5501,20 @@ bool wg_engine_run(WGEngine *engine) {
     engine->state = WG_ENGINE_RUNNING;
     WG_LOGI(TAG, "Execution started (backend: %s)",
             engine->backend == WG_BACKEND_BLINK ? "blink" : "builtin");
+    // DIAG: trap steam.exe's ERR_error_string_n (0x5FDFC0) to print the exact
+    // OpenSSL handshake error code (lib/reason). Steam drains its error queue
+    // through this fn before a level-filtered spew, so it's the only reliable
+    // way to learn WHY SSL_do_handshake fails. Guarded to steam's image base.
+    if (engine->blink && engine->pe_image &&
+        engine->pe_image->image_base == 0x400000 && !s_errstr_armed) {
+        if (wg_blink_read_mem(engine->blink, s_errstr_bp, &s_errstr_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_errstr_bp, &hlt, 1);
+            s_errstr_armed = true;
+            WG_LOGI(TAG, "Armed ERR_error_string_n trap @0x%X (orig=0x%02X)",
+                    s_errstr_bp, s_errstr_orig);
+        }
+    }
     return true;
 }
 
@@ -5515,6 +5549,25 @@ void wg_engine_tick(WGEngine *engine) {
             case WG_BLINK_HALT: {
                 if (handle_blink_thunk(engine)) break;
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
+                if (s_errstr_armed && halt_rip == s_errstr_bp) {
+                    // char *ERR_error_string_n(unsigned long e, char *buf, size_t len) [cdecl]
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t ret = 0, e = 0, buf = 0;
+                    wg_blink_read_mem(engine->blink, esp, &ret, 4);
+                    wg_blink_read_mem(engine->blink, esp + 4, &e, 4);
+                    wg_blink_read_mem(engine->blink, esp + 8, &buf, 4);
+                    uint32_t lib = (e >> 24) & 0xFF, func = (e >> 12) & 0xFFF, reason = e & 0xFFF;
+                    WG_LOGW(TAG, "*** OpenSSL error: code=0x%08X lib=%u func=%u reason=%u", e, lib, func, reason);
+                    // Stub the call: write a placeholder string, return buf, pop ret.
+                    if (buf) {
+                        char ph[24]; snprintf(ph, sizeof(ph), "wg:lib%u:r%u", lib, reason);
+                        wg_blink_write_mem(engine->blink, buf, ph, (uint32_t)strlen(ph) + 1);
+                    }
+                    wg_blink_set_reg(engine->blink, 0, buf);      // EAX = buf
+                    wg_blink_set_reg(engine->blink, 4, esp + 4);  // pop return addr (cdecl: caller cleans args)
+                    wg_blink_set_rip(engine->blink, ret);
+                    break;
+                }
                 if (halt_rip == 0) {
                     // RIP=0 can mean: (a) ExitProcess set it, or (b) a
                     // worker thread returned from its start function.
