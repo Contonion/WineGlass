@@ -369,9 +369,10 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         free(buf);
         if (sent < 0) {
             ws->last_error = errno_to_wsa(errno);
+            WG_LOGI(TAG, "send(0x%X, %u) -> ERR errno=%d wsa=%d", args[0], len, errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
-            WG_LOGD(TAG, "send(0x%X, %d) -> %zd", args[0], len, sent);
+            WG_LOGI(TAG, "send(0x%X, %u) -> %zd", args[0], len, sent);
             *out_ret = (uint32_t)sent;
         }
         return true;
@@ -389,11 +390,12 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         if (got < 0) {
             free(buf);
             ws->last_error = errno_to_wsa(errno);
+            WG_LOGI(TAG, "recv(0x%X, %u) -> ERR errno=%d wsa=%d", args[0], len, errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
             if (got > 0) wg_blink_write_mem(blink, args[1], buf, (uint32_t)got);
             free(buf);
-            WG_LOGD(TAG, "recv(0x%X, %d) -> %zd", args[0], len, got);
+            WG_LOGI(TAG, "recv(0x%X, %u) -> %zd bytes", args[0], len, got);
             *out_ret = (uint32_t)got;
         }
         return true;
