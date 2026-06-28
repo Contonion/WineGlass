@@ -1284,6 +1284,40 @@ static bool wg_raise_guest_exception(WGEngine *engine, uint32_t code,
     return true;
 }
 
+// Fill a guest buffer with cryptographic random bytes (any size). Used by all
+// the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
+// (BoringSSL) can build its ClientHello random.
+static void wg_fill_random(void *blink, uint32_t guest_addr, uint32_t len) {
+    if (!guest_addr || len == 0) return;
+    uint8_t chunk[512];
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t n = (len - done) < sizeof(chunk) ? (len - done) : (uint32_t)sizeof(chunk);
+        arc4random_buf(chunk, n);
+        wg_blink_write_mem(blink, guest_addr + done, chunk, n);
+        done += n;
+    }
+}
+
+// Dump every scheduler thread (id, state, entry, current rip, what it waits on)
+// — used to see why Steam's async download reactor stalls (which thread should
+// drive the socket I/O and what it's blocked on).
+static void wg_dump_threads(WGEngine *engine, const char *why) {
+    WGThreadScheduler *s = engine->scheduler;
+    if (!s) return;
+    WG_LOGW(TAG, "THREADS (%s): current=%d count=%d", why, s->current, s->count);
+    for (int i = 0; i < s->count; i++) {
+        WGThread *t = &s->threads[i];
+        const char *st = t->state == WG_THREAD_FREE ? "FREE" :
+                         t->state == WG_THREAD_RUNNING ? "RUN" :
+                         t->state == WG_THREAD_READY ? "READY" :
+                         t->state == WG_THREAD_WAITING ? "WAIT" :
+                         t->state == WG_THREAD_SUSPENDED ? "SUSP" : "EXIT";
+        WG_LOGW(TAG, "  [%d] id=0x%X %-5s start=0x%X rip=0x%X wait_h=0x%X to=0x%X",
+                i, t->id, st, t->start_addr, t->regs.rip, t->wait_handle, t->wait_timeout);
+    }
+}
+
 // Check if RIP is in the thunk range and handle the Win32 API call.
 // Returns true if a thunk was handled.
 static bool handle_blink_thunk(WGEngine *engine) {
@@ -2760,27 +2794,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "SystemFunction036") == 0) {
-            // RtlGenRandom(pvBuffer=args[0], cbBuffer=args[1]) -> BOOLEAN
-            if (args[0] && args[1] > 0 && args[1] <= 256) {
-                uint8_t rnd[256];
-                for (uint32_t i = 0; i < args[1]; i++)
-                    rnd[i] = (uint8_t)(arc4random() & 0xFF);
-                wg_blink_write_mem(engine->blink, args[0], rnd, args[1]);
-            }
+            // RtlGenRandom(pvBuffer=args[0], cbBuffer=args[1]) -> BOOLEAN.
+            // Fill ANY size (BoringSSL/Steam may request large seeds; the old
+            // <=256 cap left big buffers uninitialized while still returning
+            // TRUE — TLS then aborts with internal_error building ClientHello).
+            wg_fill_random(engine->blink, args[0], args[1]);
+            WG_LOGI(TAG, "RtlGenRandom(buf=0x%X, %u) -> TRUE", args[0], args[1]);
             ret_val = 1; // TRUE = success
         } else if (strcmp(fn, "BCryptGenRandom") == 0) {
             // BCryptGenRandom(hAlgorithm=args[0], pbBuffer=args[1], cbBuffer=args[2], dwFlags=args[3])
-            if (args[1] && args[2] > 0) {
-                uint32_t len = args[2] < 4096 ? args[2] : 4096;
-                uint8_t *rnd = malloc(len);
-                if (rnd) {
-                    for (uint32_t i = 0; i < len; i++)
-                        rnd[i] = (uint8_t)(arc4random() & 0xFF);
-                    wg_blink_write_mem(engine->blink, args[1], rnd, len);
-                    free(rnd);
-                }
-            }
+            wg_fill_random(engine->blink, args[1], args[2]);
+            WG_LOGI(TAG, "BCryptGenRandom(buf=0x%X, %u) -> 0", args[1], args[2]);
             ret_val = 0; // STATUS_SUCCESS
+        } else if (strcmp(fn, "ProcessPrng") == 0) {
+            // BOOL ProcessPrng(PBYTE pbData=args[0], SIZE_T cbData=args[1]).
+            // BoringSSL on modern Windows reads entropy through this
+            // (bcryptprimitives.dll) before falling back to RtlGenRandom.
+            wg_fill_random(engine->blink, args[0], args[1]);
+            WG_LOGI(TAG, "ProcessPrng(buf=0x%X, %u) -> TRUE", args[0], args[1]);
+            ret_val = 1; // TRUE = success
+        } else if (strcmp(fn, "RtlGenRandom") == 0) {
+            wg_fill_random(engine->blink, args[0], args[1]);
+            WG_LOGI(TAG, "RtlGenRandom(buf=0x%X, %u) -> TRUE", args[0], args[1]);
+            ret_val = 1;
         } else if (strcmp(fn, "CreateFontW") == 0 ||
                    strcmp(fn, "CreateFontA") == 0 ||
                    strcmp(fn, "CreateFontIndirectW") == 0 ||
@@ -4041,6 +4077,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 0;
         } else if (strcmp(fn, "ExitThread") == 0) {
             WG_LOGI(TAG, "ExitThread(%u)", args[0]);
+            wg_dump_threads(engine, "ExitThread");
             wg_sched_exit_thread(engine->scheduler, engine->blink, args[0]);
             WGThread *cur_after = wg_sched_current(engine->scheduler);
             if (cur_after) {
@@ -4589,13 +4626,89 @@ static bool handle_blink_thunk(WGEngine *engine) {
                             WG_LOGW(TAG, "  [ECX+0x%02X]: %08X %08X %08X %08X",
                                     oi*16, obj[oi*4],obj[oi*4+1],obj[oi*4+2],obj[oi*4+3]);
                     }
-                    for (int fi = 0; fi < 12 && ebp > 0x10000 && ebp < 0xF0000000u; fi++) {
-                        uint32_t ra = 0, prev = 0;
+                    for (int fi = 0; fi < 14 && ebp > 0x10000 && ebp < 0xF0000000u; fi++) {
+                        uint32_t ra = 0, prev = 0, a1 = 0, a2 = 0;
                         wg_blink_read_mem(engine->blink, ebp + 4, &ra, 4);
                         wg_blink_read_mem(engine->blink, ebp, &prev, 4);
-                        WG_LOGW(TAG, "  [%d] EBP=0x%X ret=0x%X", fi, ebp, ra);
+                        wg_blink_read_mem(engine->blink, ebp + 8, &a1, 4);   // arg1 / stdcall 'this'
+                        wg_blink_read_mem(engine->blink, ebp + 12, &a2, 4);  // arg2
+                        WG_LOGW(TAG, "  [%d] EBP=0x%X ret=0x%X arg1=0x%X arg2=0x%X",
+                                fi, ebp, ra, a1, a2);
+                        // For the inner frames, dump 0x40 bytes of code before the
+                        // return address — how this call set up ECX('this') and
+                        // the args (i.e. where the NULL `this` came from).
+                        if (ra >= 0x401000u && ra < 0x800000u && fi < 4) {
+                            for (int r = 0; r < 4; r++) {
+                                uint8_t pb[16] = {0};
+                                wg_blink_read_mem(engine->blink, ra - 0x40 + r*16, pb, 16);
+                                WG_LOGW(TAG, "      @0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                    ra - 0x40 + r*16, pb[0],pb[1],pb[2],pb[3],pb[4],pb[5],pb[6],pb[7],
+                                    pb[8],pb[9],pb[10],pb[11],pb[12],pb[13],pb[14],pb[15]);
+                            }
+                        }
                         if (prev <= ebp || prev == 0) break;
                         ebp = prev;
+                    }
+                    // Is the real (connected) connection object still reachable on
+                    // the stack near ESP? If it is but `this`=0, the send path
+                    // loaded the wrong value — that pinpoints where the NULL came
+                    // from. Also scan its presence anywhere in the stack window.
+                    if (s_last_conn_obj) {
+                        uint32_t sp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                        uint32_t base = (sp > 0x4000) ? sp - 0x400 : 0; // a little below too
+                        uint32_t top  = (sp & ~0xFFFu) + 0x6000;
+                        int hits = 0;
+                        for (uint32_t a = base; a < top && hits < 12; a += 4) {
+                            uint32_t v = 0;
+                            wg_blink_read_mem(engine->blink, a, &v, 4);
+                            if (v == s_last_conn_obj) {
+                                WG_LOGW(TAG, "  conn 0x%X on stack @0x%X (ESP%+d)",
+                                        s_last_conn_obj, a, (int)(a - sp));
+                                hits++;
+                            }
+                        }
+                        if (!hits)
+                            WG_LOGW(TAG, "  conn 0x%X NOT found in stack window", s_last_conn_obj);
+                        // Dump the whole connection object so we can spot a
+                        // member that SHOULD point to a sub-object (the send
+                        // method's owner / 'this') but is NULL because we skipped
+                        // the Windows init that populates it.
+                        for (int row = 0; row < 8; row++) {
+                            uint32_t hdr[4] = {0};
+                            wg_blink_read_mem(engine->blink, s_last_conn_obj + row*16, hdr, 16);
+                            WG_LOGW(TAG, "  conn[0x%02X]: %08X %08X %08X %08X",
+                                    row*16, hdr[0],hdr[1],hdr[2],hdr[3]);
+                        }
+                    }
+                    // Dump a wide code window before the send-method call so we
+                    // can see where ESI ('this', which should be the connection
+                    // 0x22D16000) was loaded as 0 — the getter/member/global that
+                    // produced the NULL.
+                    {
+                        uint32_t ra1 = 0;
+                        wg_blink_read_mem(engine->blink, ((uint32_t)wg_blink_get_reg(engine->blink,5)) + 4, &ra1, 4);
+                        if (ra1 >= 0x401000u && ra1 < 0x800000u) {
+                            uint32_t cs = ra1 - 0x150;
+                            for (int row = 0; row < 21; row++) {
+                                uint8_t cb[16] = {0};
+                                wg_blink_read_mem(engine->blink, cs + row*16, cb, 16);
+                                WG_LOGW(TAG, "  code 0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                    cs+row*16, cb[0],cb[1],cb[2],cb[3],cb[4],cb[5],cb[6],cb[7],
+                                    cb[8],cb[9],cb[10],cb[11],cb[12],cb[13],cb[14],cb[15]);
+                            }
+                        }
+                        // esi (the connection 'this') is non-volatile but gets
+                        // clobbered to 0 by the call to 0x4E9280 just before the
+                        // send. Dump 0x4E9280 so we can see which Win32 call it
+                        // makes (likely with a wrong stack-cleanup arg count that
+                        // corrupts the saved esi) — that's OUR bug to fix.
+                        for (int row = 0; row < 12; row++) {
+                            uint8_t cb[16] = {0};
+                            wg_blink_read_mem(engine->blink, 0x4E9280 + row*16, cb, 16);
+                            WG_LOGW(TAG, "  fn4E9280+0x%02X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                row*16, cb[0],cb[1],cb[2],cb[3],cb[4],cb[5],cb[6],cb[7],
+                                cb[8],cb[9],cb[10],cb[11],cb[12],cb[13],cb[14],cb[15]);
+                        }
                     }
                     // socket 0 == NULL connection. On Windows the earlier
                     // this->m_socket read (this=NULL) faults into Steam's active
@@ -5394,6 +5507,7 @@ void wg_engine_tick(WGEngine *engine) {
                     if (cur && cur->id != 1) {
                         // Worker thread returned — exit it and switch
                         uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                        wg_dump_threads(engine, "thread-return");
                         wg_sched_exit_thread(engine->scheduler, engine->blink, eax);
                         wg_sched_wake(engine->scheduler, cur->handle);
                         if (wg_sched_switch_next(engine->scheduler, engine->blink))

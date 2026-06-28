@@ -600,6 +600,12 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("bcrypt.dll", BCryptGenRandom, 4);
     R1S("KERNEL32.dll", SystemFunction036, 2); // RtlGenRandom
     R1S("ADVAPI32.dll", SystemFunction036, 2);
+    R1S("ADVAPI32.dll", RtlGenRandom, 2);
+    // ProcessPrng — BoringSSL's preferred Windows entropy source (modern Steam)
+    R1S("bcryptprimitives.dll", ProcessPrng, 2);
+    R1S("cryptbase.dll", ProcessPrng, 2);
+    R1S("bcrypt.dll", ProcessPrng, 2);
+    R1S("ADVAPI32.dll", ProcessPrng, 2);
 
     // === vcruntime / ucrt ===
     // All standard CRT functions are __cdecl — caller cleans args (num_args=0).

@@ -1,6 +1,7 @@
 #include "wg_winsock.h"
 #include "wg_log.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -365,6 +366,8 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         uint8_t *buf = malloc(len);
         if (!buf) { ws->last_error = WSAEINVAL; *out_ret = WIN_SOCKET_ERROR; return true; }
         wg_blink_read_mem(blink, args[1], buf, len);
+        char hex[64] = {0}; uint32_t hn = len < 16 ? len : 16;
+        for (uint32_t i = 0; i < hn; i++) snprintf(hex + i*3, 4, "%02x ", buf[i]);
         ssize_t sent = send(fd, buf, len, 0);
         free(buf);
         if (sent < 0) {
@@ -372,7 +375,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             WG_LOGI(TAG, "send(0x%X, %u) -> ERR errno=%d wsa=%d", args[0], len, errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
-            WG_LOGI(TAG, "send(0x%X, %u) -> %zd", args[0], len, sent);
+            WG_LOGI(TAG, "send(0x%X, %u) -> %zd [%s]", args[0], len, sent, hex);
             *out_ret = (uint32_t)sent;
         }
         return true;
@@ -393,9 +396,11 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             WG_LOGI(TAG, "recv(0x%X, %u) -> ERR errno=%d wsa=%d", args[0], len, errno, ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
+            char hex[64] = {0}; uint32_t hn = (got > 0) ? ((uint32_t)got < 16 ? (uint32_t)got : 16) : 0;
+            for (uint32_t i = 0; i < hn; i++) snprintf(hex + i*3, 4, "%02x ", buf[i]);
             if (got > 0) wg_blink_write_mem(blink, args[1], buf, (uint32_t)got);
             free(buf);
-            WG_LOGI(TAG, "recv(0x%X, %u) -> %zd bytes", args[0], len, got);
+            WG_LOGI(TAG, "recv(0x%X, %u) -> %zd bytes [%s]", args[0], len, got, hex);
             *out_ret = (uint32_t)got;
         }
         return true;
@@ -827,16 +832,18 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             uint32_t e[2]; wg_blink_read_mem(blink, args[1] + i * 8, e, 8);
             if (e[0] && e[1]) { wg_blink_read_mem(blink, e[1], buf + off, e[0]); off += e[0]; }
         }
+        uint8_t pv[8] = {0}; memcpy(pv, buf, total < 8 ? total : 8);
         ssize_t sent = send(fd, buf, total, 0);
         free(buf);
         if (sent < 0) {
             ws->last_error = errno_to_wsa(errno);
-            WG_LOGW(TAG, "WSASend(0x%X, %zu) failed: %s", args[0], total, strerror(errno));
+            WG_LOGI(TAG, "WSASend(0x%X, %zu, ovl=0x%X) failed: %s", args[0], total, args[5], strerror(errno));
             *out_ret = WIN_SOCKET_ERROR;
         } else {
             if (args[3]) { uint32_t bs = (uint32_t)sent; wg_blink_write_mem(blink, args[3], &bs, 4); }
             if (args[5]) { uint32_t bs = (uint32_t)sent; wg_blink_write_mem(blink, args[5] + 4, &bs, 4); }
-            WG_LOGD(TAG, "WSASend(0x%X, %zu) -> %zd", args[0], total, sent);
+            WG_LOGI(TAG, "WSASend(0x%X, %zu, ovl=0x%X) -> %zd [%02x %02x %02x %02x]",
+                    args[0], total, args[5], sent, pv[0], pv[1], pv[2], pv[3]);
             *out_ret = 0;
         }
         return true;
@@ -860,7 +867,8 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         if (got < 0) {
             free(buf);
             ws->last_error = errno_to_wsa(errno);
-            WG_LOGW(TAG, "WSARecv(0x%X) failed: %s", args[0], strerror(errno));
+            WG_LOGI(TAG, "WSARecv(0x%X, cap=%zu, ovl=0x%X) failed: %s (wsa=%d)",
+                    args[0], total_cap, args[5], strerror(errno), ws->last_error);
             *out_ret = WIN_SOCKET_ERROR;
         } else {
             // Scatter received bytes into WSABUF entries
@@ -875,7 +883,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             free(buf);
             if (args[3]) { uint32_t bg = (uint32_t)got; wg_blink_write_mem(blink, args[3], &bg, 4); }
             if (args[5]) { uint32_t bg = (uint32_t)got; wg_blink_write_mem(blink, args[5] + 4, &bg, 4); }
-            WG_LOGD(TAG, "WSARecv(0x%X) -> %zd", args[0], got);
+            WG_LOGI(TAG, "WSARecv(0x%X, cap=%zu, ovl=0x%X) -> %zd", args[0], total_cap, args[5], got);
             *out_ret = 0;
         }
         return true;
