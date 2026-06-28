@@ -13,6 +13,21 @@
 
 static char s_exe_path[1024] = {0};
 static char s_exe_dir[1024]  = {0};
+static char s_wizard_bmp[1024] = {0};  // last-extracted welcome/wizard .bmp
+static char s_cwd_win[1024]  = {0};    // current dir (Windows path), SetCurrentDirectory
+
+const char *wg_files_wizard_bmp(void) {
+    return s_wizard_bmp[0] ? s_wizard_bmp : NULL;
+}
+
+void wg_files_set_cwd(const char *win_path) {
+    if (!win_path) { s_cwd_win[0] = 0; return; }
+    strncpy(s_cwd_win, win_path, sizeof(s_cwd_win) - 1);
+    s_cwd_win[sizeof(s_cwd_win) - 1] = 0;
+}
+const char *wg_files_get_cwd(void) {
+    return s_cwd_win[0] ? s_cwd_win : NULL;
+}
 // The "bottle" — a persistent Windows prefix (like a Wine/CrossOver bottle or a
 // GPTK bottle). drive_c is the guest C:\ root; every C:\ path maps under it, so
 // the installed app lands in e.g. drive_c/Program Files (x86)/Steam instead of
@@ -207,11 +222,33 @@ const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
                                char *buf, int bufsize) {
     ensure_bottle();
 
+    // Strip the Win32 long-path prefix \\?\ (or //?/): "\\?\C:\x" is identical to
+    // "C:\x". Without this, apps that use it (Steam: \\?\C:\package\...) create a
+    // literal "?" directory in the bottle. Also handle \\?\UNC\ -> \\ (rare).
+    const char *src = buf;
+    if ((src[0] == '\\' || src[0] == '/') && (src[1] == '\\' || src[1] == '/') &&
+        src[2] == '?' && (src[3] == '\\' || src[3] == '/')) {
+        src += 4;
+        if (strncasecmp(src, "UNC\\", 4) == 0 || strncasecmp(src, "UNC/", 4) == 0)
+            src += 4; // \\?\UNC\server\share -> server\share (best effort)
+    }
+
     // The installer .exe itself is the file the user picked — it lives in the
     // app sandbox, not inside the bottle, so keep mapping it to the real path.
-    if (strcasecmp(buf, "C:\\a.exe") == 0 ||
-        strcasecmp(buf, "C:/a.exe") == 0) {
+    if (strcasecmp(src, "C:\\a.exe") == 0 ||
+        strcasecmp(src, "C:/a.exe") == 0) {
         return s_exe_path;
+    }
+
+    // Relative path (no "X:" drive, not rooted at a separator)? Resolve it
+    // against the tracked current directory. NSIS's SetOutPath does a
+    // SetCurrentDirectory then extracts files by bare name — without this they
+    // land in the drive_c root instead of $INSTDIR (C:\Program Files\Steam).
+    bool is_abs = (src[0] && src[1] == ':') || src[0] == '\\' || src[0] == '/';
+    static char rel_join[1024];
+    if (!is_abs && s_cwd_win[0]) {
+        snprintf(rel_join, sizeof(rel_join), "%s\\%s", s_cwd_win, src);
+        src = rel_join;
     }
 
     // Everything else lives on the bottle's C: drive. Strip a leading drive
@@ -219,7 +256,7 @@ const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
     // makes C:\Temp\..., C:\Program Files (x86)\Steam\..., C:\Windows\..., etc.
     // all resolve to real, persistent paths inside the bottle — so an install
     // ends up in a proper drive_c tree instead of scattered temp files.
-    const char *p = buf;
+    const char *p = src;
     if (p[0] && p[1] == ':') p += 2;            // skip drive letter (any drive)
     while (*p == '\\' || *p == '/') p++;        // skip leading separators
 
@@ -269,6 +306,11 @@ uint32_t wg_files_create(const char *real_path, uint32_t access, uint32_t creati
             s_files[i].handle = s_next_handle++;
             s_files[i].in_use = true;
             strncpy(s_files[i].path, real_path, sizeof(s_files[i].path) - 1);
+            // Remember the wizard/welcome bitmap as it's extracted, so the
+            // nsDialogs welcome page can draw it natively (the script normally
+            // loads it via System::Call, which we don't emulate).
+            if (strcasestr(real_path, "wizard") && strcasestr(real_path, ".bmp"))
+                strncpy(s_wizard_bmp, real_path, sizeof(s_wizard_bmp) - 1);
             WG_LOGI(TAG, "Opened: %s -> handle 0x%X", real_path, s_files[i].handle);
             return s_files[i].handle;
         }
@@ -419,10 +461,29 @@ uint32_t wg_files_create_null(void) {
     return 0xFFFFFFFF;
 }
 
+// Copy a just-written file to a stable cache path so it survives NSIS deleting
+// its temp dir. Used for the welcome/wizard bitmap, which NSIS extracts to a
+// temp dir, then loads (via System::Call LoadImage) only after the dir is gone.
+static void wg_cache_wizard_bmp(const char *src) {
+    const char *dc = wg_files_drive_c();
+    if (!dc || !dc[0]) return;
+    char dst[1024];
+    snprintf(dst, sizeof dst, "%s/wg_wizard_cache.bmp", dc);
+    FILE *in = fopen(src, "rb"); if (!in) return;
+    FILE *out = fopen(dst, "wb"); if (!out) { fclose(in); return; }
+    char buf[8192]; size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+    fclose(in); fclose(out);
+    strncpy(s_wizard_bmp, dst, sizeof(s_wizard_bmp) - 1);
+    s_wizard_bmp[sizeof(s_wizard_bmp) - 1] = '\0';
+}
+
 bool wg_files_close(uint32_t handle) {
     WGFileEntry *f = find_file(handle);
     if (!f) return false;
     fclose(f->fp);
+    if (strcasestr(f->path, "wizard") && strcasestr(f->path, ".bmp"))
+        wg_cache_wizard_bmp(f->path);
     f->in_use = false;
     WG_LOGD(TAG, "Closed handle 0x%X", handle);
     return true;

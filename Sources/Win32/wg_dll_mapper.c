@@ -243,6 +243,7 @@ WGWin32StubFunc wg_dll_mapper_get_handler(WGDllMapper *mapper, uint64_t thunk_ad
 void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     // === KERNEL32.dll === (function, handler, num_stdcall_args)
     R1S("KERNEL32.dll", SetCurrentDirectoryW, 1);
+    R1S("KERNEL32.dll", SetCurrentDirectoryA, 1);
     R("KERNEL32.dll", GetFileAttributesW, stub_GetFileAttributesW, 1);
     RS("KERNEL32.dll", GetFullPathNameW, 4);
     RS("KERNEL32.dll", GetFullPathNameA, 4);
@@ -353,6 +354,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", QueryPerformanceCounter, 1);
     R1S("KERNEL32.dll", QueryPerformanceFrequency, 1);
     RS("KERNEL32.dll", GetSystemInfo, 1);
+    RS("KERNEL32.dll", GetNativeSystemInfo, 1);
     R1S("KERNEL32.dll", GetVersionExA, 1);
     R1S("KERNEL32.dll", GetVersionExW, 1);
 
@@ -586,7 +588,9 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("USER32.dll", AllowSetForegroundWindow, 1);
     RS ("GDI32.dll", GetStockObject, 1);
     RS ("GDI32.dll", CreateFontW, 14);
+    RS ("GDI32.dll", CreateFontA, 14);
     R1S("GDI32.dll", GetTextExtentPoint32W, 4);
+    R1S("GDI32.dll", GetTextExtentPoint32A, 4);
     RS ("GDI32.dll", CreateDIBSection, 6);
     RS ("ADVAPI32.dll", RegOpenKeyExA, 5);
     RS ("ADVAPI32.dll", RegCreateKeyExA, 9);
@@ -772,6 +776,8 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("USER32.dll", LoadImageW, 6);
     R1S("USER32.dll", SetTimer, 4);
     R1S("USER32.dll", SetWindowTextW, 2);
+    RS ("USER32.dll", GetWindowTextW, 3);
+    RS ("USER32.dll", GetWindowTextLengthW, 1);
     RS("USER32.dll", PostQuitMessage, 1);
     R1S("USER32.dll", ShowWindow, 2);
     RS("USER32.dll", GetDlgItem, 2);
@@ -801,6 +807,30 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("GDI32.dll", SelectObject, 2);
     RS("GDI32.dll", SetBkMode, 2);
     R1S("GDI32.dll", CreateFontIndirectW, 1);
+    R1S("GDI32.dll", CreateFontIndirectA, 1);
+
+    // nsDialogs plugin exports. NSIS plugins are __cdecl (the caller cleans the
+    // 5 args), so num_args MUST be 0 here — a non-zero count double-cleans the
+    // stack and crashes NSIS right after the call returns. The engine dispatches
+    // these natively (handle_nsdialogs) to build custom wizard pages.
+    RS("nsDialogs.dll", Create, 0);
+    RS("nsDialogs.dll", CreateControl, 0);
+    RS("nsDialogs.dll", CreateItem, 0);
+    RS("nsDialogs.dll", Show, 0);
+    RS("nsDialogs.dll", SetImage, 0);
+    RS("nsDialogs.dll", SetIcon, 0);
+    RS("nsDialogs.dll", SetUserData, 0);
+    RS("nsDialogs.dll", GetUserData, 0);
+    RS("nsDialogs.dll", OnClick, 0);
+    RS("nsDialogs.dll", OnChange, 0);
+    RS("nsDialogs.dll", OnNotify, 0);
+    RS("nsDialogs.dll", OnBack, 0);
+    RS("nsDialogs.dll", SetRTL, 0);
+    RS("nsDialogs.dll", CreateTimer, 0);
+    RS("nsDialogs.dll", KillTimer, 0);
+    RS("nsDialogs.dll", SelectFileDialog, 0);
+    RS("nsDialogs.dll", SelectFolderDialog, 0);
+    RS("nsDialogs.dll", SetButtonLong, 0);
     RS("GDI32.dll", SetTextColor, 2);
     R1S("GDI32.dll", DeleteObject, 1);
     R("GDI32.dll", GetDeviceCaps, stub_GetDeviceCaps, 2);
@@ -929,6 +959,9 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS ("WS2_32.dll", WSAWaitForMultipleEvents, 5);
     RS("WS2_32.dll", getaddrinfo, 4);
     RS("WS2_32.dll", freeaddrinfo, 1);
+    RS("WS2_32.dll", gethostname, 2);
+    RS("WS2_32.dll", gethostbyname, 1);
+    RS("WS2_32.dll", Ordinal_57, 2);   // gethostname (legacy ordinal)
     RS("WS2_32.dll", socket, 3);
     RS("WS2_32.dll", closesocket, 1);
     // __stdcall/4 — MUST be registered, else auto-stub (num_args=0) leaks 16

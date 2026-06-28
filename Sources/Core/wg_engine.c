@@ -340,6 +340,11 @@ static bool           s_iocp_created = false;
 // OS-gated (always true on Win10), independent of CreateIoCompletionPort. Left
 // false (IOCP stubs active) as the neutral default.
 static bool           s_disable_iocp = false;
+// Correlate the connection lifecycle across calls: record what connect() saw so
+// it can be reported at the later send(0,0,0) (which is what gets pasted).
+static uint32_t       s_last_conn_obj  = 0; // candidate CTCPConnection 'this' at connect
+static uint32_t       s_last_conn_sock = 0; // socket passed to connect
+static int            s_connect_calls  = 0; // # of connect() calls this run
 
 // Thread pool work object table
 #define WG_TP_WORK_BASE  0x9000u
@@ -580,6 +585,26 @@ static WGDlgCtrl s_ctrls[160];
 static int       s_ctrl_count = 0;
 static int       s_dlg_cx = 331, s_dlg_cy = 222; // last-parsed dialog-unit extent
 
+// ---- HFONT registry (so SelectObject can apply CreateFont* metrics) -----
+typedef struct { uint32_t handle; int px; bool bold; char name[64]; } WGFontRec;
+static WGFontRec s_fonts[64];
+static int       s_font_count = 0;
+static uint32_t  s_next_font_h = 0xF0000;
+
+static uint32_t wg_font_register(int px, bool bold, const char *name) {
+    uint32_t h = s_next_font_h++;
+    WGFontRec *f = &s_fonts[s_font_count % 64];
+    s_font_count++;
+    f->handle = h; f->px = px; f->bold = bold;
+    if (name) { strncpy(f->name, name, sizeof(f->name) - 1); f->name[sizeof(f->name)-1] = 0; }
+    else f->name[0] = 0;
+    return h;
+}
+static WGFontRec *wg_font_find(uint32_t h) {
+    for (int i = 0; i < 64; i++) if (s_fonts[i].handle == h && h) return &s_fonts[i];
+    return NULL;
+}
+
 // Synthetic control classes for runtime-styled instfiles controls so the
 // renderer can draw them (the dialog template stores these as class-NAME
 // strings, not atoms).
@@ -657,6 +682,20 @@ static void wg_remove_ctrls(uint32_t hwnd) {
         if (s_ctrls[i].hwnd != hwnd) s_ctrls[n++] = s_ctrls[i];
     s_ctrl_count = n;
 }
+
+// The wizard shows one inner page at a time inside the outer frame. When a new
+// page is created we retire the previous one (drop its controls + destroy its
+// window) so it stops compositing — otherwise the old page (e.g. the welcome
+// bitmap/text) bleeds through behind the new page, since NSIS's own
+// DestroyWindow for the old page often arrives with a null handle here.
+static uint32_t s_inner_page = 0;
+static void wg_retire_inner_page(uint32_t keep) {
+    if (s_inner_page && s_inner_page != keep) {
+        wg_remove_ctrls(s_inner_page);
+        wg_wm_destroy(s_inner_page);
+    }
+    s_inner_page = keep;
+}
 static void wg_parse_dialog(WGEngine *engine, uint32_t hwnd, uint32_t dlg_id) {
     wg_remove_ctrls(hwnd);          // replace this window's controls
     if (!engine->pe_image) return;
@@ -732,26 +771,30 @@ static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
         int px = (int)(c->x * sx), py = (int)(c->y * sy);
         int pw = (int)(c->cx * sx), ph = (int)(c->cy * sy);
         int tlen = 0; while (tlen < 79 && c->text[tlen]) tlen++;
+        int lh = wg_gdi_line_height(dc);
         if (c->cls == 0x0080) {                 // button (incl. group box)
             if ((c->style & 0x07) == 0x07 /*BS_GROUPBOX*/) {
                 // frame + caption, no fill
                 wg_gdi_fill_rect(dc, px, py, px + pw, py + 1, 0x00A0A0A0);
-                if (tlen) wg_gdi_text_out(dc, px + 6, py - 4, c->text, tlen);
+                if (tlen) wg_gdi_text_out_caption(dc, px + 6, py - lh / 2, c->text, tlen);
             } else {
+                // push button: light fill + center the caption both axes
                 wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00E1E1E1);
-                int tx = px + 6;
-                if (tlen) wg_gdi_text_out(dc, tx, py + (ph - 8) / 2, c->text, tlen);
+                int tw = wg_gdi_text_width(dc, c->text, tlen);
+                int tx = px + (pw - tw) / 2; if (tx < px + 4) tx = px + 4;
+                if (tlen) wg_gdi_text_out_caption(dc, tx, py + (ph - lh) / 2, c->text, tlen);
             }
         } else if (c->cls == 0x0082) {          // static
             if (c->is_bitmap && c->hbitmap)
                 wg_gdi_draw_bitmap(dc, px, py, pw, ph, c->hbitmap, 0, 0, 0, 0);
             else if (tlen)
-                wg_gdi_text_out(dc, px, py, c->text, tlen);
+                // Wrap within the control so long labels don't clip at the edge.
+                wg_gdi_text_box(dc, px, py, pw, ph > lh ? ph : lh, c->text, tlen);
         } else if (c->cls == 0x0081) {          // edit box
             wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00FFFFFF);
             wg_gdi_fill_rect(dc, px, py, px + pw, py + 1, 0x00808080);   // top border
             wg_gdi_fill_rect(dc, px, py, px + 1, py + ph, 0x00808080);   // left border
-            if (tlen) wg_gdi_text_out(dc, px + 3, py + (ph - 8) / 2, c->text, tlen);
+            if (tlen) wg_gdi_text_out(dc, px + 3, py + (ph - lh) / 2, c->text, tlen);
         } else if (c->cls == WG_CLS_PROGRESS) {     // msctls_progress32
             wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00C8C8C8);   // trough
             uint32_t mx = s_pb_max ? s_pb_max : 100;
@@ -761,13 +804,13 @@ static void wg_render_dialog(WGEngine *engine, uint32_t hwnd) {
         } else if (c->cls == WG_CLS_LISTVIEW) {     // the "details" install log
             wg_gdi_fill_rect(dc, px, py, px + pw, py + ph, 0x00FFFFFF);
             wg_gdi_fill_rect(dc, px, py, px + pw, py + 1, 0x00808080);
-            int lh = 11, rows = ph / lh;             // show the most recent lines
+            int llh = lh + 2, rows = ph / llh;       // show the most recent lines
             int first = s_detail_count > rows ? s_detail_count - rows : 0;
             for (int r = first; r < s_detail_count; r++) {
                 uint16_t wline[120]; int n = 0;
                 for (; n < 119 && s_detail_lines[r][n]; n++) wline[n] = (uint8_t)s_detail_lines[r][n];
                 wline[n] = 0;
-                if (n) wg_gdi_text_out(dc, px + 3, py + 2 + (r - first) * lh, wline, n);
+                if (n) wg_gdi_text_out(dc, px + 3, py + 2 + (r - first) * llh, wline, n);
             }
         }
     }
@@ -892,6 +935,205 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFFu;
     track_alloc(addr, size);
     return addr;
+}
+
+// ===== nsDialogs plugin emulation =======================================
+// NSIS plugins are invoked LoadLibrary + GetProcAddress + call with the ABI:
+//   void Export(HWND parent, int string_size, TCHAR *vars, stack_t **top, void*)
+// (stdcall, 5 args). Strings pass through the NSIS stack: a singly linked list
+// of inline TCHAR buffers. Unicode build: stack_t = { u32 next; u16 text[ss+1] }.
+// We pop the export's args and push results, then build the page's controls
+// through the same child-control path CreateWindowExW uses, so the Welcome/
+// Finish/custom pages render like the built-in template pages.
+static uint32_t s_nsd_page = 0;        // current nsDialogs inner page hwnd
+static uint32_t s_nsd_next_id = 2200;  // synthetic control ids
+// True while paused inside nsDialogs::Show. The guest is suspended cleanly right
+// after Show returned, so the Next tap must RESUME (let NSIS continue its natural
+// page advance) rather than inject a WM_COMMAND onto the half-run WM_INITDIALOG.
+static bool s_nsd_show_pause = false;
+
+static bool nsis_pop(WGEngine *e, uint32_t topp, int ssize, uint16_t *out, int outmax) {
+    uint32_t head = 0;
+    wg_blink_read_mem(e->blink, topp, &head, 4);
+    if (!head) { if (out && outmax) out[0] = 0; return false; }
+    uint32_t next = 0;
+    wg_blink_read_mem(e->blink, head, &next, 4);
+    int n = ssize + 1; if (n > outmax) n = outmax; if (n < 1) n = 1;
+    wg_blink_read_mem(e->blink, head + 4, out, n * 2);
+    if (outmax) out[outmax - 1] = 0;
+    wg_blink_write_mem(e->blink, topp, &next, 4);
+    return true;
+}
+static int nsis_pop_int(WGEngine *e, uint32_t topp, int ssize) {
+    uint16_t b[64] = {0}; nsis_pop(e, topp, ssize, b, 64);
+    char a[64]; int i; for (i = 0; i < 63 && b[i]; i++) a[i] = (char)b[i]; a[i] = 0;
+    return (int)strtol(a, NULL, 0);
+}
+static void nsis_push_int(WGEngine *e, uint32_t topp, int ssize, int v) {
+    if (ssize < 1) ssize = 1024;
+    uint32_t node = wg_guest_alloc(e, 4 + (uint32_t)(ssize + 1) * 2);
+    if (!node) return;
+    uint32_t head = 0; wg_blink_read_mem(e->blink, topp, &head, 4);
+    wg_blink_write_mem(e->blink, node, &head, 4);
+    char a[32]; snprintf(a, sizeof a, "%d", v);
+    uint16_t w[32]; int i; for (i = 0; a[i]; i++) w[i] = (uint8_t)a[i]; w[i] = 0;
+    wg_blink_write_mem(e->blink, node + 4, w, (i + 1) * 2);
+    wg_blink_write_mem(e->blink, topp, &node, 4);
+}
+
+// Parse an nsDialogs coordinate string: plain px, "<n>u" dialog units, or
+// "<n>%" percent of the page extent; negative anchors from the far edge.
+static int nsd_coord(const uint16_t *s, int extent_px, int unit_num, int unit_den) {
+    char a[32]; int i; for (i = 0; i < 31 && s[i]; i++) a[i] = (char)s[i]; a[i] = 0;
+    int len = (int)strlen(a); bool pct = false, du = false;
+    if (len && a[len-1] == '%') { pct = true; a[--len] = 0; }
+    else if (len && (a[len-1] == 'u' || a[len-1] == 'U')) { du = true; a[--len] = 0; }
+    long v = strtol(a, NULL, 0);
+    int px = pct ? (int)(v * extent_px / 100)
+           : du  ? (int)(v * unit_num / unit_den) : (int)v;
+    if (px < 0) px += extent_px;   // negative = relative to right/bottom edge
+    return px;
+}
+
+static uint16_t nsd_class(const uint16_t *cls16, uint32_t style, bool *is_bitmap) {
+    char c[40]; int i;
+    for (i = 0; i < 39 && cls16[i]; i++) c[i] = (char)tolower((unsigned char)cls16[i]);
+    c[i] = 0;
+    *is_bitmap = false;
+    if (strstr(c, "button")) return 0x0080;
+    if (strstr(c, "edit"))   return 0x0081;
+    if ((style & 0x0F) == 0x0E /*SS_BITMAP*/) *is_bitmap = true;
+    return 0x0082; // STATIC default (labels, bitmaps, links)
+}
+
+// Dispatch one nsDialogs export. Returns the value to leave in EAX.
+static uint32_t handle_nsdialogs(WGEngine *engine, const char *exp, uint32_t *args) {
+    uint32_t parent = args[0];
+    int ssize = (int)args[1]; if (ssize <= 0 || ssize > 8192) ssize = 1024;
+    uint32_t topp = args[3];   // stack_t **stacktop
+
+    if (strcasecmp(exp, "Create") == 0) {
+        int phid = nsis_pop_int(engine, topp, ssize);   // placeholder control id
+        int px = 0, py = 0, pw = 480, ph = 320;
+        int32_t cw = 0, chh = 0; wg_wm_get_client(parent, &cw, &chh);
+        WGDlgCtrl *ph_ctrl = wg_find_ctrl(parent, (uint32_t)phid);
+        if (!ph_ctrl) ph_ctrl = wg_find_ctrl(parent, 1018);
+        if (ph_ctrl) {
+            float sx = ph_ctrl->dlg_cx ? (float)cw / ph_ctrl->dlg_cx : 1.0f;
+            float sy = ph_ctrl->dlg_cy ? (float)chh / ph_ctrl->dlg_cy : 1.0f;
+            px = (int)(ph_ctrl->x * sx); py = (int)(ph_ctrl->y * sy);
+            pw = (int)(ph_ctrl->cx * sx); ph = (int)(ph_ctrl->cy * sy);
+        } else if (cw > 0 && chh > 0) { pw = cw; ph = chh; }
+        uint16_t title[1] = {0};
+        uint32_t hwnd = wg_wm_create_window(0, 0, title, 0x50000000, px, py, pw, ph, parent);
+        wg_retire_inner_page(hwnd);   // drop the previous page so it stops painting
+        s_nsd_page = hwnd; s_page_hwnd = hwnd;
+        WG_LOGI(TAG, "nsDialogs::Create(ph=%d) -> page 0x%X @ (%d,%d %dx%d)",
+                phid, hwnd, px, py, pw, ph);
+        nsis_push_int(engine, topp, ssize, (int)hwnd);
+        return hwnd;
+    }
+    if (strcasecmp(exp, "CreateControl") == 0 || strcasecmp(exp, "CreateItem") == 0) {
+        uint16_t cls[40]={0}, ss[24]={0}, sex[24]={0};
+        uint16_t sx_[24]={0}, sy_[24]={0}, sw_[24]={0}, sh_[24]={0}, text[256]={0};
+        nsis_pop(engine, topp, ssize, cls,  40);
+        nsis_pop(engine, topp, ssize, ss,   24);
+        nsis_pop(engine, topp, ssize, sex,  24);
+        nsis_pop(engine, topp, ssize, sx_,  24);
+        nsis_pop(engine, topp, ssize, sy_,  24);
+        nsis_pop(engine, topp, ssize, sw_,  24);
+        nsis_pop(engine, topp, ssize, sh_,  24);
+        nsis_pop(engine, topp, ssize, text, 256);
+        char sb[24]; int i; for (i=0;i<23&&ss[i];i++) sb[i]=(char)ss[i]; sb[i]=0;
+        uint32_t style = (uint32_t)strtoul(sb, NULL, 0);
+        int32_t cw=0, chh=0; wg_wm_get_client(s_nsd_page, &cw, &chh);
+        int x = nsd_coord(sx_, cw,  3, 2);    // ~1.5 px per dialog unit (x)
+        int y = nsd_coord(sy_, chh, 13, 8);   // ~1.6 px per dialog unit (y)
+        int w = nsd_coord(sw_, cw,  3, 2);
+        int h = nsd_coord(sh_, chh, 13, 8);
+        bool is_bmp = false;
+        uint16_t cc = nsd_class(cls, style, &is_bmp);
+        uint32_t id = s_nsd_next_id++;
+        int before = s_ctrl_count;
+        wg_register_child_control(s_nsd_page, id, style, cc, x, y, w, h, text);
+        // Return a real control handle (WG_CTRL_HWND_BASE + index), not the raw
+        // id — that's what GetDlgItem/SendMessage(STM_SETIMAGE)/SetWindowText
+        // resolve through, so the script can set the control's bitmap/text later.
+        uint32_t ctrl_hwnd = 0;
+        if (s_ctrl_count > before) {
+            int idx = s_ctrl_count - 1;
+            if (is_bmp) s_ctrls[idx].is_bitmap = true;
+            ctrl_hwnd = WG_CTRL_HWND_BASE + (uint32_t)idx;
+        }
+        char ca[40]; for (i=0;i<39&&cls[i];i++) ca[i]=(char)cls[i]; ca[i]=0;
+        char ta[64]; for (i=0;i<63&&text[i];i++) ta[i]=text[i]<128?(char)text[i]:'?'; ta[i]=0;
+        WG_LOGI(TAG, "nsDialogs::CreateControl(%s s=0x%X @%d,%d %dx%d) hwnd=0x%X '%s'",
+                ca, style, x, y, w, h, ctrl_hwnd, ta);
+        nsis_push_int(engine, topp, ssize, (int)ctrl_hwnd);
+        return ctrl_hwnd;
+    }
+    if (strcasecmp(exp, "Show") == 0) {
+        // Native welcome bitmap: MUI loads it via System::Call -> LoadImage, but
+        // by load time NSIS has deleted the bmp's temp dir, so the script's image
+        // fails (control ends up SS_BITMAP with no image). Here we attach the
+        // cached wizard .bmp ourselves: first to an existing empty bitmap control,
+        // else (if the page reserved a left strip) we add one.
+        const char *wb = wg_files_wizard_bmp();
+        if (s_nsd_page && wb) {
+            int32_t pw = 0, ph = 0; wg_wm_get_client(s_nsd_page, &pw, &ph);
+            bool attached = false, has_bmp = false; int min_x = pw;
+            for (int i = 0; i < s_ctrl_count; i++) {
+                if (s_ctrls[i].hwnd != s_nsd_page) continue;
+                if (s_ctrls[i].is_bitmap) {
+                    has_bmp = true;
+                    if (!s_ctrls[i].hbitmap) {       // empty placeholder -> fill it
+                        uint32_t hb = wg_bitmap_load_file(wb);
+                        if (hb) { s_ctrls[i].hbitmap = hb; attached = true;
+                            WG_LOGI(TAG, "welcome bitmap '%s' -> existing ctrl", wb); }
+                    } else attached = true;
+                } else if (s_ctrls[i].x < min_x) min_x = s_ctrls[i].x;
+            }
+            if (!attached && !has_bmp && min_x >= 40 && min_x < pw && ph > 0) {
+                uint32_t hb = wg_bitmap_load_file(wb);
+                if (hb) {
+                    uint32_t id = s_nsd_next_id++;
+                    int before = s_ctrl_count;
+                    wg_register_child_control(s_nsd_page, id, 0x0E /*SS_BITMAP*/,
+                                              0x0082, 0, 0, min_x, ph, NULL);
+                    if (s_ctrl_count > before) {
+                        s_ctrls[s_ctrl_count - 1].is_bitmap = true;
+                        s_ctrls[s_ctrl_count - 1].hbitmap = hb;
+                    }
+                    WG_LOGI(TAG, "welcome bitmap '%s' -> new left strip %dx%d", wb, min_x, ph);
+                }
+            }
+        }
+        if (s_nsd_page) wg_render_dialog(engine, s_nsd_page);
+        // Go modal here so the user actually sees this page. NSIS auto-advances
+        // through custom pages, so without a pause it races to the next page. The
+        // guest is suspended cleanly after Show returns; the Next tap RESUMES
+        // (see wg_engine_dialog_command) so NSIS continues to the next page.
+        engine->state = WG_ENGINE_PAUSED;
+        s_nsd_show_pause = true;
+        WG_LOGI(TAG, "nsDialogs::Show page=0x%X — modal, waiting", s_nsd_page);
+        return 0;
+    }
+    // Remaining exports (SetImage/SetUserData/On*/SelectFileDialog/timers) are
+    // not needed to render the page text; log so we can see what a real page
+    // actually calls, then flesh out in the next iteration.
+    WG_LOGI(TAG, "nsDialogs::%s (stub)", exp);
+    return 0;
+}
+
+// True for the nsDialogs plugin exports we emulate (routed in GetProcAddress).
+static bool is_nsdialogs_export(const char *n) {
+    static const char *exps[] = {
+        "Create", "CreateControl", "CreateItem", "Show", "SetImage", "SetIcon",
+        "SetUserData", "GetUserData", "OnClick", "OnChange", "OnNotify", "OnBack",
+        "SetRTL", "CreateTimer", "KillTimer", "SelectFileDialog",
+        "SelectFolderDialog", "SetButtonLong", NULL };
+    for (int i = 0; exps[i]; i++) if (strcmp(n, exps[i]) == 0) return true;
+    return false;
 }
 
 // ---- Fake COM IShellLink / IPersistFile -----------------------------------
@@ -1054,9 +1296,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
         wg_blink_read_mem(engine->blink, rsp, &ret_addr, 8);
     }
 
-    // For 32-bit cdecl/stdcall, arguments are on the stack after the return address
-    // Read up to 12 args (enough for CreateWindowExW which has 12 params)
-    uint32_t args[12] = {0};
+    // For 32-bit cdecl/stdcall, arguments are on the stack after the return address.
+    // Read up to 16 args (CreateFontW has 14 params; reading a few extra words
+    // past a shorter call's args is harmless — we only use the indices we need).
+    uint32_t args[16] = {0};
     if (is_32bit) {
         wg_blink_read_mem(engine->blink, rsp + 4, args, sizeof(args));
     }
@@ -1071,7 +1314,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (entry) {
         const char *fn = entry->func_name;
 
-        if (strcmp(fn, "CreateWindowExW") == 0) {
+        if (entry->dll_name && strcasecmp(entry->dll_name, "nsDialogs.dll") == 0) {
+            ret_val = handle_nsdialogs(engine, fn, args);
+        } else if (strcmp(fn, "CreateWindowExW") == 0) {
             // stdcall CreateWindowExW(exStyle, className, windowName, style,
             //                         x, y, w, h, parent, menu, instance, param)
             // args[0]=exStyle, args[1]=className, args[2]=windowName, args[3]=style
@@ -1115,6 +1360,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[1]) {
                 wg_blink_read_mem(engine->blink, args[1], text_buf, 510);
             }
+            // Control handle? store its text and repaint the page. NSIS sets the
+            // directory edit's default path this way (SetWindowText on the edit's
+            // HWND, not SetDlgItemText); without this the field shows blank AND
+            // GetWindowText/GetDlgItemText read back empty -> $INSTDIR empty ->
+            // everything installs to the drive_c root.
+            WGDlgCtrl *cc = wg_ctrl_from_handle(args[0]);
+            if (cc) {
+                int n = 0; while (n < 79 && text_buf[n]) { cc->text[n] = text_buf[n]; n++; }
+                cc->text[n] = 0;
+                if (s_dlg_active) wg_render_dialog(engine, cc->hwnd);
+                ret_val = 1;
+                goto setwindowtext_done;
+            }
             wg_wm_set_text(args[0], text_buf);
             // Render text into the window's client area
             WGWin32Window *tw = wg_wm_find(args[0]);
@@ -1131,12 +1389,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     // Render text (use GDI text_out on this window's DC)
                     uint32_t dc = wg_gdi_get_dc(args[0]);
                     wg_gdi_set_text_color(dc, 0x00000000);
-                    wg_gdi_text_out(dc, 4, (ch - 8) / 2, text_buf, tlen);
+                    int lh = wg_gdi_line_height(dc);
+                    wg_gdi_text_out(dc, 4, (ch - lh) / 2, text_buf, tlen);
                     wg_gdi_release_dc(dc);
                     tw->client_dirty = true;
                 }
             }
             ret_val = 1;
+        setwindowtext_done: ;
         } else if (strcmp(fn, "GetClientRect") == 0 || strcmp(fn, "GetWindowRect") == 0) {
             WGWin32Window *w = wg_wm_find(args[0]);
             if (w && args[1]) {
@@ -1187,6 +1447,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_read_mem(engine->blink, args[3], buf, count * 2);
             wg_gdi_text_out(args[0], (int)args[1], (int)args[2], buf, count);
             ret_val = 1;
+        } else if (strcmp(fn, "GetTextExtentPoint32W") == 0 ||
+                   strcmp(fn, "GetTextExtentPoint32A") == 0) {
+            // (hdc, lpString, c, lpSize) -> write measured {cx, cy}
+            bool wide = (fn[strlen(fn) - 1] == 'W');
+            int count = (int)args[2];
+            if (count < 0) count = 0; if (count > 1024) count = 1024;
+            uint16_t buf[1025] = {0};
+            if (args[1] && count > 0) {
+                if (wide) wg_blink_read_mem(engine->blink, args[1], buf, count * 2);
+                else { char a[1025]; wg_blink_read_mem(engine->blink, args[1], a, count);
+                       for (int i = 0; i < count; i++) buf[i] = (uint8_t)a[i]; }
+            }
+            int cx = wg_gdi_text_width(args[0], buf, count);
+            int cy = wg_gdi_line_height(args[0]);
+            if (args[3]) { int32_t sz[2] = { cx, cy };
+                           wg_blink_write_mem(engine->blink, args[3], sz, 8); }
+            ret_val = 1;
         } else if (strcmp(fn, "MoveToEx") == 0) {
             wg_gdi_move_to(args[0], (int)args[1], (int)args[2]);
             ret_val = 1;
@@ -1210,6 +1487,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 const char *real = wg_files_map_path(args[1], engine->blink,
                                                      apath, sizeof(apath));
                 if (real) ret_val = wg_bitmap_load_file(real);
+                // The wizard bmp is usually loaded after NSIS deletes its temp
+                // dir, so the direct path fails — fall back to our stable cache.
+                if (!ret_val && strcasestr(apath, "wizard")) {
+                    const char *cache = wg_files_wizard_bmp();
+                    if (cache) ret_val = wg_bitmap_load_file(cache);
+                }
                 WG_LOGI(TAG, "LoadImageW('%s') -> HBITMAP 0x%X", apath,
                         (uint32_t)ret_val);
             }
@@ -1228,6 +1511,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint32_t prev = wg_gdi_select_bitmap(args[0], args[1]);
                 ret_val = prev ? prev : 1;
             } else {
+                WGFontRec *f = wg_font_find(args[1]);
+                if (f) wg_gdi_select_font(args[0], f->px, f->bold, f->name);
                 ret_val = 1;
             }
         } else if (strcmp(fn, "DeleteObject") == 0) {
@@ -1403,6 +1688,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 char func_name[256] = {0};
                 wg_blink_read_mem(engine->blink, name_ptr, func_name, 255);
 
+                // nsDialogs plugin exports route to our native emulation BEFORE
+                // any real module export, so the Welcome/Finish custom pages get
+                // built by us (the real plugin's message loop fights our modal).
+                if (is_nsdialogs_export(func_name)) {
+                    uint32_t t = wg_dll_mapper_resolve(engine->dll_mapper,
+                                                       "nsDialogs.dll", func_name);
+                    if (t >= 0xC00000ULL && t < 0xC00000ULL + 0x20000) {
+                        uint8_t hlt = 0xF4;
+                        wg_blink_write_mem(engine->blink, t, &hlt, 1);
+                    }
+                    ret_val = t;
+                    WG_LOGI(TAG, "GetProcAddress(nsDialogs!%s) -> 0x%llx",
+                            func_name, (unsigned long long)t);
+                    // fall through to stack cleanup below
+                    goto gpa_done;
+                }
+
                 // If hModule is a DLL we actually mapped, resolve from its real
                 // export table so the plug-in's own code runs (e.g. nsProcess).
                 uint32_t exp = wg_module_export(hmod, func_name);
@@ -1443,6 +1745,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 WG_LOGI(TAG, "GetProcAddress(ordinal %u -> %s) -> 0x%llx",
                         ord, ordinal_name, (unsigned long long)ret_val);
             }
+        gpa_done: ;
         } else if (strcmp(fn, "LoadLibraryExW") == 0 ||
                    strcmp(fn, "LoadLibraryW") == 0) {
             // LoadLibrary[Ex]W(lpLibFileName, [hFile, dwFlags])
@@ -1614,6 +1917,27 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "GetVersion") == 0) {
             ret_val = 0x00000A00;
+        } else if (strcmp(fn, "GetSystemInfo") == 0 ||
+                   strcmp(fn, "GetNativeSystemInfo") == 0) {
+            // SYSTEM_INFO (36 bytes). Report 1 processor so apps that gate IOCP
+            // on CPU count (Steam's BUseIOCP) use the synchronous socket path we
+            // support. Must be a real handler — auto-stub (num_args=0) on this
+            // 1-arg stdcall would corrupt the guest stack for the next call.
+            if (args[0]) {
+                uint8_t si[36] = {0};
+                uint32_t v32;
+                v32 = 4096;       memcpy(si + 4,  &v32, 4); // dwPageSize
+                v32 = 0x00010000; memcpy(si + 8,  &v32, 4); // lpMinimumApplicationAddress
+                v32 = 0x7FFE0000; memcpy(si + 12, &v32, 4); // lpMaximumApplicationAddress
+                v32 = 1;          memcpy(si + 16, &v32, 4); // dwActiveProcessorMask
+                v32 = 1;          memcpy(si + 20, &v32, 4); // dwNumberOfProcessors
+                v32 = 586;        memcpy(si + 24, &v32, 4); // dwProcessorType (PROCESSOR_INTEL_PENTIUM)
+                v32 = 0x00010000; memcpy(si + 28, &v32, 4); // dwAllocationGranularity
+                uint16_t w16 = 6; memcpy(si + 32, &w16, 2); // wProcessorLevel
+                wg_blink_write_mem(engine->blink, args[0], si, 36);
+            }
+            WG_LOGI(TAG, "%s -> 1 processor", fn);
+            ret_val = 0;
         } else if (strcmp(fn, "GetCommandLineW") == 0 ||
                    strcmp(fn, "GetCommandLineA") == 0) {
             // Map a page at 0xA00000 on first call (W at +0, A at +0x100)
@@ -1708,11 +2032,33 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[1] && args[0] >= (uint32_t)n)
                 wg_blink_write_mem(engine->blink, args[1], tmp, n * 2);
             ret_val = (args[0] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
+        } else if (strcmp(fn, "SetCurrentDirectoryW") == 0 ||
+                   strcmp(fn, "SetCurrentDirectoryA") == 0) {
+            // Track the current dir so relative file writes (NSIS SetOutPath +
+            // File) resolve under $INSTDIR instead of the drive_c root.
+            char path[520] = {0};
+            if (args[0]) {
+                bool wide = (fn[strlen(fn) - 1] == 'W');
+                if (wide) {
+                    uint16_t w[520] = {0};
+                    wg_blink_read_mem(engine->blink, args[0], w, 1038);
+                    for (int i = 0; i < 519 && w[i]; i++)
+                        path[i] = w[i] < 128 ? (char)w[i] : '?';
+                } else {
+                    wg_blink_read_mem(engine->blink, args[0], path, 519);
+                }
+            }
+            wg_files_set_cwd(path[0] ? path : NULL);
+            WG_LOGI(TAG, "SetCurrentDirectory('%s')", path);
+            ret_val = 1;
         } else if (strcmp(fn, "GetCurrentDirectoryW") == 0 ||
                    strcmp(fn, "GetCurrentDirectoryA") == 0) {
-            const char *winpath = wg_files_exe_win_path();
+            const char *cwd = wg_files_get_cwd();
+            const char *winpath = cwd ? cwd : wg_files_exe_win_path();
             char dir[520] = {0};
-            const char *last = strrchr(winpath, '\\');
+            // A tracked cwd is already a directory; only strip a filename when
+            // falling back to the exe path.
+            const char *last = cwd ? NULL : strrchr(winpath, '\\');
             int dirlen = last ? (int)(last - winpath) : (int)strlen(winpath);
             memcpy(dir, winpath, dirlen);
             // Ensure trailing backslash for root dirs (C: -> C:\)
@@ -2093,6 +2439,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_write_mem(engine->blink, args[2], tmp, (n + 1) * 2);
             }
             ret_val = n;
+        } else if (strcmp(fn, "GetWindowTextW") == 0) {
+            // GetWindowTextW(hWnd=args[0], lpString=args[1], nMaxCount=args[2]).
+            // For a control handle return its stored text (the directory edit's
+            // path); for a window return its title. Needed so NSIS reads the
+            // chosen install path back (-> $INSTDIR) instead of empty.
+            int n = 0;
+            if (args[1] && args[2] > 0) {
+                uint16_t tmp[80] = {0};
+                WGDlgCtrl *c = wg_ctrl_from_handle(args[0]);
+                if (c) {
+                    while (n < 79 && c->text[n] && (uint32_t)(n + 1) < args[2])
+                        { tmp[n] = c->text[n]; n++; }
+                }
+                tmp[n] = 0;
+                wg_blink_write_mem(engine->blink, args[1], tmp, (n + 1) * 2);
+            }
+            ret_val = n;
         } else if (strcmp(fn, "SetDlgItemTextW") == 0) {
             // SetDlgItemTextW(hDlg=args[0], id=args[1], lpString=args[2])
             WGDlgCtrl *c = wg_find_ctrl(args[0], args[1]);
@@ -2204,6 +2567,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                                                 px, py, pw, ph, parent);
             WGWin32Window *pw_win = wg_wm_find(hwnd);
             if (pw_win) pw_win->wndproc = dlgproc;
+            wg_retire_inner_page(hwnd);   // drop the previous page so it stops painting
             // Parse the page's own dialog template (e.g. the directory page) so
             // we can render its controls — these are built-in NSIS dialogs, not
             // nsDialogs plugin pages.
@@ -2274,8 +2638,40 @@ static bool handle_blink_thunk(WGEngine *engine) {
                    strcmp(fn, "CreateFontA") == 0 ||
                    strcmp(fn, "CreateFontIndirectW") == 0 ||
                    strcmp(fn, "CreateFontIndirectA") == 0) {
-            static uint32_t s_next_font = 0xF0000;
-            ret_val = s_next_font++;
+            int height = 0, weight = 400; char face[64] = {0};
+            bool wide = (fn[strlen(fn) - 1] == 'W');
+            if (strstr(fn, "Indirect")) {
+                // arg0 -> LOGFONT{W,A}: lfHeight@0, lfWeight@16, lfFaceName@28
+                if (args[0]) {
+                    int32_t lf[5];
+                    wg_blink_read_mem(engine->blink, args[0], lf, 20);
+                    height = (int32_t)lf[0]; weight = (int32_t)lf[4];
+                    if (wide) {
+                        uint16_t wf[32] = {0};
+                        wg_blink_read_mem(engine->blink, args[0] + 28, wf, 64);
+                        for (int i = 0; i < 31 && wf[i]; i++) face[i] = wf[i] < 128 ? (char)wf[i] : '?';
+                    } else {
+                        wg_blink_read_mem(engine->blink, args[0] + 28, face, 32);
+                    }
+                }
+            } else {
+                // CreateFont(cHeight, cWidth, ..., cWeight@4, ..., pszFaceName@13)
+                height = (int32_t)args[0]; weight = (int32_t)args[4];
+                if (args[13]) {
+                    if (wide) {
+                        uint16_t wf[32] = {0};
+                        wg_blink_read_mem(engine->blink, args[13], wf, 64);
+                        for (int i = 0; i < 31 && wf[i]; i++) face[i] = wf[i] < 128 ? (char)wf[i] : '?';
+                    } else {
+                        wg_blink_read_mem(engine->blink, args[13], face, 32);
+                    }
+                }
+            }
+            int px = height < 0 ? -height : height;       // negative = em height
+            if (px <= 0 || px > 200) px = 13;             // clamp / default
+            ret_val = wg_font_register(px, weight >= 600, face);
+            WG_LOGI(TAG, "%s('%s' h=%d w=%d) -> px=%d HFONT 0x%X",
+                    fn, face, height, weight, px, (uint32_t)ret_val);
         } else if (strcmp(fn, "MulDiv") == 0) {
             // MulDiv(nNumber=args[0], nNumerator=args[1], nDenominator=args[2])
             int32_t a = (int32_t)args[0];
@@ -3087,6 +3483,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 case 0x24:            path = "C:\\Windows"; break;
                 case 0x25:            path = "C:\\Windows\\System32"; break;
                 case 0x26:            path = "C:\\Program Files"; break;
+                case 0x2A:            path = "C:\\Program Files (x86)"; break; // CSIDL_PROGRAM_FILESX86
                 default:              path = "C:\\users\\steamuser"; break;
             }
             if (args[4]) {
@@ -3903,6 +4300,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     case 22: ws_fn = "shutdown"; break;
                     case 23: ws_fn = "socket"; break;
                     case 52: ws_fn = "gethostbyname"; break;
+                    case 57: ws_fn = "gethostname"; break;
                     // WS2_32 fixed ordinals (Microsoft): 111=WSAGetLastError,
                     // 112=WSASetLastError. WSAEnumNetworkEvents/WSAEventSelect are
                     // imported by NAME, not these ordinals — the old mapping made
@@ -3951,13 +4349,99 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (!ws_handled) {
                 uint64_t ws_ret = 0;
                 WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
+                // Trace the connection object at connect() so we can correlate it
+                // with the NULL connection at the later send(0,0,0). The owning
+                // CTCPConnection 'this' is usually held in a callee-saved reg
+                // (ESI/EDI/EBX). Identify it by a vtable pointer in the PE range.
+                if (strcmp(ws_fn, "connect") == 0) {
+                    s_connect_calls++;
+                    s_last_conn_sock = args[0];
+                    uint32_t r_ecx = (uint32_t)wg_blink_get_reg(engine->blink, 1);
+                    uint32_t r_ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                    uint32_t r_esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    uint32_t r_edi = (uint32_t)wg_blink_get_reg(engine->blink, 7);
+                    WG_LOGW(TAG, "connect #%d: sock=0x%X ECX=%08X EBX=%08X ESI=%08X EDI=%08X",
+                            s_connect_calls, args[0], r_ecx, r_ebx, r_esi, r_edi);
+                    uint32_t cand[4] = { r_ecx, r_ebx, r_esi, r_edi };
+                    const char *cn[4] = { "ECX", "EBX", "ESI", "EDI" };
+                    for (int ci = 0; ci < 4; ci++) {
+                        if (cand[ci] >= 0x10000u && cand[ci] < 0xF0000000u) {
+                            uint32_t vt = 0;
+                            wg_blink_read_mem(engine->blink, cand[ci], &vt, 4);
+                            if (vt >= 0x400000u && vt < 0x800000u) {
+                                WG_LOGW(TAG, "  %s=0x%X looks like an object (vtable=0x%X)",
+                                        cn[ci], cand[ci], vt);
+                                if (!s_last_conn_obj) s_last_conn_obj = cand[ci];
+                            }
+                        }
+                    }
+                    uint32_t cbp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                    for (int fi = 0; fi < 6 && cbp > 0x10000 && cbp < 0xF0000000u; fi++) {
+                        uint32_t ra = 0, prev = 0;
+                        wg_blink_read_mem(engine->blink, cbp + 4, &ra, 4);
+                        wg_blink_read_mem(engine->blink, cbp, &prev, 4);
+                        WG_LOGW(TAG, "  connect [%d] EBP=0x%X ret=0x%X", fi, cbp, ra);
+                        if (prev <= cbp || prev == 0) break;
+                        cbp = prev;
+                    }
+                }
                 // Diagnostic: a send on socket 0 is the symptom of Steam's TCP
                 // layer bailing. Dump the guest caller chain so we can see which
                 // code path issues it (real TLS send vs assert/cleanup).
                 if (strcmp(ws_fn, "send") == 0 && args[0] == 0) {
                     uint32_t ebp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
-                    WG_LOGW(TAG, "send(s=0!) buf=0x%X len=0x%X flags=0x%X — caller chain:",
-                            args[1], args[2], args[3]);
+                    uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                    uint32_t ecx = (uint32_t)wg_blink_get_reg(engine->blink, 1);
+                    uint32_t edx = (uint32_t)wg_blink_get_reg(engine->blink, 2);
+                    uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                    uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    uint32_t edi = (uint32_t)wg_blink_get_reg(engine->blink, 7);
+                    WG_LOGW(TAG, "send(s=0!) buf=0x%X len=0x%X flags=0x%X", args[1], args[2], args[3]);
+                    WG_LOGW(TAG, "  EAX=%08X ECX=%08X EDX=%08X EBX=%08X ESI=%08X EDI=%08X",
+                            eax, ecx, edx, ebx, esi, edi);
+                    // Correlation (in the block that always gets pasted): did a
+                    // connect() ever happen, and what connection object did it use?
+                    WG_LOGW(TAG, "  CORRELATION: connect_calls=%d last_conn_obj=0x%X last_conn_sock=0x%X (this send: ESI/this=0x%X)",
+                            s_connect_calls, s_last_conn_obj, s_last_conn_sock, esi);
+                    // Dump the guest SEH chain (fs:[0] = TEB[0]). If Steam has a
+                    // __try handler in its .text around this code, delivering the
+                    // NULL-deref AV to it could let it recover. Each
+                    // EXCEPTION_REGISTRATION_RECORD = { Next, Handler }.
+                    {
+                        uint32_t seh = 0;
+                        wg_blink_read_mem(engine->blink, s_main_teb + 0, &seh, 4);
+                        WG_LOGW(TAG, "  SEH chain head (fs:[0])=0x%X:", seh);
+                        for (int si = 0; si < 16 && seh > 0x1000u && seh < 0xFFFFFFFEu; si++) {
+                            uint32_t rec[2] = {0};
+                            wg_blink_read_mem(engine->blink, seh, rec, 8);
+                            WG_LOGW(TAG, "    [%d] frame=0x%X handler=0x%X", si, seh, rec[1]);
+                            if (rec[0] <= seh) break; // chain walks up the stack
+                            seh = rec[0];
+                        }
+                    }
+                    uint32_t ra0 = 0;
+                    wg_blink_read_mem(engine->blink, ebp + 4, &ra0, 4);
+                    // Disassemble the send call site (how the socket arg was pushed).
+                    if (ra0 >= 0x401000u && ra0 < 0x800000u) {
+                        uint32_t cs = (ra0 >= 40) ? ra0 - 40 : 0;
+                        uint8_t cb[48] = {0};
+                        wg_blink_read_mem(engine->blink, cs, cb, 48);
+                        for (int ci = 0; ci < 3; ci++) {
+                            int b = ci * 16;
+                            WG_LOGW(TAG, "  callsite 0x%X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                                    cs + (uint32_t)b,
+                                    cb[b+0],cb[b+1],cb[b+2],cb[b+3],cb[b+4],cb[b+5],cb[b+6],cb[b+7],
+                                    cb[b+8],cb[b+9],cb[b+10],cb[b+11],cb[b+12],cb[b+13],cb[b+14],cb[b+15]);
+                        }
+                    }
+                    // Dump the likely connection object (ECX = thiscall 'this').
+                    if (ecx >= 0x10000u && ecx < 0xF0000000u) {
+                        uint32_t obj[24] = {0};
+                        wg_blink_read_mem(engine->blink, ecx, obj, sizeof(obj));
+                        for (int oi = 0; oi < 6; oi++)
+                            WG_LOGW(TAG, "  [ECX+0x%02X]: %08X %08X %08X %08X",
+                                    oi*16, obj[oi*4],obj[oi*4+1],obj[oi*4+2],obj[oi*4+3]);
+                    }
                     for (int fi = 0; fi < 12 && ebp > 0x10000 && ebp < 0xF0000000u; fi++) {
                         uint32_t ra = 0, prev = 0;
                         wg_blink_read_mem(engine->blink, ebp + 4, &ra, 4);
@@ -4298,7 +4782,7 @@ static void wg_setup_win32_teb(WGEngine *engine) {
     uint8_t bd = 0; wg_blink_write_mem(engine->blink, peb + 0x02, &bd, 1);   // BeingDebugged
     wg_blink_write_mem(engine->blink, peb + 0x08, &image_base, 4);           // ImageBaseAddress
     wg_blink_write_mem(engine->blink, peb + 0x18, &heap_handle, 4);          // ProcessHeap
-    v = 4;     wg_blink_write_mem(engine->blink, peb + 0x64, &v, 4);         // NumberOfProcessors
+    v = 1;     wg_blink_write_mem(engine->blink, peb + 0x64, &v, 4);         // NumberOfProcessors (1 = steer apps to synchronous I/O, not IOCP)
     v = 10;    wg_blink_write_mem(engine->blink, peb + 0xA4, &v, 4);         // OSMajorVersion
     v = 0;     wg_blink_write_mem(engine->blink, peb + 0xA8, &v, 4);         // OSMinorVersion
     uint16_t bld = 19045; wg_blink_write_mem(engine->blink, peb + 0xAC, &bld, 2); // OSBuildNumber
@@ -4921,8 +5405,18 @@ bool wg_engine_dialog_active(WGEngine *engine) {
 // Re-enters the dialog proc so NSIS advances the wizard (and eventually calls
 // EndDialog). Common ids: 1 = Next/Install (IDOK), 2 = Cancel, 3 = Back.
 void wg_engine_dialog_command(WGEngine *engine, uint32_t ctrl_id) {
-    if (!engine || !s_dlg_active || !s_dlg_proc) return;
-    if (engine->state != WG_ENGINE_PAUSED) return;
+    if (!engine || engine->state != WG_ENGINE_PAUSED) return;
+    // If we paused inside nsDialogs::Show, the guest is suspended right after the
+    // Show call. NSIS drives custom-page transitions itself, so just resume and
+    // let it advance to the next page (which pauses again) — injecting a
+    // WM_COMMAND here would nest onto a half-finished WM_INITDIALOG and stall.
+    if (s_nsd_show_pause) {
+        s_nsd_show_pause = false;
+        WG_LOGI(TAG, "nsDialogs page: resume (tap id=%u)", ctrl_id);
+        engine->state = WG_ENGINE_RUNNING;
+        return;
+    }
+    if (!s_dlg_active || !s_dlg_proc) return;
     WGDlgCtrl *c = wg_find_ctrl(s_dlg_hwnd, ctrl_id);
     uint32_t ctrl_hwnd = c ? (WG_CTRL_HWND_BASE + (uint32_t)(c - s_ctrls)) : 0;
     uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);

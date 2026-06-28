@@ -607,6 +607,63 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         return true;
     }
 
+    // ── gethostname(name, namelen) ──────────────────────────────────
+    if (strcmp(fn, "gethostname") == 0) {
+        const char *host = "wineglass";
+        if (args[0] && args[1] > 0) {
+            size_t n = strlen(host);
+            if (n >= args[1]) n = args[1] - 1;
+            char tmp[64] = {0};
+            memcpy(tmp, host, n); tmp[n] = 0;
+            wg_blink_write_mem(blink, args[0], tmp, (uint32_t)n + 1);
+        }
+        WG_LOGI(TAG, "gethostname -> '%s'", host);
+        *out_ret = 0; // success
+        return true;
+    }
+
+    // ── gethostbyname(name) -> struct hostent* (in guest scratch) ────
+    // Steam's netadr.cpp resolves the local host this way; an unhandled call
+    // returned NULL and tripped its assert. We build a hostent in the gai
+    // scratch region (the engine maps 0xB00000..0xC00000 per VM).
+    if (strcmp(fn, "gethostbyname") == 0) {
+        char name[256] = {0};
+        if (args[0]) wg_blink_read_mem(blink, args[0], name, 255);
+        bool is_local = (name[0] == 0) ||
+                        strcasecmp(name, "localhost") == 0 ||
+                        strcasecmp(name, "wineglass") == 0;
+        uint32_t ip_net = htonl(0x7F000001); // 127.0.0.1 fallback
+        if (!is_local) {
+            struct addrinfo h, *res = NULL;
+            memset(&h, 0, sizeof h); h.ai_family = AF_INET;
+            if (getaddrinfo(name, NULL, &h, &res) == 0 && res && res->ai_addr) {
+                ip_net = ((struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
+            }
+            if (res) freeaddrinfo(res);
+        }
+        const uint32_t HB = 0x00BF0000u;       // within the gai scratch region
+        uint32_t name_addr = HB + 16, aliases_addr = HB + 96;
+        uint32_t addrlist_addr = HB + 104, addr_addr = HB + 120;
+        const char *hn = name[0] ? name : "wineglass";
+        wg_blink_write_mem(blink, name_addr, (void *)hn, (uint32_t)strlen(hn) + 1);
+        uint32_t zero = 0;
+        wg_blink_write_mem(blink, aliases_addr, &zero, 4);          // h_aliases = {NULL}
+        uint32_t al[2] = { addr_addr, 0 };
+        wg_blink_write_mem(blink, addrlist_addr, al, 8);            // h_addr_list = {addr, NULL}
+        wg_blink_write_mem(blink, addr_addr, &ip_net, 4);          // in_addr (network order)
+        uint8_t he[16];
+        memcpy(he + 0,  &name_addr, 4);
+        memcpy(he + 4,  &aliases_addr, 4);
+        uint16_t fam = 2 /*AF_INET*/, len = 4;
+        memcpy(he + 8,  &fam, 2);
+        memcpy(he + 10, &len, 2);
+        memcpy(he + 12, &addrlist_addr, 4);
+        wg_blink_write_mem(blink, HB, he, 16);
+        WG_LOGI(TAG, "gethostbyname('%s') -> hostent@0x%X ip=0x%08X", hn, HB, ntohl(ip_net));
+        *out_ret = HB;
+        return true;
+    }
+
     // ── getaddrinfo(nodename, servname, hints, res) ─────────────────
     if (strcmp(fn, "getaddrinfo") == 0) {
         char node[256] = {0}, serv[64] = {0};

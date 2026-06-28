@@ -14,6 +14,14 @@ void wg_files_set_exe_path(const char *path);
 const char *wg_files_exe_win_path(void);
 void wg_files_reset_win_path_cache(void);
 
+// Real filesystem path of the last-extracted welcome/wizard .bmp, or NULL.
+const char *wg_files_wizard_bmp(void);
+
+// Current directory (Windows path) for resolving relative file paths, as set by
+// SetCurrentDirectory / NSIS SetOutPath. NULL/"" = use the exe directory.
+void        wg_files_set_cwd(const char *win_path);
+const char *wg_files_get_cwd(void);
+
 // The bottle's C: drive (a persistent prefix dir, like a Wine/CrossOver bottle).
 // All guest C:\ paths map under here. Returns the real drive_c path (or "").
 const char *wg_files_drive_c(void);

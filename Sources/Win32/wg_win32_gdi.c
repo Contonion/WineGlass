@@ -3,113 +3,13 @@
 #include "wg_win32_bitmap.h"
 #include "wg_log.h"
 #include <string.h>
+#include <ctype.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <CoreText/CoreText.h>
 
 #define TAG "GDI"
 
-// ---- Embedded 8x8 bitmap font (printable ASCII 0x20..0x7E) --------------
-// Public-domain font8x8_basic. Each glyph is 8 bytes (rows top->bottom),
-// each byte's bit0 = leftmost pixel.
-static const unsigned char FONT8X8[95][8] = {
-{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // space
-{0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, // !
-{0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00}, // "
-{0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00}, // #
-{0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00}, // $
-{0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00}, // %
-{0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00}, // &
-{0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00}, // '
-{0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00}, // (
-{0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00}, // )
-{0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00}, // *
-{0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00}, // +
-{0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06}, // ,
-{0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00}, // -
-{0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00}, // .
-{0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00}, // /
-{0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00}, // 0
-{0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00}, // 1
-{0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00}, // 2
-{0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00}, // 3
-{0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00}, // 4
-{0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00}, // 5
-{0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00}, // 6
-{0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00}, // 7
-{0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00}, // 8
-{0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00}, // 9
-{0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00}, // :
-{0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06}, // ;
-{0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00}, // <
-{0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00}, // =
-{0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00}, // >
-{0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00}, // ?
-{0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00}, // @
-{0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00}, // A
-{0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00}, // B
-{0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00}, // C
-{0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00}, // D
-{0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00}, // E
-{0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00}, // F
-{0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00}, // G
-{0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00}, // H
-{0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // I
-{0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00}, // J
-{0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00}, // K
-{0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00}, // L
-{0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00}, // M
-{0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00}, // N
-{0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00}, // O
-{0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00}, // P
-{0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00}, // Q
-{0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00}, // R
-{0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00}, // S
-{0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // T
-{0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00}, // U
-{0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00}, // V
-{0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00}, // W
-{0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00}, // X
-{0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00}, // Y
-{0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00}, // Z
-{0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00}, // [
-{0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00}, // backslash
-{0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00}, // ]
-{0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00}, // ^
-{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF}, // _
-{0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00}, // `
-{0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00}, // a
-{0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00}, // b
-{0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00}, // c
-{0x38,0x30,0x30,0x3e,0x33,0x33,0x6E,0x00}, // d
-{0x00,0x00,0x1E,0x33,0x3f,0x03,0x1E,0x00}, // e
-{0x1C,0x36,0x06,0x0f,0x06,0x06,0x0F,0x00}, // f
-{0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F}, // g
-{0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00}, // h
-{0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00}, // i
-{0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E}, // j
-{0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00}, // k
-{0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00}, // l
-{0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00}, // m
-{0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00}, // n
-{0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00}, // o
-{0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F}, // p
-{0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78}, // q
-{0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00}, // r
-{0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00}, // s
-{0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00}, // t
-{0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00}, // u
-{0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00}, // v
-{0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00}, // w
-{0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00}, // x
-{0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F}, // y
-{0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00}, // z
-{0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00}, // {
-{0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00}, // |
-{0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00}, // }
-{0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // ~
-};
-
-#define FONT_SCALE 1  // each font pixel -> 1 screen pixel (the compositor
-                      // upscales the whole dialog, so 1x keeps UI text from
-                      // looking oversized — e.g. the wizard buttons)
 
 // ---- DC table ----------------------------------------------------------
 typedef struct {
@@ -122,6 +22,9 @@ typedef struct {
     uint32_t bk_color;
     int      bk_mode;     // 1=TRANSPARENT, 2=OPAQUE
     int      cur_x, cur_y;
+    int      font_px;     // pixel height of the selected font
+    bool     font_bold;
+    char     font_name[64];
 } WGDC;
 
 #define MAX_DCS 32
@@ -160,6 +63,9 @@ uint32_t wg_gdi_get_dc(uint32_t hwnd) {
             s_dcs[i].bk_mode = 2;              // OPAQUE
             s_dcs[i].cur_x = 0;
             s_dcs[i].cur_y = 0;
+            s_dcs[i].font_px = 13;             // ~MS Shell Dlg 8pt @ our scale
+            s_dcs[i].font_bold = false;
+            s_dcs[i].font_name[0] = '\0';      // empty -> default proportional
             return s_dcs[i].handle;
         }
     }
@@ -201,34 +107,201 @@ void wg_gdi_fill_rect(uint32_t hdc, int l, int t, int r, int b, uint32_t cr) {
     if (win) win->client_dirty = true;
 }
 
+// ---- Core Text glyph rasterizer ----------------------------------------
+// The old path stamped a public-domain 8x8 bitmap font, which looked blocky
+// and was monospaced. We now rasterize real proportional, anti-aliased glyphs
+// with Core Text straight into the window's RGBA8 client framebuffer. iOS
+// ships Verdana/Arial/Times/Courier, so we map common Windows face names onto
+// the closest built-in font (no Microsoft fonts shipped).
+
+// Map a Windows font face name (lowercased) onto an iOS PostScript font name.
+static const char *map_font_name(const char *name, bool bold) {
+    char low[64] = {0};
+    if (name) for (int i = 0; i < 63 && name[i]; i++) low[i] = (char)tolower((unsigned char)name[i]);
+    if (strstr(low, "courier") || strstr(low, "consol") || strstr(low, "mono"))
+        return bold ? "CourierNewPS-BoldMT" : "CourierNewPSMT";
+    if (strstr(low, "times") || strstr(low, "serif"))
+        return bold ? "TimesNewRomanPS-BoldMT" : "TimesNewRomanPSMT";
+    if (strstr(low, "arial"))
+        return bold ? "Arial-BoldMT" : "ArialMT";
+    if (strstr(low, "trebuchet"))
+        return bold ? "TrebuchetMS-Bold" : "TrebuchetMS";
+    if (strstr(low, "georgia"))
+        return bold ? "Georgia-Bold" : "Georgia";
+    // Tahoma / Segoe UI / MS Shell Dlg / MS Sans Serif / default -> Verdana,
+    // which closely matches Tahoma's humanist-sans look and is on iOS.
+    return bold ? "Verdana-Bold" : "Verdana";
+}
+
+static CTFontRef make_font(const char *name, double px, bool bold) {
+    const char *ps = map_font_name(name, bold);
+    CFStringRef cf = CFStringCreateWithCString(NULL, ps, kCFStringEncodingUTF8);
+    CTFontRef f = CTFontCreateWithName(cf, px, NULL);
+    if (cf) CFRelease(cf);
+    if (!f) f = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, px, NULL);
+    return f;
+}
+
+// Build a CTLine for a UTF-16 run in the given font/color. Caller releases
+// both the returned line and *out_font.
+static CTLineRef build_line(const uint16_t *utf16, int count, double px,
+                            bool bold, const char *name, uint32_t fg_rgba,
+                            CTFontRef *out_font) {
+    CTFontRef font = make_font(name, px, bold);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGFloat comps[4] = { (fg_rgba & 0xFF) / 255.0, ((fg_rgba >> 8) & 0xFF) / 255.0,
+                         ((fg_rgba >> 16) & 0xFF) / 255.0, 1.0 };
+    CGColorRef col = CGColorCreate(cs, comps);
+    CFStringRef keys[2] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+    CFTypeRef   vals[2] = { font, col };
+    CFDictionaryRef attr = CFDictionaryCreate(NULL, (const void **)keys,
+        (const void **)vals, 2, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFStringRef str = CFStringCreateWithCharacters(NULL, (const UniChar *)utf16, count);
+    CFAttributedStringRef as = CFAttributedStringCreate(NULL, str, attr);
+    CTLineRef line = CTLineCreateWithAttributedString(as);
+    CFRelease(as); CFRelease(str); CFRelease(attr); CFRelease(col);
+    CGColorSpaceRelease(cs);
+    *out_font = font;
+    return line;
+}
+
 void wg_gdi_text_out(uint32_t hdc, int x, int y, const uint16_t *utf16, int count) {
-    WGDC *dc = find_dc(hdc); if (!dc) return;
+    WGDC *dc = find_dc(hdc); if (!dc || count <= 0) return;
     int32_t w, h;
     uint32_t *fb = wg_wm_get_client(dc->hwnd, &w, &h);
     if (!fb) return;
     uint32_t fg = colorref_to_rgba(dc->text_color);
-    uint32_t bg = colorref_to_rgba(dc->bk_color);
     bool opaque = (dc->bk_mode == 2);
-    int pen_x = x;
-    for (int i = 0; i < count; i++) {
-        uint16_t ch = utf16[i];
-        if (ch < 0x20 || ch > 0x7E) ch = (ch == 0) ? 0x20 : '?';
-        const unsigned char *g = FONT8X8[ch - 0x20];
-        for (int row = 0; row < 8; row++) {
-            unsigned char bits = g[row];
-            for (int col = 0; col < 8; col++) {
-                bool on = (bits >> col) & 1;
-                uint32_t c = on ? fg : bg;
-                if (!on && !opaque) continue;
-                for (int sy = 0; sy < FONT_SCALE; sy++)
-                    for (int sx = 0; sx < FONT_SCALE; sx++)
-                        put_px(fb, w, h,
-                               pen_x + col * FONT_SCALE + sx,
-                               y + row * FONT_SCALE + sy, c);
-            }
-        }
-        pen_x += 8 * FONT_SCALE;
+    double px = dc->font_px > 0 ? dc->font_px : 13;
+
+    CTFontRef font = NULL;
+    CTLineRef line = build_line(utf16, count, px, dc->font_bold, dc->font_name, fg, &font);
+    CGFloat ascent = CTFontGetAscent(font);
+    CGFloat descent = CTFontGetDescent(font);
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(fb, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetShouldSmoothFonts(ctx, false); // grayscale AA (no color fringes)
+
+    if (opaque) {
+        double tw = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+        uint32_t bg = colorref_to_rgba(dc->bk_color);
+        CGFloat bgc[4] = { (bg & 0xFF) / 255.0, ((bg >> 8) & 0xFF) / 255.0,
+                           ((bg >> 16) & 0xFF) / 255.0, 1.0 };
+        CGContextSetFillColor(ctx, bgc);
+        CGContextFillRect(ctx, CGRectMake(x, h - y - (ascent + descent), tw, ascent + descent));
     }
+
+    // Framebuffer row 0 is the top; CG's origin is bottom-left, so flip y and
+    // offset by the ascent to place (x,y) at the text's top-left (GDI semantics).
+    CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+    CGContextSetTextPosition(ctx, x, h - y - ascent);
+    CTLineDraw(line, ctx);
+
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CFRelease(line);
+    CFRelease(font);
+    WGWin32Window *win = wg_wm_find(dc->hwnd);
+    if (win) win->client_dirty = true;
+}
+
+// Measured pixel width of a run in the DC's current font.
+int wg_gdi_text_width(uint32_t hdc, const uint16_t *utf16, int count) {
+    WGDC *dc = find_dc(hdc); if (!dc || count <= 0) return 0;
+    double px = dc->font_px > 0 ? dc->font_px : 13;
+    CTFontRef font = NULL;
+    CTLineRef line = build_line(utf16, count, px, dc->font_bold, dc->font_name,
+                                0xFFFFFFFFu, &font);
+    double tw = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+    CFRelease(line); CFRelease(font);
+    return (int)(tw + 0.5);
+}
+
+// Full line height (ascent + descent) of the DC's current font, in pixels.
+int wg_gdi_line_height(uint32_t hdc) {
+    WGDC *dc = find_dc(hdc);
+    double px = (dc && dc->font_px > 0) ? dc->font_px : 13;
+    CTFontRef font = make_font(dc ? dc->font_name : "", px, dc ? dc->font_bold : false);
+    int lh = (int)(CTFontGetAscent(font) + CTFontGetDescent(font) + 0.5);
+    CFRelease(font);
+    return lh;
+}
+
+// Select a font into a DC (pixel height, bold flag, face name).
+void wg_gdi_select_font(uint32_t hdc, int px, bool bold, const char *name) {
+    WGDC *dc = find_dc(hdc); if (!dc) return;
+    if (px > 0) dc->font_px = px;
+    dc->font_bold = bold;
+    if (name) { strncpy(dc->font_name, name, sizeof(dc->font_name) - 1);
+                dc->font_name[sizeof(dc->font_name) - 1] = '\0'; }
+    else dc->font_name[0] = '\0';
+}
+
+// Draw a control caption: strips '&' mnemonic markers ("&&" -> literal '&').
+void wg_gdi_text_out_caption(uint32_t hdc, int x, int y,
+                             const uint16_t *utf16, int count) {
+    uint16_t clean[256]; int n = 0;
+    for (int i = 0; i < count && n < 255; i++) {
+        if (utf16[i] == '&') {
+            if (i + 1 < count && utf16[i + 1] == '&') { clean[n++] = '&'; i++; }
+            // else: drop the single '&' (mnemonic marker)
+        } else {
+            clean[n++] = utf16[i];
+        }
+    }
+    wg_gdi_text_out(hdc, x, y, clean, n);
+}
+
+// Word-wrapped text within a rectangle (GDI DT_WORDBREAK). Strips '&' mnemonics
+// so it can render static labels. Used where single-line TextOut would clip.
+void wg_gdi_text_box(uint32_t hdc, int x, int y, int bw, int bh,
+                     const uint16_t *utf16, int count) {
+    WGDC *dc = find_dc(hdc); if (!dc || count <= 0 || bw <= 0 || bh <= 0) return;
+    int32_t w, h;
+    uint32_t *fb = wg_wm_get_client(dc->hwnd, &w, &h);
+    if (!fb) return;
+    uint16_t clean[512]; int n = 0;
+    for (int i = 0; i < count && n < 511; i++) {
+        if (utf16[i] == '&') { if (i + 1 < count && utf16[i + 1] == '&') { clean[n++] = '&'; i++; } }
+        else clean[n++] = utf16[i];
+    }
+    if (n == 0) return;
+
+    uint32_t fg = colorref_to_rgba(dc->text_color);
+    double px = dc->font_px > 0 ? dc->font_px : 13;
+    CTFontRef font = make_font(dc->font_name, px, dc->font_bold);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGFloat comps[4] = { (fg & 0xFF)/255.0, ((fg>>8)&0xFF)/255.0, ((fg>>16)&0xFF)/255.0, 1.0 };
+    CGColorRef col = CGColorCreate(cs, comps);
+    CFStringRef keys[2] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+    CFTypeRef   vals[2] = { font, col };
+    CFDictionaryRef attr = CFDictionaryCreate(NULL, (const void **)keys,
+        (const void **)vals, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFStringRef str = CFStringCreateWithCharacters(NULL, (const UniChar *)clean, n);
+    CFAttributedStringRef as = CFAttributedStringCreate(NULL, str, attr);
+
+    CGContextRef ctx = CGBitmapContextCreate(fb, w, h, 8, w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetShouldSmoothFonts(ctx, false);
+    CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+
+    CTFramesetterRef fs = CTFramesetterCreateWithAttributedString(as);
+    // Flip the rect into CG's bottom-left space so the box top sits at y.
+    CGRect rect = CGRectMake(x, h - y - bh, bw, bh);
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGPathAddRect(path, NULL, rect);
+    CTFrameRef frame = CTFramesetterCreateFrame(fs, CFRangeMake(0, 0), path, NULL);
+    CTFrameDraw(frame, ctx);
+
+    CFRelease(frame); CGPathRelease(path); CFRelease(fs);
+    CGContextRelease(ctx);
+    CFRelease(as); CFRelease(str); CFRelease(attr); CFRelease(col);
+    CGColorSpaceRelease(cs); CFRelease(font);
     WGWin32Window *win = wg_wm_find(dc->hwnd);
     if (win) win->client_dirty = true;
 }

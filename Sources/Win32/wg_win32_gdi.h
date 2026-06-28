@@ -22,6 +22,15 @@ void wg_gdi_set_bk_color(uint32_t hdc, uint32_t colorref);
 // Drawing primitives (coords are client-area pixels).
 void wg_gdi_fill_rect(uint32_t hdc, int l, int t, int r, int b, uint32_t colorref);
 void wg_gdi_text_out(uint32_t hdc, int x, int y, const uint16_t *utf16, int count);
+// Like wg_gdi_text_out but strips '&' mnemonic markers (for control captions).
+void wg_gdi_text_out_caption(uint32_t hdc, int x, int y, const uint16_t *utf16, int count);
+// Word-wrapped text inside a rectangle (DT_WORDBREAK); strips '&' mnemonics.
+void wg_gdi_text_box(uint32_t hdc, int x, int y, int w, int h, const uint16_t *utf16, int count);
+// Measured pixel width / line height of text in the DC's current font.
+int  wg_gdi_text_width(uint32_t hdc, const uint16_t *utf16, int count);
+int  wg_gdi_line_height(uint32_t hdc);
+// Select a font (pixel height, bold, face name; name NULL/"" = default sans).
+void wg_gdi_select_font(uint32_t hdc, int px, bool bold, const char *name);
 void wg_gdi_move_to(uint32_t hdc, int x, int y);
 void wg_gdi_line_to(uint32_t hdc, int x, int y);
 
