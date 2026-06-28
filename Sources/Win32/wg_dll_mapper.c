@@ -934,7 +934,13 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("WS2_32.dll", Ordinal_113, 0);  // WSACancelBlockingCall (legacy)
     RS("WS2_32.dll", Ordinal_115, 2);  // WSAStartup
     RS("WS2_32.dll", Ordinal_116, 0);  // WSACleanup
-    RS("WS2_32.dll", Ordinal_151, 4);  // WSARecvMsg or similar
+    // NOTE: Ordinal_151 is __WSAFDIsSet(s, fd_set*) = 2 args. It used to be
+    // ALSO registered here as 4 args ("WSARecvMsg"); since registration appends
+    // and resolve returns the FIRST match, that wrong 4-arg entry won and made
+    // every FD_ISSET over-pop 8 bytes of stack — corrupting the caller's saved
+    // registers (e.g. clobbering Steam's CTCPConnection 'this'/esi to 0, which
+    // turned the manifest send into send(socket=0) and killed the download).
+    // Registered once, correctly, below.
     // Named imports (some are by name, not ordinal)
     RS("WS2_32.dll", WSAStartup, 2);
     RS("WS2_32.dll", WSACleanup, 0);
