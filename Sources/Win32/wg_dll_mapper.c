@@ -355,6 +355,11 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", QueryPerformanceFrequency, 1);
     RS("KERNEL32.dll", GetSystemInfo, 1);
     RS("KERNEL32.dll", GetNativeSystemInfo, 1);
+    // stdcall/3 args (RelationshipType, Buffer, ReturnedLength). MUST be registered
+    // with the right arg count: as an auto-stub (num_args=0) it leaks 12 bytes of
+    // caller stack -> corrupts saved regs -> SIGSEGV in Steam's CPU-topology init
+    // (0x542370). Returns FALSE; Steam falls back to GetSystemInfo.
+    RS("KERNEL32.dll", GetLogicalProcessorInformationEx, 3);
     R1S("KERNEL32.dll", GetVersionExA, 1);
     R1S("KERNEL32.dll", GetVersionExW, 1);
 

@@ -1313,6 +1313,12 @@ static uint32_t s_cloop_addr = 0x69B720; // SSL_CTX_set_cipher_list entry: arg2=
 static uint8_t  s_cloop_orig = 0;
 static bool     s_cloop_armed = false;
 static int      s_cloop_count = 0;
+// Manifest-node factory entry (0x5436E0, thiscall this=ecx). Crashes at 0x5437DD
+// with this(edi)=0xFFFF. Trap entry to learn if this is bad already + who called.
+static uint32_t s_fac_addr = 0x5436E0;
+static uint8_t  s_fac_orig = 0;
+static bool     s_fac_armed = false;
+static int      s_fac_count = 0;
 
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
@@ -5580,6 +5586,11 @@ bool wg_engine_run(WGEngine *engine) {
             wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
             s_cloop_armed = true;
         }
+        if (wg_blink_read_mem(engine->blink, s_fac_addr, &s_fac_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_fac_addr, &hlt, 1);
+            s_fac_armed = true;
+        }
         // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
         // list construction, so Steam's ClientHello offers only static-RSA + P-521
         // and the CDN rejects it. Overwrite the two config strings (.rdata) with
@@ -5699,6 +5710,24 @@ void wg_engine_tick(WGEngine *engine) {
                     wg_blink_set_rip(engine->blink, s_cloop_addr);
                     wg_blink_step(engine->blink);
                     uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
+                    break;
+                }
+                if (s_fac_armed && halt_rip == s_fac_addr) {
+                    // factory(this=ecx, type=[esp+4]). At entry [esp]=caller ret.
+                    uint32_t ecx = (uint32_t)wg_blink_get_reg(engine->blink, 1);
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    if (ecx < 0x10000 || ecx >= 0xFFFFF000) {
+                        uint32_t ret = 0, type = 0;
+                        wg_blink_read_mem(engine->blink, esp, &ret, 4);
+                        wg_blink_read_mem(engine->blink, esp + 4, &type, 4);
+                        if (s_fac_count < 8)
+                            WG_LOGW(TAG, "  manifest factory BAD this=0x%X type=0x%X caller_ret=0x%X", ecx, type, ret);
+                        s_fac_count++;
+                    }
+                    wg_blink_write_mem(engine->blink, s_fac_addr, &s_fac_orig, 1);
+                    wg_blink_set_rip(engine->blink, s_fac_addr);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_fac_addr, &hlt, 1);
                     break;
                 }
                 if (s_errstr_armed && halt_rip == s_errstr_bp) {
