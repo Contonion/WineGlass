@@ -1303,10 +1303,16 @@ static int      s_errput_count = 0;
 // DIAG: one-shot read-watch at the cipher-filter decision point in
 // ssl_cipher_list_to_bytes (0x6BB98B) — dumps the version range + found flag to
 // learn why every cipher is filtered out (SSL_R_NO_CIPHERS_AVAILABLE).
-static uint32_t s_watch_addr = 0x69E59A; // just after ssl_set_client_disabled writes masks
+static uint32_t s_watch_addr = 0x6BB882; // ssl_cipher_list_to_bytes, just before the cipher loop (esi=s)
 static uint8_t  s_watch_orig = 0;
 static bool     s_watch_armed = false;
 static int      s_watch_count = 0;
+// Per-cipher loop trap: 0x6BB8B7 is `test eax,eax` right after ssl_cipher_disabled
+// returns (eax=disabled?1:0, ebx=cipher c). Logs which ciphers are dropped.
+static uint32_t s_cloop_addr = 0x69B720; // SSL_CTX_set_cipher_list entry: arg2=cipher string
+static uint8_t  s_cloop_orig = 0;
+static bool     s_cloop_armed = false;
+static int      s_cloop_count = 0;
 
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
@@ -5569,6 +5575,36 @@ bool wg_engine_run(WGEngine *engine) {
             wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
             s_watch_armed = true;
         }
+        if (wg_blink_read_mem(engine->blink, s_cloop_addr, &s_cloop_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
+            s_cloop_armed = true;
+        }
+        // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
+        // list construction, so Steam's ClientHello offers only static-RSA + P-521
+        // and the CDN rejects it. Overwrite the two config strings (.rdata) with
+        // forms that parse to ECDHE-RSA ciphers + a real curve. Addresses are from
+        // the Jun-2024 steam.exe (guarded to image_base 0x400000).
+        {
+            // blink miscomputes OpenSSL's cipher-rule parser (ssl_create_cipher_list)
+            // for multi-token strings -> only one cipher survives. Use a single
+            // token so an ECDHE-RSA suite is actually offered. (The curve parser,
+            // CONF_parse_list, works fine for multi-token.)
+            static const char ciphers[] = "ECDHE-RSA-AES128-GCM-SHA256";
+            static const char curves[]  = "X25519:P-256";
+            static const char tls13[]   = "TLS_AES_128_GCM_SHA256"; // TLS1.3 suite (single token)
+            wg_blink_write_mem(engine->blink, 0x709908, ciphers, sizeof(ciphers));
+            wg_blink_write_mem(engine->blink, 0x709A7C, curves, sizeof(curves));
+            wg_blink_write_mem(engine->blink, 0x7A3168, tls13, sizeof(tls13));
+            // Steam's CustomVerifyCertificate (0x4F0BF0) builds a Windows cert
+            // store via CRYPT32 (CertOpenStore/...) which we auto-stub to NULL, so
+            // it always fails -> connection aborts with "http error 0". The live
+            // TLS handshake already used the real CDN cert, so short-circuit the
+            // function to return success (mov eax,1; ret). cdecl/thiscall (plain ret).
+            static const uint8_t verify_ok[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
+            wg_blink_write_mem(engine->blink, 0x4F0BF0, verify_ok, sizeof(verify_ok));
+            WG_LOGI(TAG, "Patched TLS config strings + CustomVerifyCertificate");
+        }
     }
     return true;
 }
@@ -5605,29 +5641,64 @@ void wg_engine_tick(WGEngine *engine) {
                 if (handle_blink_thunk(engine)) break;
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
                 if (s_watch_armed && halt_rip == s_watch_addr) {
-                    // After ssl_set_client_disabled: esi=s, sub=[s+0x7c]=s3. Force
-                    // the key-exchange/auth disabled masks to 0 (enable ECDHE etc.)
-                    // and the min-version field to TLS1.2, so the ClientHello offers
-                    // proper ECDHE/AES-GCM ciphers instead of weak RSA-CBC.
+                    // ssl_cipher_list_to_bytes, before the cipher loop: esi=s,
+                    // s3=[s+0x7c]. The loop's "edi" flag only sets when a cipher has
+                    // max_tls >= s3->tmp.max_ver. blink leaves max_ver=0x304 (TLS1.3)
+                    // but the iterated list has no TLS1.3 suite -> edi stays 0 ->
+                    // NO_CIPHERS. Cap max_ver at 0x303 (TLS1.2) so TLS1.2 ciphers
+                    // satisfy it and a real ClientHello gets built.
                     uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
                     uint32_t sub = 0; wg_blink_read_mem(engine->blink, esi + 0x7c, &sub, 4);
                     if (sub) {
-                        uint32_t mk=0, ma=0, ver=0;
-                        wg_blink_read_mem(engine->blink, sub + 0x2a0, &mk, 4);
-                        wg_blink_read_mem(engine->blink, sub + 0x2a4, &ma, 4);
+                        uint32_t ver = 0;
                         wg_blink_read_mem(engine->blink, sub + 0x2ac, &ver, 4);
-                        uint32_t zero = 0, v12 = 0x303;
-                        wg_blink_write_mem(engine->blink, sub + 0x2a0, &zero, 4);
-                        wg_blink_write_mem(engine->blink, sub + 0x2a4, &zero, 4);
-                        wg_blink_write_mem(engine->blink, sub + 0x2ac, &v12, 4);
+                        if (ver > 0x303) {
+                            uint32_t v12 = 0x303;
+                            wg_blink_write_mem(engine->blink, sub + 0x2ac, &v12, 4);
+                        }
                         if (s_watch_count < 6)
-                            WG_LOGW(TAG, "*** masks patched: mask_k 0x%X->0, mask_a 0x%X->0, ver 0x%X->0x303", mk, ma, ver);
+                            WG_LOGW(TAG, "*** cipher_list_to_bytes: max_ver 0x%X -> 0x303", ver);
                     }
                     s_watch_count++;
                     wg_blink_write_mem(engine->blink, s_watch_addr, &s_watch_orig, 1);
                     wg_blink_set_rip(engine->blink, s_watch_addr);
                     wg_blink_step(engine->blink);
                     uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
+                    break;
+                }
+                if (s_cloop_armed && halt_rip == s_cloop_addr) {
+                    // SET_GROUPS_LIST handler `call eax`: eax = parse fn target,
+                    // [esp+? ] = the "P-521:P-384:P-256" string. Capture target.
+                    uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t a0=0,a1=0,a2=0,a3=0;
+                    wg_blink_read_mem(engine->blink, esp + 0, &a0, 4);
+                    wg_blink_read_mem(engine->blink, esp + 4, &a1, 4);
+                    wg_blink_read_mem(engine->blink, esp + 8, &a2, 4);
+                    wg_blink_read_mem(engine->blink, esp + 12, &a3, 4);
+                    if (s_cloop_count < 12) {
+                        char cstr[160] = {0};
+                        if (a2) wg_blink_read_mem(engine->blink, a2, cstr, 159);
+                        WG_LOGW(TAG, "  set_cipher_list(ctx=0x%X, '%s')", a1, cstr);
+                    }
+                    // Cap CTX max_proto_version (ctx+0x118) to TLS1.2 so the
+                    // ClientHello's supported_versions stops advertising TLS1.3
+                    // (we have no TLS1.3 ciphersuite — blink's cipher parser drops
+                    // them). SSL_new inherits this. Leaves min (ctx+0x114) alone.
+                    if (a1) {
+                        uint32_t maxv = 0;
+                        wg_blink_read_mem(engine->blink, a1 + 0xb8, &maxv, 4);
+                        if (maxv == 0 || maxv > 0x303) {
+                            uint32_t v12 = 0x303;
+                            wg_blink_write_mem(engine->blink, a1 + 0xb8, &v12, 4);
+                            WG_LOGW(TAG, "  capped ctx max_proto_version 0x%X -> 0x303", maxv);
+                        }
+                    }
+                    s_cloop_count++;
+                    wg_blink_write_mem(engine->blink, s_cloop_addr, &s_cloop_orig, 1);
+                    wg_blink_set_rip(engine->blink, s_cloop_addr);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
                     break;
                 }
                 if (s_errstr_armed && halt_rip == s_errstr_bp) {
@@ -5643,8 +5714,38 @@ void wg_engine_tick(WGEngine *engine) {
                     char fbuf[80] = {0};
                     if (file) wg_blink_read_mem(engine->blink, file, fbuf, 79);
                     if (s_errput_count < 30) {
-                        WG_LOGW(TAG, "*** ERR_put_error lib=%u func=%u reason=%u  %s:%u",
-                                lib, func, reason, fbuf, line);
+                        WG_LOGW(TAG, "*** ERR_put_error lib=%u func=%u reason=%u  %s:%u  [caller=0x%X]",
+                                lib, func, reason, fbuf, line, ret);
+                    }
+                    if (reason == 181) {
+                        // Called via SSLfatal(0x69ED30): one frame up holds the real
+                        // caller (ssl_cipher_list_to_bytes) + the SSL*. SSLfatal did
+                        // 5 pushes before this call -> its entry esp = esp+24.
+                        uint32_t up_caller = 0, sslp = 0, s3 = 0;
+                        wg_blink_read_mem(engine->blink, esp + 24, &up_caller, 4);
+                        wg_blink_read_mem(engine->blink, esp + 28, &sslp, 4);
+                        if (sslp) wg_blink_read_mem(engine->blink, sslp + 0x7c, &s3, 4);
+                        WG_LOGW(TAG, "    NO_CIPHERS: cipher_list_to_bytes ret=0x%X SSL=0x%X s3=0x%X",
+                                up_caller, sslp, s3);
+                        if (s3) {
+                            uint32_t mask_k=0, mask_a=0, min_ver=0, max_ver=0;
+                            wg_blink_read_mem(engine->blink, s3 + 0x2a0, &mask_k, 4);
+                            wg_blink_read_mem(engine->blink, s3 + 0x2a4, &mask_a, 4);
+                            wg_blink_read_mem(engine->blink, s3 + 0x2a8, &min_ver, 4);
+                            wg_blink_read_mem(engine->blink, s3 + 0x2ac, &max_ver, 4);
+                            WG_LOGW(TAG, "    masks: mask_k=0x%X mask_a=0x%X min_ver=0x%X max_ver=0x%X",
+                                    mask_k, mask_a, min_ver, max_ver);
+                        }
+                        // ssl_security: cert=[s+0x404]; sec_cb=[cert+0xf8]; ctx=[cert+0x100]
+                        uint32_t cert=0, sec_cb=0, sec_f8c=0, sec_100=0;
+                        if (sslp) wg_blink_read_mem(engine->blink, sslp + 0x404, &cert, 4);
+                        if (cert) {
+                            wg_blink_read_mem(engine->blink, cert + 0xf8, &sec_cb, 4);
+                            wg_blink_read_mem(engine->blink, cert + 0xfc, &sec_f8c, 4);
+                            wg_blink_read_mem(engine->blink, cert + 0x100, &sec_100, 4);
+                        }
+                        WG_LOGW(TAG, "    cert=0x%X sec_cb=0x%X [cert+0xfc]=0x%X(level?) [cert+0x100]=0x%X",
+                                cert, sec_cb, sec_f8c, sec_100);
                     }
                     s_errput_count++;
                     // No-op stub (void cdecl): pop return addr only (caller cleans args).
