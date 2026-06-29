@@ -1430,7 +1430,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
     if (rip >= WG_THUNK_BASE && rip < WG_THUNK_BASE + 0x20000) in_thunk_range = true;
     if (!in_thunk_range) return false;
-
+ 
     // SEH handler returned a disposition: advance the chain or resume.
     if (rip == WG_SEH_SENTINEL) {
         uint32_t disp = (uint32_t)wg_blink_get_reg(engine->blink, 0); // EAX
@@ -5571,6 +5571,19 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_event_next = 0;
     memset(s_event_signalled, 0, sizeof(s_event_signalled));
     memset(s_event_manual, 0, sizeof(s_event_manual));
+    // Re-arm the steam.exe TLS/cert/manifest patch + diagnostic traps on EVERY PE
+    // load. These were one-shot (guarded by s_errstr_armed) which is wrong when a
+    // session loads two PEs with fresh VMs each — e.g. SteamSetup.exe (installer)
+    // then Steam.exe. The first load consumed the arming; the second (the real
+    // Steam that does the manifest download) never got the cipher-string patch, so
+    // its ClientHello collapsed to NO_CIPHERS -> internal_error. The Mac harness
+    // loads Steam.exe directly (one PE) so it never hit this. Resetting here makes
+    // wg_engine_run patch + arm the traps fresh for each new VM.
+    s_errstr_armed = s_watch_armed = s_cloop_armed = s_fac_armed = false;
+    s_pe_armed = s_hs_armed = s_disp_armed = s_sslw_armed = false;
+    s_watch_count = s_cloop_count = s_fac_count = s_errput_count = 0;
+    s_pe_count = s_hs_count = s_disp_count = s_snd_count = 0;
+    s_sslw_count = s_sndchk_count = 0;
     s_tmsg_head = 0; s_tmsg_tail = 0;
     s_comp_head = 0; s_comp_tail = 0;
     s_iocp_binding_count = 0;
