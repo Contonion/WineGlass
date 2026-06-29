@@ -5614,7 +5614,12 @@ bool wg_engine_run(WGEngine *engine) {
             // function to return success (mov eax,1; ret). cdecl/thiscall (plain ret).
             static const uint8_t verify_ok[] = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
             wg_blink_write_mem(engine->blink, 0x4F0BF0, verify_ok, sizeof(verify_ok));
-            WG_LOGI(TAG, "Patched TLS config strings + CustomVerifyCertificate");
+            // Steam's manifest signature check (CheckManifestSignature, 0x4611E0,
+            // cdecl 1 arg) verifies a "kvsign2" RSA signature over the manifest
+            // KeyValues. It fails under blink; the manifest was fetched over the
+            // real TLS connection to the real CDN, so accept it. (mov eax,1; ret)
+            wg_blink_write_mem(engine->blink, 0x4611E0, verify_ok, sizeof(verify_ok));
+            WG_LOGI(TAG, "Patched TLS strings + cert + manifest verify");
         }
     }
     return true;
