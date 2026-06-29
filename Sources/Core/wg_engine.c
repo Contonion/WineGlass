@@ -1320,6 +1320,48 @@ static uint8_t  s_fac_orig = 0;
 static bool     s_fac_armed = false;
 static int      s_fac_count = 0;
 
+// DIAG (package-save root cause): the CUtlBuffer error byte lives at [this+0xf].
+// CheckError (0x454180) asserts '!m_data.HasError()' when (byte & 0xc0)==0xc0
+// (bit 0x80 = external/non-growable buffer, bit 0x40 = error). The buffer enters
+// 0xc0 in CUtlBuffer::Grow (around 0x49EF1B) at exactly two error commits:
+//   0x49EFCB  external/can't-grow buffer (entry flag already had 0x80) -> 0xc0
+//   0x49EFAF  realloc/GrowMemory returned NULL -> al=0xc0 (committed @0x49EFB8)
+// Both are COLD (error paths only) so trapping them adds no per-grow overhead.
+// 0x45419D is the assert reporter call inside CheckError — fires only when a
+// buffer actually has the 0xc0 error, telling us which buffer fails to save.
+// Correlate the three by the 'this' pointer (esi). All guarded image_base 0x400000.
+static uint32_t s_pe_ext_addr   = 0x49EFCB; // external can't-grow -> 0xc0
+static uint32_t s_pe_alloc_addr = 0x49EFAF; // realloc fail -> al=0xc0
+static uint32_t s_pe_chk_addr   = 0x45419D; // CheckError assert reporter call
+static uint8_t  s_pe_ext_orig = 0, s_pe_alloc_orig = 0, s_pe_chk_orig = 0;
+static bool     s_pe_armed = false;
+static int      s_pe_count = 0;
+
+// DIAG (post-handshake stall): SSL_do_handshake (0x69BF10) has ONE caller,
+// ThreadedPerformInitialHandshake (0x4F35A0). At 0x4F36B9 eax = the handshake
+// return (1=complete, <=0=want/err). At 0x4F36F2 eax = result of the gate call
+// 0x69ebe0(ssl) (nonzero=still in init; 0 -> branch to "done" 0x4f3c1c). Logging
+// these tells us, after the final recv, whether TLS reports complete (=> the
+// stall is the post-handshake send dispatch) or want_read (=> TLS completion
+// bug under blink). conn=esi, ssl=[esi+0x298], step=[esi+0x1a0]. image_base guard.
+static uint32_t s_hs_ret_addr  = 0x4F36B9; // eax = SSL_do_handshake ret
+static uint32_t s_hs_gate_addr = 0x4F36F2; // eax = gate(ssl) ret
+static uint8_t  s_hs_ret_orig = 0, s_hs_gate_orig = 0;
+static bool     s_hs_armed = false;
+static int      s_hs_count = 0;
+
+// DIAG (post-handshake dispatch): in the connection service loop 0x4F42DF,
+// [esi+0x22] is the "handshake complete" gate. After call ThreadedPerformInitial-
+// Handshake, 0x4F438B = `cmp byte[esi+0x22],0`: if 0 -> skip data pump (no GET);
+// if nonzero -> 0x4F4391 runs the pump (0x4f3ca0 send / 0x4f3fc0 recv). Trapping
+// 0x4F438B (flag right after handshake) and 0x4F4391 (pump path taken) tells us
+// whether the flag flips when SSL completes. esi=conn. image_base 0x400000.
+static uint32_t s_disp_chk_addr  = 0x4F438B; // post-handshake [esi+0x22] check
+static uint32_t s_disp_pump_addr = 0x4F4391; // data-pump branch entry
+static uint8_t  s_disp_chk_orig = 0, s_disp_pump_orig = 0;
+static bool     s_disp_armed = false;
+static int      s_disp_count = 0;
+
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
 // (BoringSSL) can build its ClientHello random.
@@ -1462,6 +1504,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             "Sleep", "SleepEx",  // spin-loop noise; watchdog covers stuck loops
             "WaitForSingleObject", "WaitForSingleObjectEx", // poll-loop noise
             "QueryPerformanceCounter", "GetSystemTimePreciseAsFileTime",
+            // High-frequency CRT/heap/TLS noise — drowns out the network trace and
+            // produces multi-GB logs over a 200s run. Safe to silence.
+            "HeapAlloc", "HeapFree", "HeapSize", "HeapReAlloc",
+            "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue",
+            "EnterCriticalSection", "LeaveCriticalSection",
+            "TranslateMessage", "DispatchMessageW", "GetMessageW",
+            "GetCurrentThreadId",
             NULL
         };
         bool quiet = false;
@@ -4273,7 +4322,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t buf_addr = args[1];
             uint32_t nbytes = args[2];
             uint32_t bytes_written_addr = args[3];
-            if (nbytes > 0x100000) nbytes = 0x100000;
+            // NOTE: do NOT truncate nbytes here. A previous 1MB cap silently
+            // dropped the tail of large writes; Steam's package save requires
+            // WriteFile to report the FULL requested count written (it compares
+            // bytes-written == buffer-size) or it logs "Saving package failed".
+            // The real-file path below writes the whole buffer in bounded chunks.
             // stdout/stderr (from GetStdHandle) / pipes — surface the content;
             // Steam's networking spew (incl. the OpenSSL handshake error string
             // "COpenSSLConnection ... Error: %d - %s") goes here, not to the
@@ -4304,24 +4357,39 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 1;
                 goto wf_done;
             }
-            uint8_t *tmpbuf = malloc(nbytes);
+            // Write the FULL buffer in bounded chunks so we never malloc the whole
+            // (potentially 90MB+) write at once yet still write/report everything.
+            const uint32_t WF_CHUNK = 0x100000; // 1MB working buffer
+            uint32_t alloc = nbytes < WF_CHUNK ? (nbytes ? nbytes : 1) : WF_CHUNK;
+            uint8_t *tmpbuf = malloc(alloc);
             if (tmpbuf) {
-                wg_blink_read_mem(engine->blink, buf_addr, tmpbuf, nbytes);
+                uint32_t total_written = 0, off = 0;
+                bool wrote_real = false, short_write = false;
+                while (off < nbytes) {
+                    uint32_t chunk = nbytes - off;
+                    if (chunk > WF_CHUNK) chunk = WF_CHUNK;
+                    wg_blink_read_mem(engine->blink, buf_addr + off, tmpbuf, chunk);
 #ifdef WG_DECODE_DIAG
-                if (handle == s_diag_data_tmp_handle && s_diag_data_tmp_handle != 0) {
-                    uint32_t pos = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
-                    wg_diag_check(pos, tmpbuf, nbytes);
-                }
-#endif
-                uint32_t nwritten = 0;
-                if (wg_files_write(handle, tmpbuf, nbytes, &nwritten)) {
-                    if (bytes_written_addr) {
-                        wg_blink_write_mem(engine->blink, bytes_written_addr, &nwritten, 4);
+                    if (handle == s_diag_data_tmp_handle && s_diag_data_tmp_handle != 0) {
+                        uint32_t pos = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
+                        wg_diag_check(pos, tmpbuf, chunk);
                     }
+#endif
+                    uint32_t nw = 0;
+                    if (!wg_files_write(handle, tmpbuf, chunk, &nw)) break; // unknown handle
+                    wrote_real = true;
+                    total_written += nw;
+                    if (nw < chunk) { short_write = true; break; }
+                    off += chunk;
+                }
+                if (wrote_real) {
+                    if (bytes_written_addr)
+                        wg_blink_write_mem(engine->blink, bytes_written_addr, &total_written, 4);
                     ret_val = 1;
-                    WG_LOGI(TAG, "WriteFile(0x%X, %u bytes) -> wrote %u", handle, nbytes, nwritten);
-                    if (nwritten > 0 && nwritten <= 512) {
-                        char pv[514]; uint32_t pl = nwritten < 513 ? nwritten : 512;
+                    WG_LOGI(TAG, "WriteFile(0x%X, %u bytes) -> wrote %u%s", handle, nbytes,
+                            total_written, short_write ? " (SHORT)" : "");
+                    if (total_written > 0 && total_written <= 512) {
+                        char pv[514]; uint32_t pl = total_written < 513 ? total_written : 512;
                         memcpy(pv, tmpbuf, pl); pv[pl] = '\0';
                         for (uint32_t j = 0; j < pl; j++)
                             if ((unsigned char)pv[j] < 0x20 && pv[j] != '\n') pv[j] = '.';
@@ -5591,6 +5659,39 @@ bool wg_engine_run(WGEngine *engine) {
             wg_blink_write_mem(engine->blink, s_fac_addr, &hlt, 1);
             s_fac_armed = true;
         }
+        // Package-save error-byte root-cause traps (see decls). All cold paths.
+        if (!s_pe_armed) {
+            uint8_t hlt = 0xF4;
+            if (wg_blink_read_mem(engine->blink, s_pe_ext_addr, &s_pe_ext_orig, 1))
+                wg_blink_write_mem(engine->blink, s_pe_ext_addr, &hlt, 1);
+            if (wg_blink_read_mem(engine->blink, s_pe_alloc_addr, &s_pe_alloc_orig, 1))
+                wg_blink_write_mem(engine->blink, s_pe_alloc_addr, &hlt, 1);
+            if (wg_blink_read_mem(engine->blink, s_pe_chk_addr, &s_pe_chk_orig, 1))
+                wg_blink_write_mem(engine->blink, s_pe_chk_addr, &hlt, 1);
+            s_pe_armed = true;
+            WG_LOGI(TAG, "Armed package-save traps: ext@0x%X alloc@0x%X chk@0x%X",
+                    s_pe_ext_addr, s_pe_alloc_addr, s_pe_chk_addr);
+        }
+        if (!s_hs_armed) {
+            uint8_t hlt = 0xF4;
+            if (wg_blink_read_mem(engine->blink, s_hs_ret_addr, &s_hs_ret_orig, 1))
+                wg_blink_write_mem(engine->blink, s_hs_ret_addr, &hlt, 1);
+            if (wg_blink_read_mem(engine->blink, s_hs_gate_addr, &s_hs_gate_orig, 1))
+                wg_blink_write_mem(engine->blink, s_hs_gate_addr, &hlt, 1);
+            s_hs_armed = true;
+            WG_LOGI(TAG, "Armed handshake traps: ret@0x%X gate@0x%X",
+                    s_hs_ret_addr, s_hs_gate_addr);
+        }
+        if (!s_disp_armed) {
+            uint8_t hlt = 0xF4;
+            if (wg_blink_read_mem(engine->blink, s_disp_chk_addr, &s_disp_chk_orig, 1))
+                wg_blink_write_mem(engine->blink, s_disp_chk_addr, &hlt, 1);
+            if (wg_blink_read_mem(engine->blink, s_disp_pump_addr, &s_disp_pump_orig, 1))
+                wg_blink_write_mem(engine->blink, s_disp_pump_addr, &hlt, 1);
+            s_disp_armed = true;
+            WG_LOGI(TAG, "Armed dispatch traps: chk@0x%X pump@0x%X",
+                    s_disp_chk_addr, s_disp_pump_addr);
+        }
         // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
         // list construction, so Steam's ClientHello offers only static-RSA + P-521
         // and the CDN rejects it. Overwrite the two config strings (.rdata) with
@@ -5733,6 +5834,108 @@ void wg_engine_tick(WGEngine *engine) {
                     wg_blink_set_rip(engine->blink, s_fac_addr);
                     wg_blink_step(engine->blink);
                     uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_fac_addr, &hlt, 1);
+                    break;
+                }
+                if (s_pe_armed && (halt_rip == s_pe_ext_addr ||
+                                   halt_rip == s_pe_alloc_addr ||
+                                   halt_rip == s_pe_chk_addr)) {
+                    // CUtlBuffer entered the 0xc0 (HasError) state, or CheckError
+                    // is asserting on it. Dump the buffer object + the caller chain
+                    // (stack-scan for .text return addrs) so we can see which HTTP
+                    // read/put overflowed the package buffer. Correlate the three
+                    // trap sites by 'this' (esi).
+                    uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t ebp = (uint32_t)wg_blink_get_reg(engine->blink, 5);
+                    const char *what = halt_rip == s_pe_ext_addr   ? "EXTERNAL/cant-grow"
+                                     : halt_rip == s_pe_alloc_addr ? "REALLOC-FAIL"
+                                     :                               "CHECKERROR-ASSERT";
+                    if (s_pe_count < 24) {
+                        uint32_t b0=0,b4=0,b8=0,bc=0,b10=0; uint8_t flag=0;
+                        wg_blink_read_mem(engine->blink, esi + 0x00, &b0, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x04, &b4, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x08, &b8, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x0c, &bc, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x10, &b10, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x0f, &flag, 1);
+                        WG_LOGW(TAG, "*** PKG-BUF %s this=0x%X flag=0x%02X mem=0x%X "
+                                "+4=0x%X +8=0x%X +c=0x%X +10=0x%X",
+                                what, esi, flag, b0, b4, b8, bc, b10);
+                        char chain[256] = {0}; int ci = 0, found = 0;
+                        for (int k = 0; k < 64 && found < 8; k++) {
+                            uint32_t v = 0;
+                            wg_blink_read_mem(engine->blink, esp + k * 4, &v, 4);
+                            if (v >= 0x401000 && v < 0x700000) {
+                                ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v);
+                                found++;
+                            }
+                        }
+                        WG_LOGW(TAG, "    callchain(esp=0x%X ebp=0x%X): %s", esp, ebp, chain);
+                    }
+                    s_pe_count++;
+                    uint8_t orig = halt_rip == s_pe_ext_addr   ? s_pe_ext_orig
+                                 : halt_rip == s_pe_alloc_addr ? s_pe_alloc_orig
+                                 :                               s_pe_chk_orig;
+                    wg_blink_write_mem(engine->blink, halt_rip, &orig, 1);
+                    wg_blink_set_rip(engine->blink, halt_rip);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, halt_rip, &hlt, 1);
+                    break;
+                }
+                if (s_hs_armed && (halt_rip == s_hs_ret_addr ||
+                                   halt_rip == s_hs_gate_addr)) {
+                    uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                    uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    if (halt_rip == s_hs_ret_addr) {
+                        uint32_t step = 0, ssl = 0;
+                        wg_blink_read_mem(engine->blink, esi + 0x1a0, &step, 4);
+                        wg_blink_read_mem(engine->blink, esi + 0x298, &ssl, 4);
+                        WG_LOGW(TAG, "*** HS_RET=%d (1=complete,<=0=want/err) conn=0x%X ssl=0x%X step=%u",
+                                (int)eax, esi, ssl, step);
+                    } else {
+                        WG_LOGW(TAG, "*** HS_GATE=%d (nonzero=still-in-init, 0=>done)", (int)eax);
+                    }
+                    uint8_t orig = (halt_rip == s_hs_ret_addr) ? s_hs_ret_orig : s_hs_gate_orig;
+                    wg_blink_write_mem(engine->blink, halt_rip, &orig, 1);
+                    wg_blink_set_rip(engine->blink, halt_rip);
+                    wg_blink_step(engine->blink);
+                    s_hs_count++;
+                    if (s_hs_count < 80) {
+                        uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, halt_rip, &hlt, 1);
+                    } // else leave disarmed to bound cost
+                    break;
+                }
+                if (s_disp_armed && (halt_rip == s_disp_chk_addr ||
+                                     halt_rip == s_disp_pump_addr)) {
+                    uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t tid = wg_sched_current_tid(engine->scheduler);
+                    // Stack-scan for the driver: who pumps this connection's RunFrame?
+                    char chain[200] = {0}; int ci = 0, found = 0;
+                    for (int k = 0; k < 96 && found < 9; k++) {
+                        uint32_t v = 0;
+                        wg_blink_read_mem(engine->blink, esp + k * 4, &v, 4);
+                        if (v >= 0x401000 && v < 0x700000) {
+                            ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v);
+                            found++;
+                        }
+                    }
+                    if (halt_rip == s_disp_chk_addr) {
+                        uint8_t f22 = 0;
+                        wg_blink_read_mem(engine->blink, esi + 0x22, &f22, 1);
+                        WG_LOGW(TAG, "*** DISP[tid=%X] post-HS conn=0x%X [+0x22]=%u -> %s | %s",
+                                tid, esi, f22, f22 ? "RUN pump" : "SKIP", chain);
+                    } else {
+                        WG_LOGW(TAG, "*** DISP[tid=%X] pump RUNS conn=0x%X | %s", tid, esi, chain);
+                    }
+                    uint8_t orig = (halt_rip == s_disp_chk_addr) ? s_disp_chk_orig : s_disp_pump_orig;
+                    wg_blink_write_mem(engine->blink, halt_rip, &orig, 1);
+                    wg_blink_set_rip(engine->blink, halt_rip);
+                    wg_blink_step(engine->blink);
+                    s_disp_count++;
+                    if (s_disp_count < 60) {
+                        uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, halt_rip, &hlt, 1);
+                    }
                     break;
                 }
                 if (s_errstr_armed && halt_rip == s_errstr_bp) {
