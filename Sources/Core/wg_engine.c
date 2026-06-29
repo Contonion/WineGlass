@@ -928,14 +928,6 @@ static uint32_t lookup_alloc_size(uint32_t addr) {
     return 0;
 }
 
-// Free-list reclamation so the bump heap doesn't grow unbounded. Without this,
-// Steam's multi-MB package download buffers (each realloc'd/doubled, never
-// reclaimed) climb past a gigabyte and corrupt other regions -> package saves
-// fail. Freed blocks are page-rounded and reused first-fit.
-#define WG_MAX_FREE 8192
-static struct { uint32_t addr; uint32_t size; } s_free_list[WG_MAX_FREE];
-static int s_free_count = 0;
-
 // Bump-allocate `size` bytes of zeroed guest heap (shared with GlobalAlloc).
 // Returns the guest address, or 0 on failure. Used by the CRT allocators that
 // real DLLs (StdUtils, and eventually steam.exe) call.
@@ -943,17 +935,6 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
     uint32_t alloc = (size + 0xFFF) & ~0xFFFu;
-    // Reuse a freed block big enough (first-fit) before bumping.
-    for (int i = 0; i < s_free_count; i++) {
-        if (s_free_list[i].size >= alloc) {
-            uint32_t a = s_free_list[i].addr;
-            uint8_t *z = calloc(1, alloc);
-            if (z) { wg_blink_write_mem(engine->blink, a, z, alloc); free(z); }
-            s_free_list[i] = s_free_list[--s_free_count]; // remove
-            track_alloc(a, size);
-            return a;
-        }
-    }
     uint32_t addr = s_heap_ptr;
     uint8_t *zeros = calloc(1, alloc);
     if (!zeros) return 0;
@@ -963,59 +944,6 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFFu;
     track_alloc(addr, size);
     return addr;
-}
-
-// Reclaim a guest allocation. Top block -> rewind the bump pointer; else add to
-// the free list for reuse.
-static void wg_guest_free(WGEngine *engine, uint32_t addr) {
-    (void)engine;
-    if (!addr) return;
-    uint32_t size = lookup_alloc_size(addr);
-    if (!size) return;
-    uint32_t rounded = (size + 0xFFFu) & ~0xFFFu;
-    if (addr + rounded == s_heap_ptr) { s_heap_ptr = addr; return; }
-    if (s_free_count < WG_MAX_FREE) {
-        s_free_list[s_free_count].addr = addr;
-        s_free_list[s_free_count].size = rounded;
-        s_free_count++;
-    }
-}
-
-// realloc: grow in place when the block is the top of the bump heap or already
-// page-large enough; otherwise allocate fresh, copy, and reclaim the old block.
-static uint32_t wg_guest_realloc(WGEngine *engine, uint32_t addr, uint32_t newsize) {
-    if (!addr) return wg_guest_alloc(engine, newsize);
-    if (newsize == 0) newsize = 1;
-    if ((newsize & 0x80000000u) || newsize > 512u * 1024 * 1024) return 0;
-    uint32_t old = lookup_alloc_size(addr);
-    uint32_t old_r = (old + 0xFFFu) & ~0xFFFu;
-    uint32_t new_r = (newsize + 0xFFFu) & ~0xFFFu;
-    if (old && addr + old_r == s_heap_ptr) {           // top block: extend/shrink
-        if (new_r > old_r) {
-            uint8_t *z = calloc(1, new_r - old_r);
-            if (!z) return 0;
-            wg_blink_load_code(engine->blink, addr + old_r, z, new_r - old_r, 0);
-            free(z);
-        }
-        s_heap_ptr = addr + new_r;
-        track_alloc(addr, newsize);
-        return addr;
-    }
-    if (old && new_r <= old_r) { track_alloc(addr, newsize); return addr; } // fits
-    uint32_t np = wg_guest_alloc(engine, newsize);
-    if (np) {
-        // Copy old contents. If the old size is unknown (untracked block), copy
-        // the new size like the original HeapReAlloc did, so we never lose data.
-        uint32_t copy = old ? (old < newsize ? old : newsize) : newsize;
-        uint8_t *tmp = malloc(copy);
-        if (tmp) {
-            wg_blink_read_mem(engine->blink, addr, tmp, copy);
-            wg_blink_write_mem(engine->blink, np, tmp, copy);
-            free(tmp);
-        }
-        if (old) wg_guest_free(engine, addr);   // only reclaim if we knew its size
-    }
-    return np;
 }
 
 // ===== nsDialogs plugin emulation =======================================
@@ -3271,7 +3199,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = lookup_alloc_size(args[2]);
         } else if (strcmp(fn, "HeapReAlloc") == 0) {
             // HeapReAlloc(hHeap, dwFlags, lpMem=args[2], dwBytes=args[3])
-            ret_val = wg_guest_realloc(engine, args[2], args[3]);
+            uint32_t np = wg_guest_alloc(engine, args[3]);
+            if (np && args[2] && args[3]) {
+                uint8_t *tmp = malloc(args[3]);
+                if (tmp) {
+                    wg_blink_read_mem(engine->blink, args[2], tmp, args[3]);
+                    wg_blink_write_mem(engine->blink, np, tmp, args[3]);
+                    free(tmp);
+                }
+            }
+            ret_val = np;
         } else if (strcmp(fn, "??2@YAPAXI@Z") == 0 ||   // operator new(uint)
                    strcmp(fn, "malloc") == 0) {
             // CRT allocators used by real DLLs (StdUtils, etc.). Returning 0
@@ -3281,14 +3218,21 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "calloc") == 0) {
             ret_val = wg_guest_alloc(engine, args[0] * args[1]);  // already zeroed
         } else if (strcmp(fn, "realloc") == 0) {
-            ret_val = wg_guest_realloc(engine, args[0], args[1]);
+            // Bump allocator can't grow in place; allocate fresh and copy. We
+            // don't know the old size, so copy a bounded amount (new size).
+            uint32_t np = wg_guest_alloc(engine, args[1]);
+            if (np && args[0] && args[1]) {
+                uint8_t *tmp = malloc(args[1]);
+                if (tmp) {
+                    wg_blink_read_mem(engine->blink, args[0], tmp, args[1]);
+                    wg_blink_write_mem(engine->blink, np, tmp, args[1]);
+                    free(tmp);
+                }
+            }
+            ret_val = np;
         } else if (strcmp(fn, "??3@YAXPAX@Z") == 0 ||   // operator delete(void*)
                    strcmp(fn, "free") == 0) {
-            // No-op: reclaiming arbitrary frees exposes latent use-after-free in
-            // the guest. Only realloc-move reclaims (the old block is provably
-            // dead). Combined with grow-in-place, that's enough to kill the big
-            // doubling-waste from the package download buffers.
-            ret_val = 0;
+            ret_val = 0;   // bump allocator: free is a no-op
         } else if (strcmp(fn, "memset") == 0) {
             // memset(dest=args[0], c=args[1], n=args[2]) -> returns dest (cdecl)
             uint32_t dst = args[0], n = args[2];
@@ -5541,7 +5485,6 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_iocp_created = false;
     s_tp_work_count = 0;
     s_alloc_count = 0;
-    s_free_count = 0;
     s_cmdpage_mapped = false;
     wg_bitmap_reset_all();
 

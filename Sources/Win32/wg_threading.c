@@ -12,12 +12,7 @@ WGThreadScheduler *wg_sched_create(void) {
     s->current = -1;
     s->next_id = 0x1000;
     s->next_handle = 0x7100;
-    // Worker stacks live well above the guest heap. The heap bump-allocates up
-    // from 0x20000000 and never frees, so multi-MB package downloads can climb
-    // hundreds of MB; keep the stacks at 0x70000000 (heap gets ~1.25GB clear of
-    // both the stacks and the main-thread stack at 0x7FFE0000). Was 0x30000000,
-    // which the heap grew into -> corrupted a worker stack -> package save failed.
-    s->next_stack_addr = 0x70000000u;
+    s->next_stack_addr = 0x30000000u;
     return s;
 }
 
