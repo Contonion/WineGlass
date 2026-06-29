@@ -3030,6 +3030,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 char dbg[512] = {0};
                 wg_blink_read_mem(engine->blink, args[0], dbg, 511);
                 WG_LOGI(TAG, "DbgPrint: %s", dbg);
+                // DIAG: Steam's "invalid input pointer" (strtools_unicode.cpp) on the
+                // download orchestrator precedes its early exit (big packages never
+                // download). Dump the .text caller chain so we can see WHICH op passed
+                // a bad string pointer (likely a path/name we returned wrong).
+                if (engine->pe_image && engine->pe_image->image_base == 0x400000 &&
+                    (strstr(dbg, "invalid input") || strstr(dbg, "strtools"))) {
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    char chain[300] = {0}; int ci = 0, found = 0;
+                    for (int k = 0; k < 160 && found < 12; k++) {
+                        uint32_t v = 0;
+                        wg_blink_read_mem(engine->blink, esp + k * 4, &v, 4);
+                        if (v >= 0x401000 && v < 0x700000) {
+                            ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v);
+                            found++;
+                        }
+                    }
+                    WG_LOGW(TAG, "*** DBGERR-CHAIN esp=0x%X: %s", esp, chain);
+                }
             }
         } else if (strcmp(fn, "OutputDebugStringW") == 0) {
             if (args[0]) {
