@@ -1303,7 +1303,7 @@ static int      s_errput_count = 0;
 // DIAG: one-shot read-watch at the cipher-filter decision point in
 // ssl_cipher_list_to_bytes (0x6BB98B) — dumps the version range + found flag to
 // learn why every cipher is filtered out (SSL_R_NO_CIPHERS_AVAILABLE).
-static uint32_t s_watch_addr = 0x69B720; // SSL_CTX_set_cipher_list(ctx, str) entry
+static uint32_t s_watch_addr = 0x69E59A; // just after ssl_set_client_disabled writes masks
 static uint8_t  s_watch_orig = 0;
 static bool     s_watch_armed = false;
 static int      s_watch_count = 0;
@@ -5605,14 +5605,24 @@ void wg_engine_tick(WGEngine *engine) {
                 if (handle_blink_thunk(engine)) break;
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
                 if (s_watch_armed && halt_rip == s_watch_addr) {
-                    // SSL_CTX_set_cipher_list(ctx=[esp+4], str=[esp+8]) — log the
-                    // cipher string Steam configures for each connection.
-                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
-                    uint32_t strp = 0; wg_blink_read_mem(engine->blink, esp + 8, &strp, 4);
-                    char cs[160] = {0};
-                    if (strp) wg_blink_read_mem(engine->blink, strp, cs, 159);
-                    if (s_watch_count < 12)
-                        WG_LOGW(TAG, "*** SSL_CTX_set_cipher_list: \"%s\"", cs);
+                    // After ssl_set_client_disabled: esi=s, sub=[s+0x7c]=s3. Force
+                    // the key-exchange/auth disabled masks to 0 (enable ECDHE etc.)
+                    // and the min-version field to TLS1.2, so the ClientHello offers
+                    // proper ECDHE/AES-GCM ciphers instead of weak RSA-CBC.
+                    uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+                    uint32_t sub = 0; wg_blink_read_mem(engine->blink, esi + 0x7c, &sub, 4);
+                    if (sub) {
+                        uint32_t mk=0, ma=0, ver=0;
+                        wg_blink_read_mem(engine->blink, sub + 0x2a0, &mk, 4);
+                        wg_blink_read_mem(engine->blink, sub + 0x2a4, &ma, 4);
+                        wg_blink_read_mem(engine->blink, sub + 0x2ac, &ver, 4);
+                        uint32_t zero = 0, v12 = 0x303;
+                        wg_blink_write_mem(engine->blink, sub + 0x2a0, &zero, 4);
+                        wg_blink_write_mem(engine->blink, sub + 0x2a4, &zero, 4);
+                        wg_blink_write_mem(engine->blink, sub + 0x2ac, &v12, 4);
+                        if (s_watch_count < 6)
+                            WG_LOGW(TAG, "*** masks patched: mask_k 0x%X->0, mask_a 0x%X->0, ver 0x%X->0x303", mk, ma, ver);
+                    }
                     s_watch_count++;
                     wg_blink_write_mem(engine->blink, s_watch_addr, &s_watch_orig, 1);
                     wg_blink_set_rip(engine->blink, s_watch_addr);
