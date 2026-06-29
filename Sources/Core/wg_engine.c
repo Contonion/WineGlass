@@ -6109,6 +6109,28 @@ void wg_engine_tick(WGEngine *engine) {
                     if (cur && cur->id != 1) {
                         // Worker thread returned — exit it and switch
                         uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                        // DIAG: the Steam download orchestrator/worker threads start
+                        // at 0x53CEE0. On device they return prematurely (orchestrator
+                        // code 0, then workers time out 258) leaving the package
+                        // download incomplete (no .vz saved). Capture the residual
+                        // .text call chain on the thread's stack at exit so we can see
+                        // WHAT decided to return. image_base guard to steam.exe.
+                        if (cur->start_addr == 0x53CEE0u && engine->pe_image &&
+                            engine->pe_image->image_base == 0x400000) {
+                            uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                            char chain[300] = {0}; int ci = 0, found = 0;
+                            for (int k = 0; k < 160 && found < 12; k++) {
+                                uint32_t v = 0;
+                                wg_blink_read_mem(engine->blink, esp + k * 4, &v, 4);
+                                if (v >= 0x401000 && v < 0x700000) {
+                                    ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v);
+                                    found++;
+                                }
+                            }
+                            WG_LOGW(TAG, "*** DLTHREAD-EXIT tid=0x%X code=%u esp=0x%X "
+                                    "wait_h=0x%X chain: %s", cur->id, eax, esp,
+                                    cur->wait_handle, chain);
+                        }
                         wg_dump_threads(engine, "thread-return");
                         wg_sched_exit_thread(engine->scheduler, engine->blink, eax);
                         wg_sched_wake(engine->scheduler, cur->handle);
