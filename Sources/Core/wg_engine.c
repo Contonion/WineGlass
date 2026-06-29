@@ -1373,6 +1373,19 @@ static uint8_t  s_snd_orig = 0;
 static bool     s_snd_armed = false;
 static int      s_snd_count = 0;
 
+// DIAG: the SEND pump is 0x4F3FC0 (NOT 0x4F3CA0, which is the recv pump calling
+// SSL_read 0x69cfb0). 0x4F3FC0 skips everything if [edi+0x134]==0 (no pending
+// send), else iterates a pending-send list and at 0x4F40DC does
+// `call 0x69d580(ssl=[edi+0x298], buf=[ebx+4], len=[ebx+0x14])` = SSL_write.
+// Trap 0x4F40DC: does the GET actually get SSL_written post-handshake? At the
+// call esp=[ssl][buf][len]; edi=conn; ebx=send descriptor. first4 "GET "=0x20544547.
+// Trap 0x4F3FE9 ([edi+0x134] check) to catch the "no pending send -> skip" case.
+static uint32_t s_sslw_addr   = 0x4F40DC; // the SSL_write send call site
+static uint32_t s_sndchk_addr = 0x4F3FE9; // [edi+0x134] pending-send gate
+static uint8_t  s_sslw_orig = 0, s_sndchk_orig = 0;
+static bool     s_sslw_armed = false;
+static int      s_sslw_count = 0, s_sndchk_count = 0;
+
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
 // (BoringSSL) can build its ClientHello random.
@@ -5711,6 +5724,15 @@ bool wg_engine_run(WGEngine *engine) {
                 WG_LOGI(TAG, "Armed send-pump trap: snd@0x%X", s_snd_addr);
             }
         }
+        if (!s_sslw_armed) {
+            uint8_t hlt = 0xF4;
+            if (wg_blink_read_mem(engine->blink, s_sslw_addr, &s_sslw_orig, 1))
+                wg_blink_write_mem(engine->blink, s_sslw_addr, &hlt, 1);
+            if (wg_blink_read_mem(engine->blink, s_sndchk_addr, &s_sndchk_orig, 1))
+                wg_blink_write_mem(engine->blink, s_sndchk_addr, &hlt, 1);
+            s_sslw_armed = true;
+            WG_LOGI(TAG, "Armed send traps: write@0x%X gate@0x%X", s_sslw_addr, s_sndchk_addr);
+        }
         // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
         // list construction, so Steam's ClientHello offers only static-RSA + P-521
         // and the CDN rejects it. Overwrite the two config strings (.rdata) with
@@ -5971,6 +5993,38 @@ void wg_engine_tick(WGEngine *engine) {
                     wg_blink_set_rip(engine->blink, s_snd_addr);
                     wg_blink_step(engine->blink);
                     uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_snd_addr, &hlt, 1);
+                    break;
+                }
+                if (s_sslw_armed && (halt_rip == s_sslw_addr || halt_rip == s_sndchk_addr)) {
+                    uint32_t edi = (uint32_t)wg_blink_get_reg(engine->blink, 7);
+                    if (halt_rip == s_sndchk_addr) {
+                        uint32_t pend = 0;
+                        wg_blink_read_mem(engine->blink, edi + 0x134, &pend, 4);
+                        if (s_sndchk_count < 12)
+                            WG_LOGW(TAG, "*** SENDGATE conn=0x%X [+0x134]=%u %s", edi, pend,
+                                    pend ? "(has pending send)" : "-> SKIP (no GET queued)");
+                        s_sndchk_count++;
+                        wg_blink_write_mem(engine->blink, s_sndchk_addr, &s_sndchk_orig, 1);
+                        wg_blink_set_rip(engine->blink, s_sndchk_addr);
+                        wg_blink_step(engine->blink);
+                        uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_sndchk_addr, &hlt, 1);
+                        break;
+                    }
+                    // 0x4F40DC: the SSL_write send call. esp=[ssl][buf][len].
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t sslp = 0, buf = 0, len = 0, b0 = 0;
+                    wg_blink_read_mem(engine->blink, esp + 0, &sslp, 4);
+                    wg_blink_read_mem(engine->blink, esp + 4, &buf, 4);
+                    wg_blink_read_mem(engine->blink, esp + 8, &len, 4);
+                    if (buf) wg_blink_read_mem(engine->blink, buf, &b0, 4);
+                    if (s_sslw_count < 20)
+                        WG_LOGW(TAG, "*** SSL_write SEND conn=0x%X ssl=0x%X buf=0x%X len=%u first4=0x%08X%s",
+                                edi, sslp, buf, len, b0, b0 == 0x20544547 ? " ('GET ')" : "");
+                    s_sslw_count++;
+                    wg_blink_write_mem(engine->blink, s_sslw_addr, &s_sslw_orig, 1);
+                    wg_blink_set_rip(engine->blink, s_sslw_addr);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_sslw_addr, &hlt, 1);
                     break;
                 }
                 if (s_errstr_armed && halt_rip == s_errstr_bp) {
