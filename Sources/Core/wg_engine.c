@@ -5476,10 +5476,19 @@ static bool load_pe_blink(WGEngine *engine) {
         wg_blink_load_code(engine->blink, 0xBFFF0000u, fake, sizeof(fake), 0);
     }
 
-    // Register the main thread (thread 0) with the scheduler
+    // Register the main thread (thread 0) with the scheduler. Clear the ENTIRE
+    // thread table first: the blink VM is recreated per PE load, so any worker
+    // threads from a previous PE (e.g. SteamSetup.exe's installer threads, before
+    // the user picks Steam.exe) are stale — their saved rip/stack point into the
+    // destroyed VM. Leaving them non-FREE made the round-robin scheduler resume a
+    // stale thread in the new VM -> SIGSEGV (seen at 0x53d58a). Also reset the
+    // id/handle/stack allocators so the new PE's threads start fresh + deterministic.
     if (engine->scheduler) {
+        memset(engine->scheduler->threads, 0, sizeof(engine->scheduler->threads));
+        engine->scheduler->next_id = 0x1000;
+        engine->scheduler->next_handle = 0x7100;
+        engine->scheduler->next_stack_addr = 0x30000000u;
         WGThread *mt = &engine->scheduler->threads[0];
-        memset(mt, 0, sizeof(*mt));
         mt->state = WG_THREAD_RUNNING;
         mt->id = 1;
         mt->handle = 0x7000;
