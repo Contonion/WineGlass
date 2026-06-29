@@ -1362,6 +1362,17 @@ static uint8_t  s_disp_chk_orig = 0, s_disp_pump_orig = 0;
 static bool     s_disp_armed = false;
 static int      s_disp_count = 0;
 
+// DIAG (the real gate): in the send-side data pump 0x4F3CA0, at 0x4F3D16
+// (`sub eax,[edi+0x244]`) eax = total bytes queued in the connection's send buffer
+// ([edi+0x230], via 0x46fb10) and [edi+0x244] = bytes already sent. If queued is
+// ~0 post-handshake, the HTTP layer never put the GET into the send buffer
+// (upstream gate). If queued >> sent (the GET is there) but no SSL_write happens,
+// it's the send guard. edi=conn. image_base 0x400000.
+static uint32_t s_snd_addr = 0x4F3D16;
+static uint8_t  s_snd_orig = 0;
+static bool     s_snd_armed = false;
+static int      s_snd_count = 0;
+
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
 // (BoringSSL) can build its ClientHello random.
@@ -5692,6 +5703,14 @@ bool wg_engine_run(WGEngine *engine) {
             WG_LOGI(TAG, "Armed dispatch traps: chk@0x%X pump@0x%X",
                     s_disp_chk_addr, s_disp_pump_addr);
         }
+        if (!s_snd_armed) {
+            if (wg_blink_read_mem(engine->blink, s_snd_addr, &s_snd_orig, 1)) {
+                uint8_t hlt = 0xF4;
+                wg_blink_write_mem(engine->blink, s_snd_addr, &hlt, 1);
+                s_snd_armed = true;
+                WG_LOGI(TAG, "Armed send-pump trap: snd@0x%X", s_snd_addr);
+            }
+        }
         // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
         // list construction, so Steam's ClientHello offers only static-RSA + P-521
         // and the CDN rejects it. Overwrite the two config strings (.rdata) with
@@ -5936,6 +5955,22 @@ void wg_engine_tick(WGEngine *engine) {
                     if (s_disp_count < 60) {
                         uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, halt_rip, &hlt, 1);
                     }
+                    break;
+                }
+                if (s_snd_armed && halt_rip == s_snd_addr) {
+                    // Send pump @0x4F3D16: eax = total bytes queued in the send
+                    // buffer ([edi+0x230]); [edi+0x244] = bytes already sent.
+                    uint32_t eax = (uint32_t)wg_blink_get_reg(engine->blink, 0);
+                    uint32_t edi = (uint32_t)wg_blink_get_reg(engine->blink, 7);
+                    uint32_t sent = 0; wg_blink_read_mem(engine->blink, edi + 0x244, &sent, 4);
+                    if (s_snd_count < 30)
+                        WG_LOGW(TAG, "*** SENDPUMP conn=0x%X queued=%u sent=%u remaining=%d",
+                                edi, eax, sent, (int)(eax - sent));
+                    s_snd_count++;
+                    wg_blink_write_mem(engine->blink, s_snd_addr, &s_snd_orig, 1);
+                    wg_blink_set_rip(engine->blink, s_snd_addr);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_snd_addr, &hlt, 1);
                     break;
                 }
                 if (s_errstr_armed && halt_rip == s_errstr_bp) {
