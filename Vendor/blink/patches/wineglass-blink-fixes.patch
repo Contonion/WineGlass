@@ -1,0 +1,50 @@
+=== blink/modrm.c (MMX m64 unaligned operand fix) ===
+(no modrm.c.bak; current shown below)
+
+=== config.h.ios (DISABLE_BMI2) ===
+--- config.h.ios.bak	2026-06-28 16:19:52
++++ config.h.ios	2026-06-28 16:20:12
+@@ -18,7 +18,7 @@
+ // #define DISABLE_MMX
+ // #define DISABLE_BCD
+ // #define DISABLE_ROM
+-// #define DISABLE_BMI2
++#define DISABLE_BMI2  // MULX/ADCX/ADOX miscompute under iOS interp -> BoringSSL X25519 keygen bad -> TLS internal_error. Force portable bignum.
+ 
+ // Features available on iOS / Darwin ARM64
+ #define HAVE_SYNC
+
+=== blink/cpuid.c (pclmulqdq off) ===
+--- blink/cpuid.c.bak	2026-06-28 16:19:52
++++ blink/cpuid.c	2026-06-28 16:20:27
+@@ -130,7 +130,7 @@
+       break;
+     case 1:
+       cx |= 1 << 0;    // sse3
+-      cx |= 1 << 1;    // pclmulqdq
++      cx |= 0 << 1;    // pclmulqdq (off: force portable GHASH under iOS interp)
+       cx |= 1 << 9;    // ssse3
+       cx |= 1 << 23;   // popcnt
+       cx |= 1 << 30;   // rdrnd
+
+=== blink/modrm.c — GetMmxAddress (replace the 3-line GetVectorAddress(A,8) version) ===
+// x86 MMX m64 memory operands are NOT alignment-restricted (unlike 16-byte SSE).
+// GetVectorAddress's (v & 7) check wrongly faults unaligned m64 (OpenSSL MMX bn_mul
+// uses e.g. [esp+0x14]). Allow unaligned within a page; keep page-straddle safety.
+u8 *GetMmxAddress(P) {
+  // MMX m64 memory operands are NOT alignment-restricted on x86 (unlike 16-byte
+  // SSE operands). GetVectorAddress's (v & 7) check wrongly faults on unaligned
+  // m64 (e.g. OpenSSL's MMX bignum uses [esp+0x14]). Allow unaligned access as
+  // long as the 8 bytes stay within one page (preserves page-straddle safety).
+  u8 *p;
+  i64 v;
+  if (IsModrmRegister(rde)) {
+    return XmmRexbRm(m, rde);
+  }
+  v = ComputeAddress(A);
+  SetReadAddr(m, v, 8);
+  if ((v & 4095) > 4096 - 8 || !(p = LookupAddress(m, v))) {
+    ThrowSegmentationFault(m, v);
+  }
+  return p;
+}

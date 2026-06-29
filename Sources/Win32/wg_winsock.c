@@ -368,6 +368,11 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         wg_blink_read_mem(blink, args[1], buf, len);
         char hex[64] = {0}; uint32_t hn = len < 16 ? len : 16;
         for (uint32_t i = 0; i < hn; i++) snprintf(hex + i*3, 4, "%02x ", buf[i]);
+        // DIAG: dump a TLS handshake record (0x16) to a file for offline parsing.
+        if (len > 64 && buf[0] == 0x16) {
+            FILE *cf = fopen("/tmp/wg_clienthello.bin", "wb");
+            if (cf) { fwrite(buf, 1, len, cf); fclose(cf); }
+        }
         ssize_t sent = send(fd, buf, len, 0);
         free(buf);
         if (sent < 0) {

@@ -861,6 +861,14 @@ typedef struct {
 static WGPendingCall s_callstack[64];
 static int           s_callstack_depth = 0;
 
+// WM_TIMER network pump: Steam calls SetTimer(hwnd, id, ~20ms, NULL) and drives
+// its whole network frame (select/recv) from the WM_TIMER handler in its wndproc.
+// We record the timer and deliver WM_TIMER from GetMessageW so the pump keeps
+// running (otherwise the main loop spins on GetMessage and never re-selects).
+static uint32_t s_timer_hwnd = 0;
+static uint32_t s_timer_id   = 0;
+static bool     s_timer_active = false;
+
 static uint32_t wg_resolve_wndproc(uint32_t hwnd) {
     if (hwnd == s_dlg_hwnd && s_dlg_proc) return s_dlg_proc;
     WGWin32Window *w = wg_wm_find(hwnd);
@@ -1284,11 +1292,21 @@ static bool wg_raise_guest_exception(WGEngine *engine, uint32_t code,
     return true;
 }
 
-// DIAG: one-shot trap on steam.exe's ERR_error_string_n to surface the exact
-// OpenSSL error that aborts the TLS handshake.
-static uint32_t s_errstr_bp = 0x5FDFC0;
+// DIAG: trap steam.exe's OpenSSL ERR_put_error(lib,func,reason,file,line) to
+// surface the exact error that aborts the TLS handshake, as it is generated
+// (the spew-gated reporter never runs). No-op stub: the fatal-alert flag is set
+// separately (by the SSL wrapper), so the handshake still fails identically.
+static uint32_t s_errstr_bp = 0x5FE710;
 static uint8_t  s_errstr_orig = 0;
 static bool     s_errstr_armed = false;
+static int      s_errput_count = 0;
+// DIAG: one-shot read-watch at the cipher-filter decision point in
+// ssl_cipher_list_to_bytes (0x6BB98B) — dumps the version range + found flag to
+// learn why every cipher is filtered out (SSL_R_NO_CIPHERS_AVAILABLE).
+static uint32_t s_watch_addr = 0x69B720; // SSL_CTX_set_cipher_list(ctx, str) entry
+static uint8_t  s_watch_orig = 0;
+static bool     s_watch_armed = false;
+static int      s_watch_count = 0;
 
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
@@ -1763,8 +1781,35 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "SetStretchBltMode") == 0) {
             ret_val = 1;
         } else if (strcmp(fn, "DefWindowProcW") == 0 ||
-                   strcmp(fn, "TranslateMessage") == 0 ||
-                   strcmp(fn, "DispatchMessageW") == 0) {
+                   strcmp(fn, "TranslateMessage") == 0) {
+            ret_val = 0;
+        } else if (strcmp(fn, "SetTimer") == 0) {
+            // SetTimer(hWnd=args[0], nIDEvent=args[1], uElapse=args[2], lpTimerFunc=args[3])
+            s_timer_hwnd = args[0];
+            s_timer_id   = args[1];
+            s_timer_active = true;
+            WG_LOGI(TAG, "SetTimer(hwnd=0x%X, id=0x%X, %ums) -> WM_TIMER pump armed",
+                    args[0], args[1], args[2]);
+            ret_val = args[1] ? args[1] : 1;
+        } else if (strcmp(fn, "KillTimer") == 0) {
+            if (args[1] == s_timer_id) s_timer_active = false;
+            ret_val = 1;
+        } else if (strcmp(fn, "DispatchMessageW") == 0 ||
+                   strcmp(fn, "DispatchMessageA") == 0) {
+            // Route the message to its window procedure. Critically, this lets
+            // WM_TIMER reach Steam's wndproc, which runs the network frame
+            // (select/recv) — the pump that completes the TLS handshake.
+            uint32_t dmsg[4] = {0};
+            if (args[0]) wg_blink_read_mem(engine->blink, args[0], dmsg, 16);
+            uint32_t dhwnd = dmsg[0], dwmsg = dmsg[1], dwp = dmsg[2], dlp = dmsg[3];
+            if (dwmsg != 0 && is_32bit) { // skip WM_NULL
+                uint32_t proc = wg_resolve_wndproc(dhwnd);
+                uint64_t caller_clean = rsp + ptr_size + (1 * ptr_size);
+                if (proc && wg_call_wndproc(engine, proc, dhwnd, dwmsg, dwp, dlp,
+                                            (uint32_t)ret_addr, (uint32_t)caller_clean)) {
+                    return true;
+                }
+            }
             ret_val = 0;
         } else if (strcmp(fn, "PostThreadMessageW") == 0 ||
                    strcmp(fn, "PostThreadMessageA") == 0) {
@@ -1781,12 +1826,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // main loop was supposed to drive. Instead: deliver a queued thread
             // message (or WM_NULL), return 1 so the loop body runs, then YIELD so
             // other threads (the download/poll thread) also make progress.
-            uint32_t gm_msg = 0, gm_wp = 0, gm_lp = 0;
+            uint32_t gm_msg = 0, gm_wp = 0, gm_lp = 0, gm_hwnd = 0;
             uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
-            tmsg_pop(cur_tid, &gm_msg, &gm_wp, &gm_lp); // WM_NULL(0) if none
+            bool had_msg = tmsg_pop(cur_tid, &gm_msg, &gm_wp, &gm_lp); // WM_NULL(0) if none
+            if (!had_msg && s_timer_active) {
+                // No queued message — deliver WM_TIMER so the wndproc runs its
+                // network frame (select/recv) and the TLS handshake can advance.
+                gm_hwnd = s_timer_hwnd; gm_msg = 0x0113 /*WM_TIMER*/; gm_wp = s_timer_id; gm_lp = 0;
+            }
             if (args[0]) {
                 // MSG: hwnd, message, wParam, lParam, time, pt.x, pt.y (28 bytes)
-                uint32_t msgbuf[7] = { 0, gm_msg, gm_wp, gm_lp, 0, 0, 0 };
+                uint32_t msgbuf[7] = { gm_hwnd, gm_msg, gm_wp, gm_lp, 0, 0, 0 };
                 wg_blink_write_mem(engine->blink, args[0], msgbuf, 28);
             }
             static int s_getmsg_log = 0;
@@ -5514,6 +5564,11 @@ bool wg_engine_run(WGEngine *engine) {
             WG_LOGI(TAG, "Armed ERR_error_string_n trap @0x%X (orig=0x%02X)",
                     s_errstr_bp, s_errstr_orig);
         }
+        if (wg_blink_read_mem(engine->blink, s_watch_addr, &s_watch_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
+            s_watch_armed = true;
+        }
     }
     return true;
 }
@@ -5549,22 +5604,41 @@ void wg_engine_tick(WGEngine *engine) {
             case WG_BLINK_HALT: {
                 if (handle_blink_thunk(engine)) break;
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
-                if (s_errstr_armed && halt_rip == s_errstr_bp) {
-                    // char *ERR_error_string_n(unsigned long e, char *buf, size_t len) [cdecl]
+                if (s_watch_armed && halt_rip == s_watch_addr) {
+                    // SSL_CTX_set_cipher_list(ctx=[esp+4], str=[esp+8]) — log the
+                    // cipher string Steam configures for each connection.
                     uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
-                    uint32_t ret = 0, e = 0, buf = 0;
+                    uint32_t strp = 0; wg_blink_read_mem(engine->blink, esp + 8, &strp, 4);
+                    char cs[160] = {0};
+                    if (strp) wg_blink_read_mem(engine->blink, strp, cs, 159);
+                    if (s_watch_count < 12)
+                        WG_LOGW(TAG, "*** SSL_CTX_set_cipher_list: \"%s\"", cs);
+                    s_watch_count++;
+                    wg_blink_write_mem(engine->blink, s_watch_addr, &s_watch_orig, 1);
+                    wg_blink_set_rip(engine->blink, s_watch_addr);
+                    wg_blink_step(engine->blink);
+                    uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
+                    break;
+                }
+                if (s_errstr_armed && halt_rip == s_errstr_bp) {
+                    // void ERR_put_error(int lib,int func,int reason,const char*file,int line) [cdecl]
+                    uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+                    uint32_t ret = 0, lib = 0, func = 0, reason = 0, file = 0, line = 0;
                     wg_blink_read_mem(engine->blink, esp, &ret, 4);
-                    wg_blink_read_mem(engine->blink, esp + 4, &e, 4);
-                    wg_blink_read_mem(engine->blink, esp + 8, &buf, 4);
-                    uint32_t lib = (e >> 24) & 0xFF, func = (e >> 12) & 0xFFF, reason = e & 0xFFF;
-                    WG_LOGW(TAG, "*** OpenSSL error: code=0x%08X lib=%u func=%u reason=%u", e, lib, func, reason);
-                    // Stub the call: write a placeholder string, return buf, pop ret.
-                    if (buf) {
-                        char ph[24]; snprintf(ph, sizeof(ph), "wg:lib%u:r%u", lib, reason);
-                        wg_blink_write_mem(engine->blink, buf, ph, (uint32_t)strlen(ph) + 1);
+                    wg_blink_read_mem(engine->blink, esp + 4, &lib, 4);
+                    wg_blink_read_mem(engine->blink, esp + 8, &func, 4);
+                    wg_blink_read_mem(engine->blink, esp + 12, &reason, 4);
+                    wg_blink_read_mem(engine->blink, esp + 16, &file, 4);
+                    wg_blink_read_mem(engine->blink, esp + 20, &line, 4);
+                    char fbuf[80] = {0};
+                    if (file) wg_blink_read_mem(engine->blink, file, fbuf, 79);
+                    if (s_errput_count < 30) {
+                        WG_LOGW(TAG, "*** ERR_put_error lib=%u func=%u reason=%u  %s:%u",
+                                lib, func, reason, fbuf, line);
                     }
-                    wg_blink_set_reg(engine->blink, 0, buf);      // EAX = buf
-                    wg_blink_set_reg(engine->blink, 4, esp + 4);  // pop return addr (cdecl: caller cleans args)
+                    s_errput_count++;
+                    // No-op stub (void cdecl): pop return addr only (caller cleans args).
+                    wg_blink_set_reg(engine->blink, 4, esp + 4);
                     wg_blink_set_rip(engine->blink, ret);
                     break;
                 }
