@@ -1402,6 +1402,49 @@ static void wg_fill_random(void *blink, uint32_t guest_addr, uint32_t len) {
 }
 
 // Dump every scheduler thread (id, state, entry, current rip, what it waits on)
+// Reactor backstop. Steam's HTTP-over-TLS download is a multi-thread reactor
+// (orchestrator + TLS worker + socket-I/O helper) that coordinates via job
+// events. On Windows those events are re-signalled by IOCP/WSAEventSelect when a
+// socket becomes readable (inbound) or by a peer thread when there's data to send
+// (outbound); we have no OS notifier and the cooperative interleaving is racy, so
+// the reactor can livelock at any phase (handshake recv, GET compose/send, HTTP
+// response recv) with every thread parked on its event. Whenever a thread idles
+// (Sleep OR WaitForSingleObject), nudge the reactor: periodically force every
+// event-waiter's event signalled so the parked workers re-run their pump (recv /
+// SSL_write). The pumps are gated on their own state, so a spurious wake is a
+// cheap no-op; this keeps the reactor cycling regardless of which blocking
+// primitive the threads happen to be using or which phase they're in. Fires often
+// when a socket has data waiting (inbound) and on a slower keep-alive otherwise
+// (outbound / break idle livelocks). Guarded to Steam (image_base 0x400000).
+static int s_backstop_tick = 0;
+static int s_backstop_log  = 0;
+static void wg_reactor_backstop(WGEngine *engine) {
+    if (!engine->pe_image || engine->pe_image->image_base != 0x400000) return;
+    if ((++s_backstop_tick & 7) != 0) return;            // throttle the whole check
+    bool readable = wg_winsock_any_readable(engine->winsock);
+    if (!readable && (s_backstop_tick % 64) != 0) return; // keep-alive cadence
+    WGThreadScheduler *sc = engine->scheduler;
+    int woke = 0;
+    for (int ti = 0; ti < sc->count; ti++) {
+        WGThread *t = &sc->threads[ti];
+        // Only parked waiters (READY = cooperative re-poll, WAITING = blocked).
+        // Never the RUNNING thread (the one invoking us) — don't satisfy its own
+        // wait early.
+        if (t->state != WG_THREAD_READY && t->state != WG_THREAD_WAITING) continue;
+        uint32_t wh = t->wait_handle;
+        if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
+            s_event_signalled[wh - WG_EVENT_BASE] = true;
+            wg_sched_wake(sc, wh);
+            woke++;
+        }
+    }
+    if (woke && s_backstop_log < 60) {
+        s_backstop_log++;
+        WG_LOGW(TAG, "*** REACTOR-BACKSTOP: woke %d event-waiter(s) (readable=%d tick=%d)",
+                woke, (int)readable, s_backstop_tick);
+    }
+}
+
 // — used to see why Steam's async download reactor stalls (which thread should
 // drive the socket I/O and what it's blocked on).
 static void wg_dump_threads(WGEngine *engine, const char *why) {
@@ -3513,6 +3556,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
             } else if (timeout == 0) {
                 ret_val = 258; // WAIT_TIMEOUT
             } else {
+                // Nudge the async download reactor: when threads park here (not on
+                // Sleep) the reactor can still livelock, so drive it from the wait
+                // path too.
+                wg_reactor_backstop(engine);
                 // Finite timeout → cooperative POLL (yield READY, re-check next
                 // turn) since we have no real timer to fire timeouts; INFINITE →
                 // truly block (WAITING) until signalled. This lets timed waiters
@@ -3996,7 +4043,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // On first few calls, dump guest call stack so we know what's looping.
                 static uint32_t s_sleep_loop_rip = 0;
                 static int      s_sleep_loop_cnt = 0;
-                static int      s_backstop_log = 0;
                 uint32_t cur_rip = (uint32_t)ret_addr; // instruction after the Sleep call
                 if (cur_rip == s_sleep_loop_rip) {
                     s_sleep_loop_cnt++;
@@ -4004,37 +4050,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     s_sleep_loop_rip = cur_rip;
                     s_sleep_loop_cnt = 1;
                 }
-                // Reactor backstop: the orchestrator's Sleep loop is the heartbeat
-                // while it waits for async I/O to finish. If a connected socket has
-                // data ready but the app's I/O worker threads are parked on their
-                // job events (Windows auto-signals those via IOCP/WSAEventSelect;
-                // we have no OS notifier), wake every thread waiting on an event so
-                // one of them does the recv and drives the TLS handshake / download
-                // forward. Self-limiting: once the socket is drained it stops being
-                // readable, so we stop signalling. Guarded to Steam (image_base
-                // 0x400000) so it can't perturb other apps' I/O.
-                if (s_sleep_loop_cnt > 3 && (s_sleep_loop_cnt & 7) == 0 &&
-                    engine->pe_image && engine->pe_image->image_base == 0x400000 &&
-                    wg_winsock_any_readable(engine->winsock)) {
-                    WGThreadScheduler *sc = engine->scheduler;
-                    int woke = 0;
-                    for (int ti = 0; ti < sc->count; ti++) {
-                        WGThread *t = &sc->threads[ti];
-                        if (t->state == WG_THREAD_FREE || t->state == WG_THREAD_EXITED)
-                            continue;
-                        uint32_t wh = t->wait_handle;
-                        if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
-                            s_event_signalled[wh - WG_EVENT_BASE] = true;
-                            wg_sched_wake(sc, wh);
-                            woke++;
-                        }
-                    }
-                    if (woke && s_backstop_log < 40) {
-                        s_backstop_log++;
-                        WG_LOGW(TAG, "*** REACTOR-BACKSTOP: socket readable, woke %d event-waiter(s) (spin=%d)",
-                                woke, s_sleep_loop_cnt);
-                    }
-                }
+                wg_reactor_backstop(engine); // nudge the async download reactor
                 if (s_sleep_loop_cnt <= 2) {
                     uint32_t ebp0 = (uint32_t)wg_blink_get_reg(engine->blink, 5);
                     uint32_t cur_tid2 = wg_sched_current_tid(engine->scheduler);

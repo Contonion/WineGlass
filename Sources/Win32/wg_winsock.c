@@ -80,6 +80,7 @@ struct WGWinsock {
     // are unsigned ints; we use a small table indexed by (handle - base).
     int  fds[WG_MAX_SOCKETS]; // -1 = unused
     bool connect_reported[WG_MAX_SOCKETS]; // FD_CONNECT delivered once per socket
+    int  select_spin; // consecutive select() with no intervening send/recv (livelock detect)
 };
 
 #define SOCK_BASE 0x1000u
@@ -359,6 +360,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── send(s, buf, len, flags) ────────────────────────────────────
     if (strcmp(fn, "send") == 0) {
+        ws->select_spin = 0; // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t len = args[2];
@@ -406,6 +408,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── recv(s, buf, len, flags) ────────────────────────────────────
     if (strcmp(fn, "recv") == 0) {
+        ws->select_spin = 0; // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t len = args[2];
@@ -437,6 +440,47 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         // __WSAFDIsSet to test membership. We poll the real fds and rebuild each
         // set. (Old stub returned 1 without marking which fd -> infinite re-select.)
         uint32_t set_ptrs[3] = { args[1], args[2], args[3] }; // read, write, except
+
+        // Livelock-breaker (checked before normal processing). Steam's first
+        // connection completes the TLS handshake but (on the full-handshake path)
+        // never composes the HTTP GET, so it spins select() forever: the socket
+        // stays writable, so it keeps trying to send (nothing queued) and never
+        // recv()s or reaches its give-up. A healthy exchange does a send/recv
+        // between selects (which reset select_spin). After a long run of selects
+        // with zero I/O, force the connection to fail so Steam retries on a fresh
+        // connection (which succeeds via TLS session resumption and actually queues
+        // the GET): shut the socket(s) down and present them as readable-ONLY so the
+        // app stops write-polling, calls recv(), gets 0/EOF, and takes its normal
+        // "connection closed" -> "http error 0" -> retry path.
+        if (++ws->select_spin >= 4000) {
+            bool first = (ws->select_spin == 4000);
+            uint32_t rdy[64]; uint32_t rc = 0;
+            for (int si = 0; si < 2; si++) { // sockets named in read+write sets
+                if (!set_ptrs[si]) continue;
+                uint32_t fc = 0; wg_blink_read_mem(blink, set_ptrs[si], &fc, 4);
+                if (fc > 64) fc = 64;
+                uint32_t a[64] = {0};
+                if (fc) wg_blink_read_mem(blink, set_ptrs[si] + 4, a, fc * 4);
+                for (uint32_t i = 0; i < fc; i++) {
+                    int fd = lookup_fd(ws, a[i]);
+                    if (fd < 0) continue;
+                    if (first) shutdown(fd, SHUT_RDWR);
+                    bool seen = false;
+                    for (uint32_t k = 0; k < rc; k++) if (rdy[k] == a[i]) { seen = true; break; }
+                    if (!seen && rc < 64) rdy[rc++] = a[i];
+                }
+            }
+            if (first)
+                WG_LOGW(TAG, "select livelock-breaker: no I/O in 4000 selects, forcing %u sock(s) to EOF/retry", rc);
+            if (set_ptrs[0]) { wg_blink_write_mem(blink, set_ptrs[0], &rc, 4);
+                if (rc) wg_blink_write_mem(blink, set_ptrs[0] + 4, rdy, rc * 4); }
+            if (set_ptrs[1]) { uint32_t z = 0; wg_blink_write_mem(blink, set_ptrs[1], &z, 4); }
+            if (set_ptrs[2]) { uint32_t z = 0; wg_blink_write_mem(blink, set_ptrs[2], &z, 4); }
+            *out_ret = (uint32_t)(rc ? rc : 1);
+            return true;
+        }
+
+        // Normal: poll each fd, rebuild each set in place to hold only ready ones.
         int total = 0;
         for (int si = 0; si < 3; si++) {
             if (!set_ptrs[si]) continue;
@@ -837,6 +881,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     // These use WSABUF structures. For now, stub them.
     // ── WSASend(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSASend") == 0 || strcmp(fn, "WSASendTo") == 0) {
+        ws->select_spin = 0; // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t buf_count = args[2];
@@ -873,6 +918,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     }
     // ── WSARecv(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSARecv") == 0 || strcmp(fn, "WSARecvFrom") == 0) {
+        ws->select_spin = 0; // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t buf_count = args[2];
