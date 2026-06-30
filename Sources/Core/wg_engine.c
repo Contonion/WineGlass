@@ -53,6 +53,13 @@ static bool s_force_giveup_enabled = true;
 #else
 static bool s_force_giveup_enabled = false;
 #endif
+// Set true once a TLS handshake COMPLETES (HS_RET=1); reset false while a handshake
+// is in progress (HS_RET<=0). s_post_hs_spins counts orchestrator Sleep-loop spins
+// since the handshake completed — we only force the give-up AFTER the handshake is
+// up and has stayed resultless, never during connect/handshake (which itself burns
+// >1000 orchestrator spins on the device).
+static bool s_hs_done = false;
+static int  s_post_hs_spins = 0;
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
@@ -4261,25 +4268,29 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // time, log it periodically (read-only) so a genuine deadlock is
                 // visible. Includes the pump disasm so we don't have to scroll up to
                 // the one-shot iter-5 probe in a huge log.
-                // Device forced give-up: if the manifest-download orchestrator's
-                // Sleep poll loop (ret 0x53D58A) has spun a long time with no result
-                // ([this+0x18C]==0) and its exit flag not yet set, force the give-up
-                // so Steam retries (-> resumption -> manifest). iOS only; on macOS
-                // the orchestrator gives up naturally well before this threshold.
-                if (s_force_giveup_enabled && cur_rip == 0x53D58Au &&
-                    s_sleep_loop_cnt >= 1200) {
+                // Device forced give-up: ONLY after the handshake has completed
+                // (s_hs_done) and the orchestrator has then spun its Sleep loop
+                // (ret 0x53D58A) a while longer with no result ([this+0x18C]==0).
+                // This fires in the genuine post-handshake hang (GET never queued),
+                // NOT during connect/handshake (which itself burns >1000 spins). Set
+                // the documented loop-exit flag [this+0x4C]=1 -> http error 0 ->
+                // Steam's outer loop retries (-> resumption -> manifest). iOS only.
+                if (s_force_giveup_enabled && cur_rip == 0x53D58Au && s_hs_done) {
+                    s_post_hs_spins++;
                     static uint32_t s_forced_ebx = 0;
-                    uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
-                    if (ebx >= 0x400000u && ebx < 0x80000000u && ebx != s_forced_ebx) {
-                        uint32_t f18c = 0, f4c = 0;
-                        wg_blink_read_mem(engine->blink, ebx + 0x18C, &f18c, 4);
-                        wg_blink_read_mem(engine->blink, ebx + 0x4C, &f4c, 4);
-                        if (f18c == 0 && (f4c & 0xFF) == 0) {
-                            uint8_t one = 1;
-                            wg_blink_write_mem(engine->blink, ebx + 0x4C, &one, 1);
-                            s_forced_ebx = ebx;
-                            WG_LOGW(TAG, "*** FORCE-GIVEUP: orchestrator 0x%X stuck %d spins, set [+0x4C]=1 -> trigger retry",
-                                    ebx, s_sleep_loop_cnt);
+                    if (s_post_hs_spins >= 600) {
+                        uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                        if (ebx >= 0x400000u && ebx < 0x80000000u && ebx != s_forced_ebx) {
+                            uint32_t f18c = 0, f4c = 0;
+                            wg_blink_read_mem(engine->blink, ebx + 0x18C, &f18c, 4);
+                            wg_blink_read_mem(engine->blink, ebx + 0x4C, &f4c, 4);
+                            if (f18c == 0 && (f4c & 0xFF) == 0) {
+                                uint8_t one = 1;
+                                wg_blink_write_mem(engine->blink, ebx + 0x4C, &one, 1);
+                                s_forced_ebx = ebx;
+                                WG_LOGW(TAG, "*** FORCE-GIVEUP: orchestrator 0x%X stuck %d spins post-handshake, set [+0x4C]=1 -> trigger retry",
+                                        ebx, s_post_hs_spins);
+                            }
                         }
                     }
                 }
@@ -5692,6 +5703,7 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     // wg_engine_run patch + arm the traps fresh for each new VM.
     s_errstr_armed = s_watch_armed = s_cloop_armed = s_fac_armed = false;
     s_pe_armed = s_hs_armed = s_disp_armed = s_sslw_armed = false;
+    s_hs_done = false; s_post_hs_spins = 0;
     s_watch_count = s_cloop_count = s_fac_count = s_errput_count = 0;
     s_pe_count = s_hs_count = s_disp_count = s_snd_count = 0;
     s_sslw_count = s_sndchk_count = 0;
@@ -6057,6 +6069,10 @@ void wg_engine_tick(WGEngine *engine) {
                         wg_blink_read_mem(engine->blink, esi + 0x298, &ssl, 4);
                         WG_LOGW(TAG, "*** HS_RET=%d (1=complete,<=0=want/err) conn=0x%X ssl=0x%X step=%u",
                                 (int)eax, esi, ssl, step);
+                        // Gate the forced give-up on handshake completion: only start
+                        // the post-HS spin counter once the handshake is actually up.
+                        if ((int)eax == 1) { s_hs_done = true; s_post_hs_spins = 0; }
+                        else               { s_hs_done = false; s_post_hs_spins = 0; }
                     } else {
                         WG_LOGW(TAG, "*** HS_GATE=%d (nonzero=still-in-init, 0=>done)", (int)eax);
                     }
