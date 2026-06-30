@@ -1061,3 +1061,28 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
 uint32_t wg_winsock_get_last_error(WGWinsock *ws) { return ws ? (uint32_t)ws->last_error : 0; }
 void     wg_winsock_set_last_error(WGWinsock *ws, uint32_t err) { if (ws) ws->last_error = (int)err; }
+
+// Reactor backstop: returns true if ANY open socket has data ready to read (or a
+// pending connect/close). Used by the cooperative scheduler to detect that the
+// app's async I/O threads should be woken to recv — Windows would auto-signal an
+// event/IOCP completion on readiness; we have no OS notifier, so we poll.
+bool wg_winsock_any_readable(WGWinsock *ws) {
+    if (!ws) return false;
+    struct pollfd pfds[WG_MAX_SOCKETS];
+    int n = 0;
+    for (int i = 0; i < WG_MAX_SOCKETS; i++) {
+        if (ws->fds[i] >= 0) {
+            pfds[n].fd = ws->fds[i];
+            pfds[n].events = POLLIN;
+            pfds[n].revents = 0;
+            n++;
+        }
+    }
+    if (n == 0) return false;
+    int r = poll(pfds, (nfds_t)n, 0);
+    if (r <= 0) return false;
+    for (int i = 0; i < n; i++) {
+        if (pfds[i].revents & (POLLIN | POLLHUP | POLLERR)) return true;
+    }
+    return false;
+}

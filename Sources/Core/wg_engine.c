@@ -3996,12 +3996,44 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // On first few calls, dump guest call stack so we know what's looping.
                 static uint32_t s_sleep_loop_rip = 0;
                 static int      s_sleep_loop_cnt = 0;
+                static int      s_backstop_log = 0;
                 uint32_t cur_rip = (uint32_t)ret_addr; // instruction after the Sleep call
                 if (cur_rip == s_sleep_loop_rip) {
                     s_sleep_loop_cnt++;
                 } else {
                     s_sleep_loop_rip = cur_rip;
                     s_sleep_loop_cnt = 1;
+                }
+                // Reactor backstop: the orchestrator's Sleep loop is the heartbeat
+                // while it waits for async I/O to finish. If a connected socket has
+                // data ready but the app's I/O worker threads are parked on their
+                // job events (Windows auto-signals those via IOCP/WSAEventSelect;
+                // we have no OS notifier), wake every thread waiting on an event so
+                // one of them does the recv and drives the TLS handshake / download
+                // forward. Self-limiting: once the socket is drained it stops being
+                // readable, so we stop signalling. Guarded to Steam (image_base
+                // 0x400000) so it can't perturb other apps' I/O.
+                if (s_sleep_loop_cnt > 3 && (s_sleep_loop_cnt & 7) == 0 &&
+                    engine->pe_image && engine->pe_image->image_base == 0x400000 &&
+                    wg_winsock_any_readable(engine->winsock)) {
+                    WGThreadScheduler *sc = engine->scheduler;
+                    int woke = 0;
+                    for (int ti = 0; ti < sc->count; ti++) {
+                        WGThread *t = &sc->threads[ti];
+                        if (t->state == WG_THREAD_FREE || t->state == WG_THREAD_EXITED)
+                            continue;
+                        uint32_t wh = t->wait_handle;
+                        if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
+                            s_event_signalled[wh - WG_EVENT_BASE] = true;
+                            wg_sched_wake(sc, wh);
+                            woke++;
+                        }
+                    }
+                    if (woke && s_backstop_log < 40) {
+                        s_backstop_log++;
+                        WG_LOGW(TAG, "*** REACTOR-BACKSTOP: socket readable, woke %d event-waiter(s) (spin=%d)",
+                                woke, s_sleep_loop_cnt);
+                    }
                 }
                 if (s_sleep_loop_cnt <= 2) {
                     uint32_t ebp0 = (uint32_t)wg_blink_get_reg(engine->blink, 5);
