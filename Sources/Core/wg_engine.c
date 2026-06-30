@@ -1402,49 +1402,6 @@ static void wg_fill_random(void *blink, uint32_t guest_addr, uint32_t len) {
 }
 
 // Dump every scheduler thread (id, state, entry, current rip, what it waits on)
-// Reactor backstop. Steam's HTTP-over-TLS download is a multi-thread reactor
-// (orchestrator + TLS worker + socket-I/O helper) that coordinates via job
-// events. On Windows those events are re-signalled by IOCP/WSAEventSelect when a
-// socket becomes readable (inbound) or by a peer thread when there's data to send
-// (outbound); we have no OS notifier and the cooperative interleaving is racy, so
-// the reactor can livelock at any phase (handshake recv, GET compose/send, HTTP
-// response recv) with every thread parked on its event. Whenever a thread idles
-// (Sleep OR WaitForSingleObject), nudge the reactor: periodically force every
-// event-waiter's event signalled so the parked workers re-run their pump (recv /
-// SSL_write). The pumps are gated on their own state, so a spurious wake is a
-// cheap no-op; this keeps the reactor cycling regardless of which blocking
-// primitive the threads happen to be using or which phase they're in. Fires often
-// when a socket has data waiting (inbound) and on a slower keep-alive otherwise
-// (outbound / break idle livelocks). Guarded to Steam (image_base 0x400000).
-static int s_backstop_tick = 0;
-static int s_backstop_log  = 0;
-static void wg_reactor_backstop(WGEngine *engine) {
-    if (!engine->pe_image || engine->pe_image->image_base != 0x400000) return;
-    if ((++s_backstop_tick & 7) != 0) return;            // throttle the whole check
-    bool readable = wg_winsock_any_readable(engine->winsock);
-    if (!readable && (s_backstop_tick % 64) != 0) return; // keep-alive cadence
-    WGThreadScheduler *sc = engine->scheduler;
-    int woke = 0;
-    for (int ti = 0; ti < sc->count; ti++) {
-        WGThread *t = &sc->threads[ti];
-        // Only parked waiters (READY = cooperative re-poll, WAITING = blocked).
-        // Never the RUNNING thread (the one invoking us) — don't satisfy its own
-        // wait early.
-        if (t->state != WG_THREAD_READY && t->state != WG_THREAD_WAITING) continue;
-        uint32_t wh = t->wait_handle;
-        if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
-            s_event_signalled[wh - WG_EVENT_BASE] = true;
-            wg_sched_wake(sc, wh);
-            woke++;
-        }
-    }
-    if (woke && s_backstop_log < 60) {
-        s_backstop_log++;
-        WG_LOGW(TAG, "*** REACTOR-BACKSTOP: woke %d event-waiter(s) (readable=%d tick=%d)",
-                woke, (int)readable, s_backstop_tick);
-    }
-}
-
 // — used to see why Steam's async download reactor stalls (which thread should
 // drive the socket I/O and what it's blocked on).
 static void wg_dump_threads(WGEngine *engine, const char *why) {
@@ -3556,10 +3513,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
             } else if (timeout == 0) {
                 ret_val = 258; // WAIT_TIMEOUT
             } else {
-                // Nudge the async download reactor: when threads park here (not on
-                // Sleep) the reactor can still livelock, so drive it from the wait
-                // path too.
-                wg_reactor_backstop(engine);
                 // Finite timeout → cooperative POLL (yield READY, re-check next
                 // turn) since we have no real timer to fire timeouts; INFINITE →
                 // truly block (WAITING) until signalled. This lets timed waiters
@@ -3990,26 +3943,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0; // no messages
             }
         } else if (strcmp(fn, "GetTickCount") == 0) {
-            // MUST track REAL elapsed wall-clock, not advance per-call. Steam times
-            // its manifest download / connection against GetTickCount in a tight
-            // poll loop (Sleep+select spin). A per-call increment made virtual time
-            // race ahead during the slow (under blink) TLS full handshake — thousands
-            // of polls * 16ms = minutes of "elapsed" — tripping Steam's request
-            // timeout before the HTTP GET was queued (full handshake failed; only the
-            // faster resumption beat the timeout). Real monotonic ms keeps the actual
-            // few-second handshake well within Steam's timeout. Per-launch offset so
-            // NSIS temp-dir names (derived from GetTickCount) still vary across runs.
-            static uint64_t s_tick_base = 0; static uint32_t s_tick_off = 0;
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
-            if (s_tick_base == 0) { s_tick_base = now_ms; s_tick_off = (uint32_t)(time(NULL) * 1000u) | 1u; }
-            ret_val = (uint32_t)(s_tick_off + (now_ms - s_tick_base));
-        } else if (strcmp(fn, "GetTickCount64") == 0) {
-            static uint64_t s_tick64_base = 0; static uint64_t s_tick64_off = 0;
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
-            if (s_tick64_base == 0) { s_tick64_base = now_ms; s_tick64_off = (uint64_t)time(NULL) * 1000ull; }
-            ret_val = s_tick64_off + (now_ms - s_tick64_base);
+            // Seed from a real clock so it varies across launches — NSIS
+            // derives its temp-dir names from this, and a fixed seed makes
+            // every run collide on the same stale directory.
+            static uint32_t s_tick = 0;
+            if (s_tick == 0) s_tick = (uint32_t)(time(NULL) * 1000u) | 1u;
+            ret_val = s_tick;
+            s_tick += 16;
         } else if (strcmp(fn, "GetSystemTimeAsFileTime") == 0 ||
                    strcmp(fn, "GetSystemTimePreciseAsFileTime") == 0) {
             if (args[0]) {
@@ -4063,7 +4003,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     s_sleep_loop_rip = cur_rip;
                     s_sleep_loop_cnt = 1;
                 }
-                wg_reactor_backstop(engine); // nudge the async download reactor
                 if (s_sleep_loop_cnt <= 2) {
                     uint32_t ebp0 = (uint32_t)wg_blink_get_reg(engine->blink, 5);
                     uint32_t cur_tid2 = wg_sched_current_tid(engine->scheduler);
@@ -4311,26 +4250,6 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 return true; // no other threads; state already cleaned
             }
             ret_val = 0;
-        } else if (strcmp(fn, "SleepConditionVariableCS") == 0 ||
-                   strcmp(fn, "SleepConditionVariableSRW") == 0) {
-            // Real condition-variable wait. The old R1S stub returned TRUE WITHOUT
-            // yielding, so a consumer's `while(!pred) SleepConditionVariableCS(...)`
-            // loop spun without ever giving the PRODUCER thread CPU (cooperative
-            // scheduler) to set the predicate -> handoff stalled forever. Steam uses
-            // a CV (e.g. 0x857180) to hand "connection established" to the thread that
-            // composes+queues the HTTP GET; the no-yield stub stalled that handoff so
-            // the GET was never queued after a (slow) full handshake. Fix: complete
-            // the call returning TRUE but YIELD so other threads run; the caller then
-            // re-checks its predicate and loops if still unsatisfied. (Our critical
-            // sections don't serialize, so a cooperative yield-and-recheck is more
-            // robust than truly blocking, which would risk lost-wakeup hangs.)
-            int cv_nargs = (strcmp(fn, "SleepConditionVariableSRW") == 0) ? 4 : 3;
-            uint64_t new_rsp = rsp + ptr_size + ((uint64_t)cv_nargs * ptr_size);
-            wg_blink_set_reg(engine->blink, 4, new_rsp);
-            wg_blink_set_rip(engine->blink, ret_addr);
-            wg_blink_set_reg(engine->blink, 0, 1); // EAX = TRUE (woke)
-            wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
-            return true; // call completed (manually cleaned) + yielded
         } else if (strcmp(fn, "ExitThread") == 0) {
             WG_LOGI(TAG, "ExitThread(%u)", args[0]);
             wg_dump_threads(engine, "ExitThread");
