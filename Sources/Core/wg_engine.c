@@ -3990,13 +3990,26 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0; // no messages
             }
         } else if (strcmp(fn, "GetTickCount") == 0) {
-            // Seed from a real clock so it varies across launches — NSIS
-            // derives its temp-dir names from this, and a fixed seed makes
-            // every run collide on the same stale directory.
-            static uint32_t s_tick = 0;
-            if (s_tick == 0) s_tick = (uint32_t)(time(NULL) * 1000u) | 1u;
-            ret_val = s_tick;
-            s_tick += 16;
+            // MUST track REAL elapsed wall-clock, not advance per-call. Steam times
+            // its manifest download / connection against GetTickCount in a tight
+            // poll loop (Sleep+select spin). A per-call increment made virtual time
+            // race ahead during the slow (under blink) TLS full handshake — thousands
+            // of polls * 16ms = minutes of "elapsed" — tripping Steam's request
+            // timeout before the HTTP GET was queued (full handshake failed; only the
+            // faster resumption beat the timeout). Real monotonic ms keeps the actual
+            // few-second handshake well within Steam's timeout. Per-launch offset so
+            // NSIS temp-dir names (derived from GetTickCount) still vary across runs.
+            static uint64_t s_tick_base = 0; static uint32_t s_tick_off = 0;
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+            if (s_tick_base == 0) { s_tick_base = now_ms; s_tick_off = (uint32_t)(time(NULL) * 1000u) | 1u; }
+            ret_val = (uint32_t)(s_tick_off + (now_ms - s_tick_base));
+        } else if (strcmp(fn, "GetTickCount64") == 0) {
+            static uint64_t s_tick64_base = 0; static uint64_t s_tick64_off = 0;
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+            if (s_tick64_base == 0) { s_tick64_base = now_ms; s_tick64_off = (uint64_t)time(NULL) * 1000ull; }
+            ret_val = s_tick64_off + (now_ms - s_tick64_base);
         } else if (strcmp(fn, "GetSystemTimeAsFileTime") == 0 ||
                    strcmp(fn, "GetSystemTimePreciseAsFileTime") == 0) {
             if (args[0]) {
@@ -4298,6 +4311,26 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 return true; // no other threads; state already cleaned
             }
             ret_val = 0;
+        } else if (strcmp(fn, "SleepConditionVariableCS") == 0 ||
+                   strcmp(fn, "SleepConditionVariableSRW") == 0) {
+            // Real condition-variable wait. The old R1S stub returned TRUE WITHOUT
+            // yielding, so a consumer's `while(!pred) SleepConditionVariableCS(...)`
+            // loop spun without ever giving the PRODUCER thread CPU (cooperative
+            // scheduler) to set the predicate -> handoff stalled forever. Steam uses
+            // a CV (e.g. 0x857180) to hand "connection established" to the thread that
+            // composes+queues the HTTP GET; the no-yield stub stalled that handoff so
+            // the GET was never queued after a (slow) full handshake. Fix: complete
+            // the call returning TRUE but YIELD so other threads run; the caller then
+            // re-checks its predicate and loops if still unsatisfied. (Our critical
+            // sections don't serialize, so a cooperative yield-and-recheck is more
+            // robust than truly blocking, which would risk lost-wakeup hangs.)
+            int cv_nargs = (strcmp(fn, "SleepConditionVariableSRW") == 0) ? 4 : 3;
+            uint64_t new_rsp = rsp + ptr_size + ((uint64_t)cv_nargs * ptr_size);
+            wg_blink_set_reg(engine->blink, 4, new_rsp);
+            wg_blink_set_rip(engine->blink, ret_addr);
+            wg_blink_set_reg(engine->blink, 0, 1); // EAX = TRUE (woke)
+            wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
+            return true; // call completed (manually cleaned) + yielded
         } else if (strcmp(fn, "ExitThread") == 0) {
             WG_LOGI(TAG, "ExitThread(%u)", args[0]);
             wg_dump_threads(engine, "ExitThread");
