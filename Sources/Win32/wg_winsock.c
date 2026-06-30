@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
+#include <time.h>
 
 #define TAG "WSock"
 
@@ -80,8 +81,14 @@ struct WGWinsock {
     // are unsigned ints; we use a small table indexed by (handle - base).
     int  fds[WG_MAX_SOCKETS]; // -1 = unused
     bool connect_reported[WG_MAX_SOCKETS]; // FD_CONNECT delivered once per socket
-    int  select_spin; // consecutive select() with no intervening send/recv (livelock detect)
+    time_t last_io; // wall-clock of last send/recv-with-data (livelock detect)
 };
+
+// Seconds of zero socket I/O while select() spins before we treat it as a genuine
+// livelock and force the connection to fail (see select handler). Must be well
+// above normal network round-trip latency (handshake replies arrive in well under
+// a second) so we never kill a healthy handshake that's just waiting for the peer.
+#define WG_LIVELOCK_SECS 20
 
 #define SOCK_BASE 0x1000u
 
@@ -360,7 +367,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── send(s, buf, len, flags) ────────────────────────────────────
     if (strcmp(fn, "send") == 0) {
-        ws->select_spin = 0; // real I/O = progress; reset livelock detector
+        ws->last_io = time(NULL); // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t len = args[2];
@@ -408,7 +415,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
     // ── recv(s, buf, len, flags) ────────────────────────────────────
     if (strcmp(fn, "recv") == 0) {
-        ws->select_spin = 0; // real I/O = progress; reset livelock detector
+        ws->last_io = time(NULL); // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t len = args[2];
@@ -445,15 +452,24 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         // connection completes the TLS handshake but (on the full-handshake path)
         // never composes the HTTP GET, so it spins select() forever: the socket
         // stays writable, so it keeps trying to send (nothing queued) and never
-        // recv()s or reaches its give-up. A healthy exchange does a send/recv
-        // between selects (which reset select_spin). After a long run of selects
-        // with zero I/O, force the connection to fail so Steam retries on a fresh
-        // connection (which succeeds via TLS session resumption and actually queues
-        // the GET): shut the socket(s) down and present them as readable-ONLY so the
-        // app stops write-polling, calls recv(), gets 0/EOF, and takes its normal
-        // "connection closed" -> "http error 0" -> retry path.
-        if (++ws->select_spin >= 4000) {
-            bool first = (ws->select_spin == 4000);
+        // recv()s or reaches its give-up. A healthy exchange does a send/recv that
+        // updates last_io. Only when there has been ZERO socket I/O for a real
+        // wall-clock interval (WG_LIVELOCK_SECS) do we treat it as a genuine
+        // livelock — a select COUNT threshold is unusable because the same spin is
+        // sub-second on a fast (JIT) host yet many seconds on the slow interpreter,
+        // and would kill healthy handshakes mid-flight. On a true stall, force the
+        // connection to fail so Steam retries on a fresh connection (which succeeds
+        // via TLS session resumption and actually queues the GET): shut the
+        // socket(s) down and present them as readable-ONLY so the app stops
+        // write-polling, calls recv(), gets 0/EOF, and takes its normal "connection
+        // closed" -> "http error 0" -> retry path.
+        time_t now_t = time(NULL);
+        if (ws->last_io == 0) ws->last_io = now_t;
+        if (now_t - ws->last_io >= WG_LIVELOCK_SECS) {
+            static time_t last_break = 0;
+            bool first = (last_break != now_t);
+            last_break = now_t;
+            ws->last_io = now_t; // give the forced retry a fresh interval
             uint32_t rdy[64]; uint32_t rc = 0;
             for (int si = 0; si < 2; si++) { // sockets named in read+write sets
                 if (!set_ptrs[si]) continue;
@@ -471,7 +487,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
                 }
             }
             if (first)
-                WG_LOGW(TAG, "select livelock-breaker: no I/O in 4000 selects, forcing %u sock(s) to EOF/retry", rc);
+                WG_LOGW(TAG, "select livelock-breaker: no socket I/O for %ds, forcing %u sock(s) to EOF/retry", WG_LIVELOCK_SECS, rc);
             if (set_ptrs[0]) { wg_blink_write_mem(blink, set_ptrs[0], &rc, 4);
                 if (rc) wg_blink_write_mem(blink, set_ptrs[0] + 4, rdy, rc * 4); }
             if (set_ptrs[1]) { uint32_t z = 0; wg_blink_write_mem(blink, set_ptrs[1], &z, 4); }
@@ -881,7 +897,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     // These use WSABUF structures. For now, stub them.
     // ── WSASend(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSASend") == 0 || strcmp(fn, "WSASendTo") == 0) {
-        ws->select_spin = 0; // real I/O = progress; reset livelock detector
+        ws->last_io = time(NULL); // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t buf_count = args[2];
@@ -918,7 +934,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
     }
     // ── WSARecv(s, lpBuffers, dwBufferCount, lpBytesOut, flags, ovl, cbrtn) ──
     if (strcmp(fn, "WSARecv") == 0 || strcmp(fn, "WSARecvFrom") == 0) {
-        ws->select_spin = 0; // real I/O = progress; reset livelock detector
+        ws->last_io = time(NULL); // real I/O = progress; reset livelock detector
         int fd = lookup_fd(ws, args[0]);
         if (fd < 0) { ws->last_error = WSAENOTSOCK; *out_ret = WIN_SOCKET_ERROR; return true; }
         uint32_t buf_count = args[2];
