@@ -39,6 +39,21 @@ static bool s_backstop_enabled = false; // iOS device: natural timing works
 static bool s_backstop_enabled = true;  // macOS harness: needs the crutch
 #endif
 
+// Device-only forced give-up. On the iOS device Steam's manifest-download
+// orchestrator HANGS after a full handshake that never queues the GET: it spins
+// its Sleep poll loop forever, never giving up, so Steam never retries and never
+// reaches the TLS resumption that DOES queue the GET (the Mac interpreter gives up
+// fast -> retries -> resumes -> manifest). We force the same give-up: when the
+// orchestrator has spun a long time on that loop with no result, set its documented
+// loop-exit flag [this+0x4C]=1 so it exits via the "no result" handler -> http
+// error 0 -> Steam's outer loop retries. ON for iOS, OFF for the macOS harness
+// (which gives up naturally and must not be perturbed).
+#if TARGET_OS_IPHONE
+static bool s_force_giveup_enabled = true;
+#else
+static bool s_force_giveup_enabled = false;
+#endif
+
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
 static void wg_rmtree(const char *path) {
@@ -4246,6 +4261,28 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // time, log it periodically (read-only) so a genuine deadlock is
                 // visible. Includes the pump disasm so we don't have to scroll up to
                 // the one-shot iter-5 probe in a huge log.
+                // Device forced give-up: if the manifest-download orchestrator's
+                // Sleep poll loop (ret 0x53D58A) has spun a long time with no result
+                // ([this+0x18C]==0) and its exit flag not yet set, force the give-up
+                // so Steam retries (-> resumption -> manifest). iOS only; on macOS
+                // the orchestrator gives up naturally well before this threshold.
+                if (s_force_giveup_enabled && cur_rip == 0x53D58Au &&
+                    s_sleep_loop_cnt >= 1200) {
+                    static uint32_t s_forced_ebx = 0;
+                    uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
+                    if (ebx >= 0x400000u && ebx < 0x80000000u && ebx != s_forced_ebx) {
+                        uint32_t f18c = 0, f4c = 0;
+                        wg_blink_read_mem(engine->blink, ebx + 0x18C, &f18c, 4);
+                        wg_blink_read_mem(engine->blink, ebx + 0x4C, &f4c, 4);
+                        if (f18c == 0 && (f4c & 0xFF) == 0) {
+                            uint8_t one = 1;
+                            wg_blink_write_mem(engine->blink, ebx + 0x4C, &one, 1);
+                            s_forced_ebx = ebx;
+                            WG_LOGW(TAG, "*** FORCE-GIVEUP: orchestrator 0x%X stuck %d spins, set [+0x4C]=1 -> trigger retry",
+                                    ebx, s_sleep_loop_cnt);
+                        }
+                    }
+                }
                 if (s_sleep_loop_cnt > 0 && s_sleep_loop_cnt % 200 == 0) {
                     uint32_t ebx = (uint32_t)wg_blink_get_reg(engine->blink, 3);
                     WG_LOGW(TAG, "Sleep spin watchdog: ret=0x%X spun %d times, EBX(this)=0x%X",
