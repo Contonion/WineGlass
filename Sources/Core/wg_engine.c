@@ -24,6 +24,20 @@
 #include <dirent.h>
 #include <time.h>
 #include <ctype.h>
+#include <TargetConditionals.h>
+
+// The reactor backstop (in the Sleep handler) is a crutch for the SLOW Mac
+// interpreter, whose async handshake-recv timing stalls without it. The iOS device
+// runs blink with JIT and is fast enough that Steam's natural event-driven timing
+// already works there — and the backstop's force-signalling of events only
+// PERTURBS that flow (it regressed device downloads). So: ON for the macOS harness,
+// OFF for the iOS device. Runtime flag (not #if at the use site) so it's easy to
+// flip for A/B testing on either platform.
+#if TARGET_OS_IPHONE
+static bool s_backstop_enabled = false; // iOS device: natural timing works
+#else
+static bool s_backstop_enabled = true;  // macOS harness: needs the crutch
+#endif
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
@@ -4013,7 +4027,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 // forward. Self-limiting: once the socket is drained it stops being
                 // readable, so we stop signalling. Guarded to Steam (image_base
                 // 0x400000) so it can't perturb other apps' I/O.
-                if (s_sleep_loop_cnt > 3 && (s_sleep_loop_cnt & 7) == 0 &&
+                if (s_backstop_enabled &&
+                    s_sleep_loop_cnt > 3 && (s_sleep_loop_cnt & 7) == 0 &&
                     engine->pe_image && engine->pe_image->image_base == 0x400000 &&
                     wg_winsock_any_readable(engine->winsock)) {
                     WGThreadScheduler *sc = engine->scheduler;
