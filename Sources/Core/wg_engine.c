@@ -4005,34 +4005,48 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     s_sleep_loop_cnt = 1;
                 }
                 // Reactor backstop: the orchestrator's Sleep loop is the heartbeat
-                // while it waits for async I/O to finish. If a connected socket has
-                // data ready but the app's I/O worker threads are parked on their
-                // job events (Windows auto-signals those via IOCP/WSAEventSelect;
-                // we have no OS notifier), wake every thread waiting on an event so
-                // one of them does the recv and drives the TLS handshake / download
-                // forward. Self-limiting: once the socket is drained it stops being
-                // readable, so we stop signalling. Guarded to Steam (image_base
-                // 0x400000) so it can't perturb other apps' I/O.
-                if (s_sleep_loop_cnt > 3 && (s_sleep_loop_cnt & 7) == 0 &&
-                    engine->pe_image && engine->pe_image->image_base == 0x400000 &&
-                    wg_winsock_any_readable(engine->winsock)) {
-                    WGThreadScheduler *sc = engine->scheduler;
-                    int woke = 0;
-                    for (int ti = 0; ti < sc->count; ti++) {
-                        WGThread *t = &sc->threads[ti];
-                        if (t->state == WG_THREAD_FREE || t->state == WG_THREAD_EXITED)
-                            continue;
-                        uint32_t wh = t->wait_handle;
-                        if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
-                            s_event_signalled[wh - WG_EVENT_BASE] = true;
-                            wg_sched_wake(sc, wh);
-                            woke++;
+                // while it waits for async I/O to finish. The app's network I/O
+                // worker threads park on job events that Windows would re-signal via
+                // IOCP/WSAEventSelect on socket readiness (inbound) or that another
+                // thread signals when there's data to send (outbound); we have no OS
+                // notifier and the cooperative interleaving is racy, so the reactor
+                // can livelock at any phase (handshake recv, GET compose/send, HTTP
+                // response recv). Fix: on the Sleep heartbeat, wake the I/O workers
+                // so they re-run their pump (recv / SSL_write). The pump is gated on
+                // its own state, so a spurious wake is a cheap no-op; this just keeps
+                // the reactor cycling through every phase regardless of timing.
+                //   - Only wake threads with start_addr 0x53CEE0 (Steam's CRT thread
+                //     wrapper = the I/O workers). NEVER the main thread (start 0):
+                //     force-signalling its events (e.g. 0x20F thread-ready) could
+                //     falsely satisfy a wait and corrupt its flow.
+                //   - Fire faster when a socket is actually readable (inbound data
+                //     waiting), slower otherwise (keep-alive for outbound work).
+                //   - Guarded to Steam (image_base 0x400000).
+                if (s_sleep_loop_cnt > 3 &&
+                    engine->pe_image && engine->pe_image->image_base == 0x400000) {
+                    bool readable = wg_winsock_any_readable(engine->winsock);
+                    bool fire = (readable && (s_sleep_loop_cnt & 7) == 0) ||
+                                (s_sleep_loop_cnt % 24 == 0);
+                    if (fire) {
+                        WGThreadScheduler *sc = engine->scheduler;
+                        int woke = 0;
+                        for (int ti = 0; ti < sc->count; ti++) {
+                            WGThread *t = &sc->threads[ti];
+                            if (t->state == WG_THREAD_FREE || t->state == WG_THREAD_EXITED)
+                                continue;
+                            if (t->start_addr != 0x53CEE0u) continue; // I/O workers only
+                            uint32_t wh = t->wait_handle;
+                            if (wh >= WG_EVENT_BASE && wh < WG_EVENT_BASE + WG_MAX_EVENTS) {
+                                s_event_signalled[wh - WG_EVENT_BASE] = true;
+                                wg_sched_wake(sc, wh);
+                                woke++;
+                            }
                         }
-                    }
-                    if (woke && s_backstop_log < 40) {
-                        s_backstop_log++;
-                        WG_LOGW(TAG, "*** REACTOR-BACKSTOP: socket readable, woke %d event-waiter(s) (spin=%d)",
-                                woke, s_sleep_loop_cnt);
+                        if (woke && s_backstop_log < 40) {
+                            s_backstop_log++;
+                            WG_LOGW(TAG, "*** REACTOR-BACKSTOP: woke %d I/O worker(s) (readable=%d spin=%d)",
+                                    woke, (int)readable, s_sleep_loop_cnt);
+                        }
                     }
                 }
                 if (s_sleep_loop_cnt <= 2) {
