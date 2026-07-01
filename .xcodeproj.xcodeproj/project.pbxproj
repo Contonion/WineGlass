@@ -50,6 +50,7 @@
 		42339EDAF6C08B393CB06629 /* wg_x86_decode.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_decode.c; sourceTree = "<group>"; };
 		63E59713DC947033856A12CF /* WineGlass.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WineGlass.entitlements; sourceTree = "<group>"; };
 		6E7BD0669D0C63DA944073BE /* wg_winsock.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_winsock.c; sourceTree = "<group>"; };
+		748BF95E2FF4B05B00117451 /* WineGlass.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = WineGlass.xcodeproj; sourceTree = SOURCE_ROOT; };
 		7F2AEF7511EB4DBFF0E62487 /* wg_x86_state.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_state.c; sourceTree = "<group>"; };
 		84466C30852AB61143363D30 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
 		9B7C6CA02B6DFA3DC5F82359 /* wg_memory.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_memory.c; sourceTree = "<group>"; };
@@ -112,6 +113,7 @@
 				C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */,
 				CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */,
 				A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */,
+				748BF95E2FF4B05B00117451 /* WineGlass.xcodeproj */,
 				B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */,
 				3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */,
 				A695F4AD386205BBF3906750 /* wg_win32_windows.c */,
@@ -136,6 +138,11 @@
 				ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		748BF95F2FF4B05B00117451 /* Products */ = {
+			isa = PBXGroup;
+			name = Products;
 			sourceTree = "<group>";
 		};
 		7D9CEDDFBF7C251922D7ED48 /* PE */ = {
@@ -244,6 +251,12 @@
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 893C5D89D46BFE3C1AA22A84 /* Products */;
 			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = 748BF95F2FF4B05B00117451 /* Products */;
+					ProjectRef = 748BF95E2FF4B05B00117451 /* WineGlass.xcodeproj */;
+				},
+			);
 			projectRoot = "";
 			targets = (
 				CBA7DB16A594539BDCE7004E /* WineGlass */,

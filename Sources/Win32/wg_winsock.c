@@ -474,7 +474,10 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
             if (rc) wg_blink_write_mem(blink, set_ptrs[si] + 4, ready, rc * 4);
             total += (int)rc;
         }
-        WG_LOGD(TAG, "select -> %d ready", total);
+        // Dedup: only log when the ready-count changes — a spinning select loop
+        // otherwise floods the ring buffer and scrolls off real activity.
+        { static int s_last_total = -1;
+          if (total != s_last_total) { WG_LOGD(TAG, "select -> %d ready", total); s_last_total = total; } }
         *out_ret = (uint32_t)total;
         return true;
     }

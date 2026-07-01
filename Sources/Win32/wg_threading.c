@@ -132,9 +132,15 @@ bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink) {
             t->state = WG_THREAD_RUNNING;
             restore_regs(&t->regs, blink);
             // Only log real context switches, not self-reswitches in a spin loop.
-            if (prev != idx)
-                WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
-                        idx, t->id, t->regs.rip);
+            // Rate-limit: a steady-state ping-pong between two threads otherwise
+            // floods the device ring buffer (170k+ lines) and scrolls off the real
+            // activity. Log the first switches, then 1/256.
+            if (prev != idx) {
+                static uint32_t sw = 0;
+                if (sw++ < 64 || (sw & 0xFF) == 0)
+                    WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
+                            idx, t->id, t->regs.rip);
+            }
             return true;
         }
     }

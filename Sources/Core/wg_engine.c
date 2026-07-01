@@ -4897,7 +4897,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
 
             if (!ws_handled) {
                 uint64_t ws_ret = 0;
-                WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
+                // Don't log the per-iteration polling calls (select / __WSAFDIsSet):
+                // during a wait they fire hundreds of thousands of times and flood
+                // the device log's ring buffer, scrolling off the actual download
+                // activity we need to see. Log everything else.
+                if (strcmp(ws_fn, "select") != 0 && strcmp(ws_fn, "__WSAFDIsSet") != 0)
+                    WG_LOGI(TAG, "WS2_32 dispatch: %s -> %s", fn, ws_fn);
                 // Trace the connection object at connect() so we can correlate it
                 // with the NULL connection at the later send(0,0,0). The owning
                 // CTCPConnection 'this' is usually held in a callee-saved reg
