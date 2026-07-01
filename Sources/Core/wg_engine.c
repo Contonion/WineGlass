@@ -25,6 +25,8 @@ __attribute__((weak)) int wg_native_download(const char *url, const char *dest_p
 #include "wg_winhttp.h"
 #include "wg_schannel.h"
 #include "wg_threading.h"
+#include "wg_sync.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -73,6 +75,54 @@ static bool s_real_timeouts   = false;  // macOS harness: legacy no-timeout path
                                         // firing finite timeouts here reshuffles Steam's
                                         // timing and breaks the manifest download
 #endif
+
+// ── Real-threads mode (docs/threads_rearchitect.md) ─────────────────────────
+// When TRUE, each guest CreateThread/_beginthreadex becomes a REAL pthread with
+// its own blink Machine over the shared System, and the Win32 sync handlers
+// (WaitForSingleObject/Sleep/events/mutexes/critical sections) use the real
+// pthread-backed wg_sync objects instead of the cooperative wg_sched_yield.
+// Default OFF so the shipping cooperative path is untouched until this is proven
+// on the Mac harness, then the device (needs iOS blink.a rebuilt w/o
+// DISABLE_THREADS). Set via wg_engine_set_real_threads() or the WG_REAL_THREADS
+// env var (macOS harness).
+static bool s_use_real_threads = false;
+
+// Global "big lock" serialising Win32 thunk dispatch across guest threads. Guest
+// CODE (blink execution) runs concurrently; only handle_blink_thunk (which
+// touches the many shared s_* statics + file/socket/heap tables) is serialised.
+// Recursive so a handler can re-enter safely. A blocking handler (WFSO/Sleep)
+// RELEASES this around the actual block (see wg_thunk_block_*) so other threads'
+// SetEvent thunks can run. Only used when s_use_real_threads.
+static pthread_mutex_t s_thunk_lock;
+static bool            s_thunk_lock_inited = false;
+
+static void wg_thunk_lock_init(void) {
+    if (s_thunk_lock_inited) return;
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s_thunk_lock, &a);
+    pthread_mutexattr_destroy(&a);
+    s_thunk_lock_inited = true;
+}
+static inline void wg_thunk_lock(void)   { if (s_use_real_threads) pthread_mutex_lock(&s_thunk_lock); }
+static inline void wg_thunk_unlock(void) { if (s_use_real_threads) pthread_mutex_unlock(&s_thunk_lock); }
+// Release the thunk lock around a blocking wait, then re-acquire. Returns the
+// recursion count released so it can be restored (recursive mutex).
+static inline void wg_thunk_block_begin(void) { if (s_use_real_threads) pthread_mutex_unlock(&s_thunk_lock); }
+static inline void wg_thunk_block_end(void)   { if (s_use_real_threads) pthread_mutex_lock(&s_thunk_lock); }
+
+// The calling pthread's guest thread id (real-threads mode). Main engine thread
+// keeps 1; each worker sets its own in wg_worker_thread_entry. Used by
+// GetCurrentThreadId and as the caller_tid for wg_sync mutex ownership.
+static _Thread_local uint32_t s_cur_guest_tid = 1;
+
+// Spawn a real pthread for a guest CreateThread/_beginthreadex (real-threads
+// mode). Defined after wg_alloc_thread_teb; forward-declared for the CreateThread
+// handler inside handle_blink_thunk.
+static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
+                                     uint32_t param, uint32_t flags,
+                                     uint32_t *out_tid);
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
@@ -3767,30 +3817,40 @@ static bool handle_blink_thunk(WGEngine *engine) {
             //              flags=args[4], lpThreadId=args[5]).
             uint32_t start = args[2], param = args[3], flags = args[4];
             uint32_t tid = 0;
-            uint32_t hthread = wg_sched_create_thread(
-                engine->scheduler, engine->blink,
-                start, param, flags, &tid);
+            uint32_t hthread = 0;
+            bool ct_real = false;
+            if (s_use_real_threads) {
+                hthread = wg_spawn_real_thread(engine, start, param, flags, &tid);
+                if (hthread) ct_real = true;   // real pthread spawned; skip cooperative
+            }
+            if (!ct_real) {
+                hthread = wg_sched_create_thread(
+                    engine->scheduler, engine->blink,
+                    start, param, flags, &tid);
+            }
             if (args[5] && tid) {
                 wg_blink_write_mem(engine->blink, args[5], &tid, 4);
             }
-            if (hthread) {
-                // Give the new thread its own TEB (stack bounds, ClientId, TLS).
-                WGThread *nt = wg_sched_find(engine->scheduler, hthread);
-                if (nt) {
-                    uint32_t teb = wg_alloc_thread_teb(engine,
-                        nt->stack_base + nt->stack_size, nt->stack_base, tid);
-                    if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
-                }
-            } else {
-                // Fallback: run synchronously (for NSIS compatibility)
-                hthread = 0x7100;
-                uint64_t clean_rsp = rsp + ptr_size + (6 * ptr_size);
-                if (start && is_32bit && !(flags & 0x4u)) {
-                    wg_call_wndproc_ovr(engine, start, param, 0, 0, 0,
-                                        (uint32_t)ret_addr, (uint32_t)clean_rsp,
-                                        true, hthread);
-                    WG_LOGI(TAG, "CreateThread: fallback sync start=0x%X", start);
-                    return true;
+            if (!ct_real) {
+                if (hthread) {
+                    // Give the new thread its own TEB (stack bounds, ClientId, TLS).
+                    WGThread *nt = wg_sched_find(engine->scheduler, hthread);
+                    if (nt) {
+                        uint32_t teb = wg_alloc_thread_teb(engine,
+                            nt->stack_base + nt->stack_size, nt->stack_base, tid);
+                        if (teb) { nt->teb = teb; nt->regs.fs_base = teb; }
+                    }
+                } else {
+                    // Fallback: run synchronously (for NSIS compatibility)
+                    hthread = 0x7100;
+                    uint64_t clean_rsp = rsp + ptr_size + (6 * ptr_size);
+                    if (start && is_32bit && !(flags & 0x4u)) {
+                        wg_call_wndproc_ovr(engine, start, param, 0, 0, 0,
+                                            (uint32_t)ret_addr, (uint32_t)clean_rsp,
+                                            true, hthread);
+                        WG_LOGI(TAG, "CreateThread: fallback sync start=0x%X", start);
+                        return true;
+                    }
                 }
             }
             ret_val = hthread;
@@ -5674,8 +5734,126 @@ static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
     return teb;
 }
 
+// ── Real-threads worker (docs/threads_rearchitect.md P2c) ────────────────────
+// Each guest thread is a real pthread driving its OWN blink Machine over the
+// shared System. Guest code runs concurrently (blink's System locks cover shared
+// memory); Win32 thunks serialise on s_thunk_lock so the many shared s_* statics
+// + file/socket/heap tables stay safe.
+
+typedef struct {
+    WGEngine *engine;
+    void    *machine;    // from wg_blink_new_thread_machine
+    uint32_t start;      // guest entry point
+    uint32_t param;      // thread argument
+    uint32_t stack_top;  // high end of the guest stack
+    uint32_t teb;        // guest TEB
+    uint32_t thread_h;   // wg_sync THREAD handle (for join/WFSO)
+    uint32_t tid;        // guest thread id
+} WGWorkerArgs;
+
+static void *wg_worker_thread_entry(void *arg) {
+    WGWorkerArgs wa = *(WGWorkerArgs *)arg;
+    free(arg);
+    WGEngine *engine = wa.engine;
+
+    s_cur_guest_tid = wa.tid;
+    wg_blink_adopt_machine(wa.machine);   // g_machine = this pthread's Machine
+
+    // Seed the stdcall entry frame: [esp]=return addr 0 (a plain `ret` from the
+    // thread proc lands at rip 0 = our exit sentinel), [esp+4]=arg.
+    uint32_t sp = (wa.stack_top - 0x100) & ~0xFu;
+    uint32_t zero = 0;
+    wg_blink_write_mem(engine->blink, sp,     &zero,     4);
+    wg_blink_write_mem(engine->blink, sp + 4, &wa.param, 4);
+    wg_blink_set_reg(engine->blink, 4, sp);       // ESP
+    wg_blink_set_reg(engine->blink, 5, sp);       // EBP
+    wg_blink_set_fs_base(engine->blink, wa.teb);
+    wg_blink_set_rip(engine->blink, wa.start);
+
+    WG_LOGI(TAG, "[realthr] worker tid=0x%X start=0x%X esp=0x%X teb=0x%X running",
+            wa.tid, wa.start, sp, wa.teb);
+
+    uint32_t exit_code = 0;
+    for (;;) {
+        WGBlinkResult r = wg_blink_run(engine->blink, engine->instructions_per_tick);
+        uint32_t rip = (uint32_t)wg_blink_get_rip(engine->blink);
+        if (rip == 0) {   // thread proc returned -> exit
+            exit_code = (uint32_t)wg_blink_get_reg(engine->blink, 0); // EAX
+            break;
+        }
+        if (r == WG_BLINK_ERROR) {
+            wg_thunk_lock();
+            bool handled = handle_blink_thunk(engine);
+            wg_thunk_unlock();
+            if (!handled) {
+                WG_LOGE(TAG, "[realthr] worker tid=0x%X fault at rip=0x%X — exiting",
+                        wa.tid, (uint32_t)wg_blink_get_rip(engine->blink));
+                exit_code = (uint32_t)-1;
+                break;
+            }
+        }
+        if (engine->state == WG_ENGINE_STOPPED) break;
+    }
+
+    WG_LOGI(TAG, "[realthr] worker tid=0x%X exited code=%u", wa.tid, exit_code);
+    wg_sync_thread_exit(wa.thread_h, exit_code);
+    wg_blink_free_thread_machine(wa.machine);
+    return NULL;
+}
+
+static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
+                                     uint32_t param, uint32_t flags,
+                                     uint32_t *out_tid) {
+    (void)flags; // CREATE_SUSPENDED not yet honoured for real threads
+    if (!engine->pe_image || engine->pe_image->is_64bit) return 0;
+
+    // Allocate + map a 1MB guest stack from the shared thread-stack region
+    // (same bump allocator the cooperative scheduler uses, so no collision).
+    uint32_t stack_base = engine->scheduler->next_stack_addr;
+    engine->scheduler->next_stack_addr += WG_THREAD_STACK + 0x1000;
+    uint8_t *zstack = calloc(1, WG_THREAD_STACK);
+    if (zstack) { wg_blink_load_code(engine->blink, stack_base, zstack, WG_THREAD_STACK, 0); free(zstack); }
+    uint32_t stack_top = stack_base + WG_THREAD_STACK;
+
+    uint32_t tid = engine->scheduler->next_id++;
+    uint32_t teb = wg_alloc_thread_teb(engine, stack_top, stack_base, tid);
+
+    void *machine = wg_blink_new_thread_machine(engine->blink);
+    if (!machine) return 0;
+
+    uint32_t thread_h = wg_sync_create_thread_obj(tid);
+
+    WGWorkerArgs *wa = calloc(1, sizeof(*wa));
+    if (!wa) { wg_blink_free_thread_machine(machine); return 0; }
+    wa->engine = engine; wa->machine = machine; wa->start = start;
+    wa->param = param; wa->stack_top = stack_top; wa->teb = teb;
+    wa->thread_h = thread_h; wa->tid = tid;
+
+    pthread_t pt;
+    if (pthread_create(&pt, NULL, wg_worker_thread_entry, wa) != 0) {
+        free(wa); wg_blink_free_thread_machine(machine);
+        return 0;
+    }
+    pthread_detach(pt);
+
+    WG_LOGI(TAG, "[realthr] spawned tid=0x%X handle=0x%X start=0x%X", tid, thread_h, start);
+    if (out_tid) *out_tid = tid;
+    return thread_h;
+}
+
 static bool load_pe_blink(WGEngine *engine) {
     WGPEImage *pe = engine->pe_image;
+
+    // Real-threads mode (docs/threads_rearchitect.md): opt-in via env on the
+    // harness. Initialise the pthread-backed sync subsystem + the global thunk
+    // lock, and mark the main guest thread's id.
+    if (getenv("WG_REAL_THREADS")) s_use_real_threads = true;
+    if (s_use_real_threads) {
+        wg_thunk_lock_init();
+        wg_sync_init();
+        s_cur_guest_tid = 1;
+        WG_LOGW(TAG, "[realthr] REAL-THREADS mode ENABLED");
+    }
 
     if (!ensure_blink_vm(engine, pe->is_64bit)) {
         return false;
@@ -6168,7 +6346,7 @@ void wg_engine_tick(WGEngine *engine) {
             case WG_BLINK_OK:
                 break;
             case WG_BLINK_HALT: {
-                if (handle_blink_thunk(engine)) break;
+                { wg_thunk_lock(); bool _htk = handle_blink_thunk(engine); wg_thunk_unlock(); if (_htk) break; }
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
                 if (s_watch_armed && halt_rip == s_watch_addr) {
                     // ssl_cipher_list_to_bytes, before the cipher loop: esi=s,
@@ -6625,7 +6803,7 @@ void wg_engine_tick(WGEngine *engine) {
                 WG_LOGD(TAG, "Syscall intercepted (blink)");
                 break;
             case WG_BLINK_ERROR:
-                if (handle_blink_thunk(engine)) break;
+                { wg_thunk_lock(); bool _htk = handle_blink_thunk(engine); wg_thunk_unlock(); if (_htk) break; }
                 WG_LOGE(TAG, "Crash at RIP=0x%llx",
                         (unsigned long long)wg_blink_get_rip(engine->blink));
                 engine->state = WG_ENGINE_STOPPED;
