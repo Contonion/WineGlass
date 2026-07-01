@@ -148,8 +148,18 @@ bool wg_blink_load_code(WGBlinkInstance *inst, uint64_t addr,
         return false;
     }
 
-    WG_LOGI(TAG, "Loaded %u bytes at 0x%llx, entry 0x%llx",
-            size, (unsigned long long)addr, (unsigned long long)entry_rip);
+    // Real/large loads always log; single-page (4096B) on-demand commits are
+    // faulted in by the thousands during large allocations and would flood the
+    // device ring buffer (scrolling off the actual activity), so rate-limit them.
+    if (size != 4096) {
+        WG_LOGI(TAG, "Loaded %u bytes at 0x%llx, entry 0x%llx",
+                size, (unsigned long long)addr, (unsigned long long)entry_rip);
+    } else {
+        static uint32_t pc = 0;
+        if ((pc++ & 0x3FF) == 0)
+            WG_LOGI(TAG, "Loaded 4096 bytes at 0x%llx (page commit #%u)",
+                    (unsigned long long)addr, pc);
+    }
     return true;
 }
 
