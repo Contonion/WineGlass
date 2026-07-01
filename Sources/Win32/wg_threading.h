@@ -35,6 +35,7 @@ typedef struct {
     uint32_t      wait_handle;   // handle being waited on (0 = not waiting)
     uint32_t      wait_timeout;  // timeout in ms (INFINITE = 0xFFFFFFFF)
     uint64_t      wait_start_ms; // wall-clock ms when this wait began (for real timeouts)
+    uint32_t      wait_cv_gen;   // condition-variable generation captured when the sleep began
     WGThreadRegs  regs;          // saved register state
 } WGThread;
 

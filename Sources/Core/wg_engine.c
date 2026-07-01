@@ -343,6 +343,25 @@ static void wg_event_consume(uint32_t h) {
     }
 }
 
+// Condition variables (SleepConditionVariableCS / WakeConditionVariable /
+// WakeAllConditionVariable). Steam's thread pool coordinates work hand-off
+// through CVs: idle workers Sleep on the CV, and queuing work Wakes them. The
+// old stubs made Sleep return TRUE immediately (never blocking) and Wake a
+// no-op, so on the device the pool never parks/dispatches and the queued
+// manifest-send worker is never run. We model each CV by its guest address and
+// a monotonically increasing "generation": Wake bumps the generation (and marks
+// waiters runnable), a sleeper captures the generation when it parks and knows
+// it was woken once the generation moves. Keyed by guest CV pointer.
+#define WG_MAX_CVS 64
+static struct { uint32_t ptr; uint32_t gen; } s_cvs[WG_MAX_CVS];
+static uint32_t *cv_slot(uint32_t ptr) {
+    for (int i = 0; i < WG_MAX_CVS; i++)
+        if (s_cvs[i].ptr == ptr) return &s_cvs[i].gen;
+    for (int i = 0; i < WG_MAX_CVS; i++)
+        if (s_cvs[i].ptr == 0) { s_cvs[i].ptr = ptr; s_cvs[i].gen = 0; return &s_cvs[i].gen; }
+    return NULL;
+}
+
 // Fake IOCP (I/O Completion Ports).
 // Steam uses async sockets: bind socket to IOCP, call WSARecv/ConnectEx with
 // an OVERLAPPED, then GetQueuedCompletionStatus waits for the completion.
@@ -3762,6 +3781,70 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 bool sw = wg_sched_yield(engine->scheduler, engine->blink, blk);
                 if (sw) return true;
                 ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258;
+            }
+        } else if (strcmp(fn, "InitializeConditionVariable") == 0) {
+            uint32_t *g = cv_slot(args[0]);
+            if (g) *g = 0;
+            ret_val = 0;
+        } else if (strcmp(fn, "WakeConditionVariable") == 0 ||
+                   strcmp(fn, "WakeAllConditionVariable") == 0) {
+            // Signal the CV: advance its generation (so parked sleepers see the
+            // change) and mark any WAITING waiters runnable.
+            uint32_t cv = args[0];
+            uint32_t *g = cv_slot(cv);
+            if (g) (*g)++;
+            wg_sched_wake(engine->scheduler, cv);
+            ret_val = 0;
+        } else if (strcmp(fn, "SleepConditionVariableCS") == 0 ||
+                   strcmp(fn, "SleepConditionVariableSRW") == 0) {
+            // SleepConditionVariableCS(cv, cs, dwMs[, flags]). The old stub returned
+            // TRUE immediately (never blocking), so Steam's thread-pool workers never
+            // parked and queued work (the manifest send) was never dispatched. Real
+            // behavior: release the lock (we have no real locks, so nothing to do),
+            // block until the CV is woken or the timeout elapses, re-acquire. We
+            // busy-park (yield, stay runnable) and detect a wake via the CV
+            // generation. Always report TRUE — a spurious wakeup is always legal for
+            // a CV, so we never surface a timeout as an error; Steam re-checks its
+            // work-queue predicate after every return. Device-gated: the macOS
+            // harness keeps the legacy immediate-return stub (its timing already
+            // gets Steam through and real CV blocking reshuffles it).
+            uint32_t cv = args[0];
+            uint32_t ms = args[2];
+            if (!s_real_timeouts) {
+                ret_val = 1; // macOS harness: legacy stub
+            } else {
+                WGThread *cur = wg_sched_current(engine->scheduler);
+                uint32_t *g = cv_slot(cv);
+                if (cur && cur->wait_handle == cv) {
+                    // Continuation of a park on this CV.
+                    bool woken = (g && *g != cur->wait_cv_gen);
+                    bool timed_out = false;
+                    if (!woken && ms != 0xFFFFFFFFu) {
+                        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                        uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+                        if (now - cur->wait_start_ms >= (uint64_t)ms) timed_out = true;
+                    }
+                    if (woken || timed_out) {
+                        cur->wait_handle = 0;
+                        ret_val = 1; // woken (or timed out — report as spurious wake)
+                    } else {
+                        bool sw = wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
+                        if (sw) return true;
+                        ret_val = 1; // alone: report a spurious wake so we never hard-hang
+                    }
+                } else {
+                    // First entry: begin a park on this CV.
+                    if (cur) {
+                        cur->wait_handle = cv;
+                        cur->wait_cv_gen = g ? *g : 0;
+                        cur->wait_timeout = ms;
+                        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                        cur->wait_start_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+                    }
+                    bool sw = wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
+                    if (sw) return true;
+                    ret_val = 1;
+                }
             }
         } else if (strcmp(fn, "ResumeThread") == 0) {
             uint32_t h = args[0];
