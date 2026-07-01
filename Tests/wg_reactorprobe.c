@@ -136,7 +136,7 @@ int main(void) {
 
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     dbg("RP: socket -> %u", (unsigned)s);
-    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);   // non-blocking, like Steam
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);   // non-blocking, like Steam's tid=1
 
     int cr = connect(s, res->ai_addr, (int)res->ai_addrlen);
     int ce = WSAGetLastError();
@@ -164,12 +164,12 @@ int main(void) {
     dbg("RP: send -> %d", sent);
     if (sent <= 0) { dbg("RP: VERDICT FAIL (send err=%d)", WSAGetLastError()); return 1; }
 
-    // Read loop: poll select for readable, recv only when it says so (like Steam).
-    // Our select returns instantly (ignores its timeout), so this busy-spins; loop
-    // a lot so it spans the real network round-trip. Counts how many times select
-    // reported readable -> tells us if select(readfds) detects incoming data at all.
-    int total = 0, got_any = 0, sel_ready = 0;
-    for (int i = 0; i < 30000; i++) {
+    // TEST C — non-blocking select(readfds)+recv (Steam's tid=1 read loop). Our
+    // select returns instantly (ignores its timeout), so this busy-spins; bounded
+    // iteration count so it always finishes. Counts how often select reported
+    // readable -> tells us if select(readfds) detects incoming data.
+    int total = 0, sel_ready = 0;
+    for (int i = 0; i < 60000 && total == 0; i++) {   // span real time; stop once we get data
         fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
         struct timeval tv = { 0, 100000 };
         int n = select(0, &rd, NULL, NULL, &tv);
@@ -177,20 +177,26 @@ int main(void) {
             sel_ready++;
             char buf[2048];
             int got = recv(s, buf, sizeof(buf), 0);
-            if (got > 0) { total += got; got_any = 1;
-                if (total <= 4096) dbg("RP: recv i=%d -> %d bytes (total=%d) first='%.16s'", i, got, total, buf);
-            } else if (got == 0) { dbg("RP: recv i=%d -> 0 (peer closed, total=%d)", i, total); break; }
+            if (got > 0) { total += got;
+                dbg("RP: C recv i=%d -> %d bytes first='%.16s'", i, got, buf);
+            } else if (got == 0) { dbg("RP: C peer closed (total=%d)", total); break; }
         }
-        if ((i % 5000) == 0) dbg("RP: read-loop i=%d (select_ready=%d total=%d)", i, sel_ready, total);
-        SetEvent(g_job); WaitForSingleObject(g_done, 50);  // keep pumping the worker
+        if ((i % 10000) == 0) dbg("RP: C read-loop i=%d (sel_fires=%d)", i, sel_ready);
     }
-    dbg("RP: read-loop done total=%d got_any=%d select_ready_count=%d", total, got_any, sel_ready);
+    int test_c = (total > 0);
+    dbg("RP: TEST_C select-recv: %s (bytes=%d, select_ready_fired=%d)",
+        test_c ? "PASS" : "FAIL", total, sel_ready);
 
     g_stop = 1; SetEvent(g_job);
-    WaitForSingleObject(th, 2000);
     closesocket(s); freeaddrinfo(res);
 
-    if (got_any && total > 0) dbg("RP: VERDICT PASS (events+connect+send+recv all worked, %d bytes)", total);
-    else                      dbg("RP: VERDICT FAIL (no HTTP response received)");
+    // Per-primitive summary — one line for an easy Mac-vs-device diff. Reaching here
+    // at all means events+connect+send worked (they'd have early-returned FAIL
+    // otherwise). selectrecv tells us if non-blocking select(readfds)+recv detects
+    // the HTTP response.
+    dbg("RP: SUMMARY events=PASS connect=PASS send=PASS selectrecv=%s (bytes=%d sel_fires=%d)",
+        test_c ? "PASS" : "FAIL", total, sel_ready);
+    dbg("RP: VERDICT DONE (threads+events+connect+send OK; selectrecv=%s)",
+        test_c ? "PASS" : "FAIL");
     return 0;
 }

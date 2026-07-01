@@ -35,8 +35,17 @@
 // flip for A/B testing on either platform.
 #if TARGET_OS_IPHONE
 static bool s_backstop_enabled = false; // iOS device: natural timing works
+static bool s_real_timeouts   = true;   // iOS device: fire finite waits on a real
+                                        // wall-clock deadline (no backstop crutch here,
+                                        // so a wait whose signaller has exited — or a
+                                        // wait on a never-signalling pseudo-handle —
+                                        // must time out or the reactor freezes)
 #else
 static bool s_backstop_enabled = true;  // macOS harness: needs the crutch
+static bool s_real_timeouts   = false;  // macOS harness: legacy no-timeout path + the
+                                        // backstop is what actually gets Steam through;
+                                        // firing finite timeouts here reshuffles Steam's
+                                        // timing and breaks the manifest download
 #endif
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
@@ -3521,30 +3530,47 @@ static bool handle_blink_thunk(WGEngine *engine) {
                         h, timeout, (int)signalled, (wt != NULL));
                 s_wfso_last_h = h; s_wfso_last_sig = (int)signalled;
             }
+            WGThread *cur = wg_sched_current(engine->scheduler);
             if (signalled) {
                 wg_event_consume(h); // auto-reset events clear after a satisfied wait
+                if (s_real_timeouts && cur) cur->wait_handle = 0; // reset timeout tracking
                 ret_val = 0; // WAIT_OBJECT_0
             } else if (timeout == 0) {
                 ret_val = 258; // WAIT_TIMEOUT
             } else {
-                // Finite timeout → cooperative POLL (yield READY, re-check next
-                // turn) since we have no real timer to fire timeouts; INFINITE →
-                // truly block (WAITING) until signalled. This lets timed waiters
-                // (e.g. the network worker's 250ms job wait) keep making progress
-                // instead of blocking forever, and avoids falsely reporting
-                // "signalled" when we're the only runnable thread.
-                WGThreadState blk = (timeout == 0xFFFFFFFFu)
-                                    ? WG_THREAD_WAITING : WG_THREAD_READY;
-                WGThread *cur = wg_sched_current(engine->scheduler);
-                if (cur) {
-                    cur->wait_handle = h;
-                    cur->wait_timeout = timeout;
+                // Finite timeout → cooperative POLL with a REAL wall-clock deadline
+                // (we have no timer interrupt, so we track when the wait began and
+                // fire WAIT_TIMEOUT once that many ms have actually elapsed). INFINITE
+                // → truly block (WAITING) until signalled. Real timeouts matter: a
+                // finite wait on an event whose signaller has exited (or a wait on a
+                // pseudo-handle like the process, which never signals) must eventually
+                // return instead of yielding forever — that freeze is what stalled the
+                // reactor test and Steam's post-resumption flow.
+                bool timed_out = false;
+                if (s_real_timeouts && timeout != 0xFFFFFFFFu && cur) {
+                    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                    uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+                    if (cur->wait_handle != h || cur->wait_timeout != timeout)
+                        cur->wait_start_ms = now;            // a new wait began
+                    else if (now - cur->wait_start_ms >= (uint64_t)timeout)
+                        timed_out = true;                    // deadline reached
                 }
-                bool switched = wg_sched_yield(engine->scheduler, engine->blink, blk);
-                if (switched) {
-                    return true; // switched to another thread
+                if (timed_out) {
+                    cur->wait_handle = 0;
+                    ret_val = 258; // WAIT_TIMEOUT
+                } else {
+                    WGThreadState blk = (timeout == 0xFFFFFFFFu)
+                                        ? WG_THREAD_WAITING : WG_THREAD_READY;
+                    if (cur) {
+                        cur->wait_handle = h;
+                        cur->wait_timeout = timeout;
+                    }
+                    bool switched = wg_sched_yield(engine->scheduler, engine->blink, blk);
+                    if (switched) {
+                        return true; // switched to another thread
+                    }
+                    ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258; // alone: INFINITE→OBJ_0, else TIMEOUT
                 }
-                ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258; // alone: INFINITE→OBJ_0, else TIMEOUT
             }
         } else if (strcmp(fn, "WaitForMultipleObjects") == 0 ||
                    strcmp(fn, "WaitForMultipleObjectsEx") == 0 ||
