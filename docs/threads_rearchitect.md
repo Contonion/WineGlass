@@ -26,18 +26,38 @@ Fix: stop emulating threads. Map each guest `CreateThread`/`_beginthreadex` to a
       `~/Developer/blink/config.h.ios`, rebuild `blink_macos.a`. Verified: harness
       compiles, single-Machine cooperative path still works (Steam loads, manifest
       downloads, no crash). *iOS: blink.a must be rebuilt the same way (see below).*
-- [ ] **P2 — Machine-per-thread bridge.** `wg_blink_impl.c`: keep System + main
-      Machine; add `WGBlinkVM_SpawnThread(entry, arg, stack)` → `NewMachine(s, main)`
-      + real pthread that sets `g_machine`, seeds regs/rip/stack/TEB, runs the blink
-      loop, and calls back into `handle_blink_thunk` on HLT. Per-Machine reg/mem
-      accessors (operate on the calling thread's Machine, not `vm->m`).
+- [x] **P2a — g_machine routing (bridge).** DONE (0db5914). All per-thread
+      accessors route through `cur_m()` = `g_machine` (fallback `vm->m`); seed
+      `g_machine=vm->m` at create. No-op single-threaded (manifest 3/3, no
+      regression). The halt/abort longjmp mechanism is already `_Thread_local`.
+- [x] **P2b — per-thread Machine primitives (bridge).** DONE (2c1bc05).
+      `wg_blink_new_thread_machine` (NewMachine over shared System + restore decode
+      mode), `wg_blink_adopt_machine` (set g_machine + m->thread on the worker),
+      `wg_blink_free_thread_machine`. Additive, compiles, no caller yet.
+- [ ] **P2c — engine worker-pthread entry + wiring (INTERLOCKED with P4).**
+      A `wg_worker_thread_entry` in wg_engine.c: adopt Machine, seed
+      regs/esp/param/retaddr=0/fs_base, run its own `wg_blink_run` loop, call
+      `handle_blink_thunk` on HLT, on rip==0 exit → signal joiners + free Machine.
+      Wire CreateThread/_beginthreadex to spawn it. **Gate behind `s_use_real_threads`
+      (default OFF)** so the cooperative path stays default until proven.
+      *Cannot run standalone:* `handle_blink_thunk`'s `wg_sched_yield` calls
+      (WFSO/Sleep/select/CV) assume cooperative scheduling — with real threads they
+      must block the real pthread. So P2c ships together with P4.
 - [ ] **P3 — Thread-safe Win32 layer.** `handle_blink_thunk` + all shared tables
       (files, sockets `wg_winsock`, handle tables, GlobalAlloc/guest heap bump
       allocator, event/CV tables) get locks. Guest heap allocator especially
       (currently a lockless bump pointer).
-- [ ] **P4 — Real synchronization.** Back Win32 events/CVs/WFSO/CriticalSection
-      with real pthread mutex+cond. `WaitForSingleObject` blocks the real thread on
-      a real cond; `SetEvent` signals it. This is where the deadlocks vanish.
+- [ ] **P4 — Real synchronization (ships with P2c).** New `wg_sync` module: a
+      handle-keyed table of pthread-backed Win32 objects — EVENT (mutex+cond+manual/
+      signalled), MUTEX (recursive owner+count), SEMAPHORE (count+cond), THREAD
+      (exited+exitcode+cond for join). Real ops: WFSO/WFMO = lock+cond_wait (or
+      cond_timedwait for finite timeout); SetEvent = set+broadcast(manual)/
+      signal(auto); Sleep = real usleep; EnterCriticalSection = recursive pthread
+      mutex; CVs = real pthread_cond. In `s_use_real_threads` mode the WFSO/Sleep/
+      select/CV thunk handlers call these instead of `wg_sched_yield`. Plus a global
+      thunk mutex around `handle_blink_thunk` so the (large) shared Win32 state +
+      wg_engine `s_*` statics stay safe while guest CODE runs concurrently (blink's
+      own System locks cover shared memory).
 - [ ] **P5 — Retire `wg_threading.c`** (cooperative scheduler) and the
       device-gated crutches: `s_backstop_enabled`, `s_real_timeouts`, the
       select-timeout, the CV emulation, the Sleep-spin watchdog.
