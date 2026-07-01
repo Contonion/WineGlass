@@ -991,6 +991,13 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     // Skip Steam's control/bookkeeping files (not CDN downloads).
     if (strstr(name, ".writable") || strstr(name, ".installed") ||
         strstr(name, ".manifest") || strstr(name, "metrics")) return false;
+    // Guard: if WGNativeDownload.m isn't in the build, the weak symbol is NULL —
+    // calling it would jump to 0x0 (hard crash). Fall back to the reactor instead.
+    if (!wg_native_download) {
+        WG_LOGW(TAG, "Native package fetch unavailable (wg_native_download not linked "
+                "— run 'xcodegen generate'); leaving to reactor: %s", name);
+        return false;
+    }
     char url[600];
     snprintf(url, sizeof(url), "https://cdn.steamstatic.com/client/%s", name);
     WG_LOGW(TAG, "Native package fetch START: %s", name);

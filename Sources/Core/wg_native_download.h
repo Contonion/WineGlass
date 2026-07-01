@@ -12,6 +12,12 @@
 // BLOCKS the calling thread until the download finishes. Only call it from the
 // engine thread (never the UI main thread — iOS would watchdog-kill a long block
 // there). Implemented in WGNativeDownload.m (Foundation/NSURLSession).
-int wg_native_download(const char *url, const char *dest_path);
+//
+// Declared weak so that if WGNativeDownload.m ever isn't compiled into the build
+// (e.g. `xcodegen generate` wasn't run after adding it), the symbol resolves to
+// NULL instead of the link failing — callers MUST null-check `wg_native_download`
+// before calling so a missing build artifact degrades to the fallback path
+// rather than jumping to 0x0 (-undefined dynamic_lookup makes that a hard crash).
+int wg_native_download(const char *url, const char *dest_path) __attribute__((weak));
 
 #endif
