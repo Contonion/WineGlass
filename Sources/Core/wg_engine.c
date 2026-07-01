@@ -2109,6 +2109,30 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGI(TAG, "PostThreadMessageW(tid=0x%X, msg=0x%X, wp=0x%X, lp=0x%X)",
                     args[0], args[1], args[2], args[3]);
             ret_val = 1;
+        } else if ((strcmp(fn, "GetMessageW") == 0 || strcmp(fn, "GetMessageA") == 0)
+                   && s_use_real_threads) {
+            // Real-threads: the main thread is a real pthread (driven by
+            // wg_engine_tick) that runs continuously — NO cooperative yield / PAUSE
+            // (those operate on the cooperative scheduler, which doesn't manage the
+            // real worker pthreads, and would freeze the main thread). Deliver a
+            // queued thread message, else WM_TIMER so the wndproc pumps its network
+            // frame, return 1, and briefly sleep (releasing the thunk lock) so the
+            // pump doesn't spin at 100% while workers run concurrently.
+            uint32_t gm_msg = 0, gm_wp = 0, gm_lp = 0, gm_hwnd = 0;
+            bool had_msg = tmsg_pop(s_cur_guest_tid, &gm_msg, &gm_wp, &gm_lp);
+            if (!had_msg && s_timer_active) {
+                gm_hwnd = s_timer_hwnd; gm_msg = 0x0113; gm_wp = s_timer_id; gm_lp = 0;
+            }
+            if (args[0]) {
+                uint32_t msgbuf[7] = { gm_hwnd, gm_msg, gm_wp, gm_lp, 0, 0, 0 };
+                wg_blink_write_mem(engine->blink, args[0], msgbuf, 28);
+            }
+            uint64_t gm_rsp = rsp + ptr_size + (4 * ptr_size);
+            wg_blink_set_reg(engine->blink, 4, gm_rsp);
+            wg_blink_set_rip(engine->blink, ret_addr);
+            wg_blink_set_reg(engine->blink, 0, 1); // EAX = 1
+            if (!had_msg) { wg_thunk_block_begin(); usleep(1000); wg_thunk_block_end(); }
+            return true;
         } else if (strcmp(fn, "GetMessageW") == 0 || strcmp(fn, "GetMessageA") == 0) {
             // Real cooperative message pump. The old behavior froze the engine
             // (PAUSED) on the first call, so the main thread's message loop body —
@@ -5971,12 +5995,16 @@ static void *wg_worker_thread_entry(void *arg) {
             exit_code = (uint32_t)wg_blink_get_reg(engine->blink, 0); // EAX
             break;
         }
-        if (r == WG_BLINK_ERROR) {
+        // A HLT thunk (HALT) OR a fault (ERROR) both dispatch through
+        // handle_blink_thunk — same as the main tick. (Bug fixed: the worker
+        // used to handle only ERROR, so every Win32 call from a worker spun
+        // forever on its HLT at 0xC000xx.)
+        if (r == WG_BLINK_HALT || r == WG_BLINK_ERROR) {
             wg_thunk_lock();
             bool handled = handle_blink_thunk(engine);
             wg_thunk_unlock();
             if (!handled) {
-                WG_LOGE(TAG, "[realthr] worker tid=0x%X fault at rip=0x%X — exiting",
+                WG_LOGE(TAG, "[realthr] worker tid=0x%X unhandled halt/fault at rip=0x%X — exiting",
                         wa.tid, (uint32_t)wg_blink_get_rip(engine->blink));
                 exit_code = (uint32_t)-1;
                 break;
@@ -6399,8 +6427,16 @@ bool wg_engine_run(WGEngine *engine) {
     // OpenSSL handshake error code (lib/reason). Steam drains its error queue
     // through this fn before a level-filtered spew, so it's the only reliable
     // way to learn WHY SSL_do_handshake fails. Guarded to steam's image base.
+    static bool s_tls_setup_done = false;
     if (engine->blink && engine->pe_image &&
-        engine->pe_image->image_base == 0x400000 && !s_errstr_armed) {
+        engine->pe_image->image_base == 0x400000 && !s_tls_setup_done) {
+      // The armed HLT diagnostic traps (below) are handled only by the main tick,
+      // not by worker pthreads — a worker hitting one (e.g. 0x6BB882) would take an
+      // unhandled halt. They're cooperative-era diagnostics + the cipher max_ver
+      // force (now redundant with the max_proto_version cap + config-string
+      // rewrite). So skip them in real-threads mode; the functional config patch
+      // (cipher/curve/cert/manifest, further below) still runs.
+      if (!s_use_real_threads) {
         if (wg_blink_read_mem(engine->blink, s_errstr_bp, &s_errstr_orig, 1)) {
             uint8_t hlt = 0xF4;
             wg_blink_write_mem(engine->blink, s_errstr_bp, &hlt, 1);
@@ -6473,6 +6509,7 @@ bool wg_engine_run(WGEngine *engine) {
             s_sslw_armed = true;
             WG_LOGI(TAG, "Armed send traps: write@0x%X gate@0x%X", s_sslw_addr, s_sndchk_addr);
         }
+      } // end if(!s_use_real_threads) — trap arming
         // Pragmatic TLS fix: blink miscomputes OpenSSL's multi-token cipher/curve
         // list construction, so Steam's ClientHello offers only static-RSA + P-521
         // and the CDN rejects it. Overwrite the two config strings (.rdata) with
@@ -6503,6 +6540,7 @@ bool wg_engine_run(WGEngine *engine) {
             wg_blink_write_mem(engine->blink, 0x4611E0, verify_ok, sizeof(verify_ok));
             WG_LOGI(TAG, "Patched TLS strings + cert + manifest verify");
         }
+        s_tls_setup_done = true;
     }
     return true;
 }
