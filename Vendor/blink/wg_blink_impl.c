@@ -30,6 +30,18 @@ struct WGBlinkVM {
     int last_stop;   // last siglongjmp code from onhalt (kMachine* / -1 halt)
 };
 
+// Real-threads rearchitecture: each guest thread runs its OWN blink Machine on
+// its own pthread, all sharing one System (guest memory). blink already keeps
+// the current Machine in the thread-local g_machine. So every per-thread
+// accessor routes through the CALLING thread's Machine via cur_m(): the main
+// engine thread has g_machine == vm->m (identical to the old behavior), and a
+// worker pthread has g_machine == its own Machine. Falls back to vm->m if a
+// caller runs before g_machine is seeded (setup on the main thread).
+static inline struct Machine *cur_m(struct WGBlinkVM *vm) {
+    if (g_machine) return g_machine;
+    return vm ? vm->m : (struct Machine *)0;
+}
+
 static int s_blink_initialized = 0;
 
 static void ensure_initialized(void) {
@@ -61,6 +73,7 @@ static struct WGBlinkVM *create_vm_with_mode(struct XedMachineMode mode) {
 
     vm->m = NewMachine(vm->s, NULL);
     if (!vm->m) { FreeSystem(vm->s); free(vm); return NULL; }
+    g_machine = vm->m;   // seed the creating (main engine) thread's current Machine
 
     if (mode.omode == XED_MODE_LONG) {
         // 64-bit: paging required, set up page tables
@@ -167,10 +180,10 @@ int WGBlinkVM_SetupStack(struct WGBlinkVM *vm, unsigned long long entry_rip) {
 // TEB and GS for the 64-bit TEB; the MSVC CRT reads fs:[0x18]/[0x2C]/[0x30]
 // during startup, so without a real base + TEB it faults immediately.
 void WGBlinkVM_SetFsBase(struct WGBlinkVM *vm, unsigned long long base) {
-    if (vm) vm->m->fs.base = base;
+    if (vm) cur_m(vm)->fs.base = base;
 }
 void WGBlinkVM_SetGsBase(struct WGBlinkVM *vm, unsigned long long base) {
-    if (vm) vm->m->gs.base = base;
+    if (vm) cur_m(vm)->gs.base = base;
 }
 
 
@@ -179,78 +192,80 @@ extern void wg_blink_set_onhalt(sigjmp_buf *buf);
 
 int WGBlinkVM_Step(struct WGBlinkVM *vm) {
     if (!vm) return -1;
+    struct Machine *m = cur_m(vm);
 
-    vm->m->canhalt = true;
+    m->canhalt = true;
 
-    int rc = sigsetjmp(vm->m->onhalt, 0);
-    wg_blink_set_onhalt(&vm->m->onhalt);
+    int rc = sigsetjmp(m->onhalt, 0);
+    wg_blink_set_onhalt(&m->onhalt);
 
     if (rc) {
         vm->last_stop = rc;
-        vm->m->canhalt = false;
+        m->canhalt = false;
         wg_blink_set_onhalt(NULL);
         return 1; // any signal/halt = stop
     }
 
-    LoadInstruction(vm->m, GetPc(vm->m));
-    ExecuteInstruction(vm->m);
+    LoadInstruction(m, GetPc(m));
+    ExecuteInstruction(m);
 
     vm->last_stop = 0;
-    vm->m->canhalt = false;
+    m->canhalt = false;
     wg_blink_set_onhalt(NULL);
 
-    if (vm->m->ip == 0) return 1;
+    if (m->ip == 0) return 1;
     return 0;
 }
 
 int WGBlinkVM_Run(struct WGBlinkVM *vm, int max_insns) {
     if (!vm) return -1;
+    struct Machine *m = cur_m(vm);
 
-    vm->m->canhalt = true;
+    m->canhalt = true;
 
-    int rc = sigsetjmp(vm->m->onhalt, 0);
-    wg_blink_set_onhalt(&vm->m->onhalt);
+    int rc = sigsetjmp(m->onhalt, 0);
+    wg_blink_set_onhalt(&m->onhalt);
 
     if (rc) {
         vm->last_stop = rc;
-        vm->m->canhalt = false;
+        m->canhalt = false;
         wg_blink_set_onhalt(NULL);
         return 1; // halt/signal
     }
 
     for (int i = 0; i < max_insns; i++) {
-        if (vm->m->ip == 0) {
+        if (m->ip == 0) {
             vm->last_stop = 0;
-            vm->m->canhalt = false;
+            m->canhalt = false;
             wg_blink_set_onhalt(NULL);
             return 1;
         }
-        LoadInstruction(vm->m, GetPc(vm->m));
-        ExecuteInstruction(vm->m);
+        LoadInstruction(m, GetPc(m));
+        ExecuteInstruction(m);
     }
 
     vm->last_stop = 0;
-    vm->m->canhalt = false;
+    m->canhalt = false;
     wg_blink_set_onhalt(NULL);
     return 0;
 }
 
 unsigned long long WGBlinkVM_GetReg(struct WGBlinkVM *vm, int idx) {
     if (!vm || idx < 0 || idx >= 16) return 0;
-    return Get64(vm->m->weg[idx]);
+    return Get64(cur_m(vm)->weg[idx]);
 }
 
 void WGBlinkVM_SetReg(struct WGBlinkVM *vm, int idx, unsigned long long val) {
     if (!vm || idx < 0 || idx >= 16) return;
-    Put64(vm->m->weg[idx], val);
+    Put64(cur_m(vm)->weg[idx], val);
 }
 
 unsigned long long WGBlinkVM_GetRIP(struct WGBlinkVM *vm) {
-    return vm ? vm->m->ip : 0;
+    return vm ? cur_m(vm)->ip : 0;
 }
 
 void WGBlinkVM_SetRIP(struct WGBlinkVM *vm, unsigned long long rip) {
-    if (vm) vm->m->ip = rip;
+    if (vm) cur_m(vm)->ip = rip;
 }
 
 // Last stop reason: 0 = ran/clean, -1 = halt, kMachineSegmentationFault (-4),
@@ -262,19 +277,19 @@ int WGBlinkVM_GetStopReason(struct WGBlinkVM *vm) {
 
 // Faulting guest virtual address recorded on the last memory fault.
 unsigned long long WGBlinkVM_GetFaultAddr(struct WGBlinkVM *vm) {
-    return vm ? (unsigned long long)vm->m->faultaddr : 0;
+    return vm ? (unsigned long long)cur_m(vm)->faultaddr : 0;
 }
 
 int WGBlinkVM_WriteMem(struct WGBlinkVM *vm, unsigned long long addr,
                         const void *buf, unsigned int len) {
     if (!vm) return 0;
-    CopyToUser(vm->m, addr, (void *)buf, len);
+    CopyToUser(cur_m(vm), addr, (void *)buf, len);
     return 1;
 }
 
 int WGBlinkVM_ReadMem(struct WGBlinkVM *vm, unsigned long long addr,
                        void *buf, unsigned int len) {
     if (!vm) return 0;
-    CopyFromUser(vm->m, buf, addr, len);
+    CopyFromUser(cur_m(vm), buf, addr, len);
     return 1;
 }
