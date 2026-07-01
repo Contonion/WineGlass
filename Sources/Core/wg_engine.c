@@ -1537,6 +1537,10 @@ static int      s_errput_count = 0;
 static uint32_t s_watch_addr = 0x6BB882; // ssl_cipher_list_to_bytes, just before the cipher loop (esi=s)
 static uint8_t  s_watch_orig = 0;
 static bool     s_watch_armed = false;
+// One-shot guard for the TLS config-patch block, RESET per PE load (see the reset
+// in wg_engine_run) so SteamSetup.exe running first doesn't consume it before the
+// real Steam.exe. File-scope so the per-PE reset can clear it.
+static bool     s_tls_setup_done = false;
 static int      s_watch_count = 0;
 // Per-cipher loop trap: 0x6BB8B7 is `test eax,eax` right after ssl_cipher_disabled
 // returns (eax=disabled?1:0, ebx=cipher c). Logs which ciphers are dropped.
@@ -6401,6 +6405,7 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_watch_count = s_cloop_count = s_fac_count = s_errput_count = 0;
     s_pe_count = s_hs_count = s_disp_count = s_snd_count = 0;
     s_sslw_count = s_sndchk_count = 0;
+    s_tls_setup_done = false;   // re-patch the TLS strings/cert/manifest for each new PE
     s_tmsg_head = 0; s_tmsg_tail = 0;
     s_comp_head = 0; s_comp_tail = 0;
     s_iocp_binding_count = 0;
@@ -6498,7 +6503,8 @@ bool wg_engine_run(WGEngine *engine) {
     // OpenSSL handshake error code (lib/reason). Steam drains its error queue
     // through this fn before a level-filtered spew, so it's the only reliable
     // way to learn WHY SSL_do_handshake fails. Guarded to steam's image base.
-    static bool s_tls_setup_done = false;
+    // (s_tls_setup_done is file-scope + reset per PE load, so SteamSetup.exe
+    // running first no longer consumes the patch before the real Steam.exe.)
     // Only the real Steam.exe (~4MB, image_base 0x400000). The size gate is
     // essential: the iOS self-test runs tiny 32-bit PEs (also image_base
     // 0x400000) BEFORE Steam, and without it one of them would trip the
