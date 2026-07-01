@@ -1115,7 +1115,11 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     char url[600];
     snprintf(url, sizeof(url), "https://cdn.steamstatic.com/client/%s", name);
     WG_LOGW(TAG, "Native package fetch START: %s (expect %ld bytes)", name, expected);
+    // Release the global thunk lock during the (long, blocking) download so other
+    // guest threads' Win32 calls aren't frozen for the duration (real-threads).
+    wg_thunk_block_begin();
     bool ok = wg_native_download(url, hostpath) != 0;
+    wg_thunk_block_end();
     if (ok && expected >= 0 && stat(hostpath, &pst) == 0 && pst.st_size != expected) {
         WG_LOGW(TAG, "Native package fetch SIZE MISMATCH (%lld != %ld): %s",
                 (long long)pst.st_size, expected, name);
@@ -1139,8 +1143,10 @@ static bool wg_try_native_manifest_fetch(const char *hostpath) {
     struct stat st;
     if (stat(hostpath, &st) == 0 && st.st_size > 0) return true; // already fetched
     WG_LOGW(TAG, "Native manifest fetch START -> %s", base);
+    wg_thunk_block_begin();   // don't freeze other guest threads during the download
     bool ok = wg_native_download("https://cdn.steamstatic.com/client/steam_client_win32",
                                  hostpath) != 0;
+    wg_thunk_block_end();
     if (ok && stat(hostpath, &st) == 0 && st.st_size == 0) ok = false;
     WG_LOGW(TAG, "Native manifest fetch %s (%lld bytes)", ok ? "OK" : "FAILED",
             (stat(hostpath, &st) == 0) ? (long long)st.st_size : -1);
