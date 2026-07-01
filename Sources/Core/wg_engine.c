@@ -44,12 +44,22 @@ __attribute__((weak)) int wg_native_download(const char *url, const char *dest_p
 // OFF for the iOS device. Runtime flag (not #if at the use site) so it's easy to
 // flip for A/B testing on either platform.
 #if TARGET_OS_IPHONE
-static bool s_backstop_enabled = false; // iOS device: natural timing works
+static bool s_backstop_enabled = true;  // iOS device: RE-ENABLED. It drives the
+                                        // reactor forward so the MANIFEST download's
+                                        // queued GET actually gets flushed (without
+                                        // it, [conn+0x134]=0 -> send-pump skips ->
+                                        // manifest stalls -> "fails early" loop). It
+                                        // was disabled long ago for device regressions
+                                        // that predate the heap/timeout/CV/native-fetch
+                                        // fixes; packages are native-fetched now so the
+                                        // backstop only needs to carry the manifest.
+                                        // Verified on the Mac device-sim (real timeouts
+                                        // + backstop): manifest 3/3 vs 0/3 without it.
 static bool s_real_timeouts   = true;   // iOS device: fire finite waits on a real
-                                        // wall-clock deadline (no backstop crutch here,
-                                        // so a wait whose signaller has exited — or a
-                                        // wait on a never-signalling pseudo-handle —
-                                        // must time out or the reactor freezes)
+                                        // wall-clock deadline (a wait whose signaller
+                                        // has exited — or on a never-signalling
+                                        // pseudo-handle — must time out or the reactor
+                                        // freezes)
 #else
 static bool s_backstop_enabled = true;  // macOS harness: needs the crutch
 static bool s_real_timeouts   = false;  // macOS harness: legacy no-timeout path + the
