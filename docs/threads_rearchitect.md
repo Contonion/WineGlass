@@ -70,7 +70,33 @@ blink must be rebuilt **without** `DISABLE_THREADS`:
   force a rebuild after editing `config.h.ios`).
 - iOS: rebuild `Vendor/blink/lib/blink.a` from the same `config.h.ios`.
 
-## ⚠ BLOCKER (found during P2c bring-up): blink threading model vs our manual stepping
+## ✅ P2c/P4 UPDATE (bring-up milestone): real threads RUN
+The blink-threading blocker below is **RESOLVED** by option (A): keep blink built
+with `DISABLE_THREADS` (fast, no lock deadlock, no init hang) and track the
+current thread's Machine in the bridge's OWN real TLS via `__thread wg_tls_m`
+(blink's macro only rewrites `_Thread_local`, not `__thread`; blink's interpreter
+hot path uses the passed `m`, not `g_machine` — verified memory.c has 0 reads).
+Commit 6328f9a. Now: a real worker pthread spawns + runs its own Machine, the
+MAIN thread is NOT clobbered (no crash, no fault), and the cooperative shipping
+path is unregressed (202k lines, 5 handshakes).
+
+**Remaining P2c work (next):**
+1. **Pool worker exits early.** Steam's pool worker `0x53CEE0` (does SEH setup,
+   reads its param struct, calls IAT `*0x6e2174`/`*0x6e2350`, then returns
+   code=0) — Steam's tier0 then logs threadtools.cpp:3972 "Probably deadlock or
+   failure". Debug why the pool loop returns immediately: does an IAT call return
+   an exit-condition value? Is a shared struct field (its work-queue/CV) not in
+   the expected state? Likely needs the real CV handlers (SleepConditionVariableCS
+   / Wake*ConditionVariable) wired to wg_sync too (not yet done for real-threads).
+2. **Wire condition variables** for real-threads (SleepConditionVariableCS,
+   WakeConditionVariable, WakeAllConditionVariable) → wg_sync (CV = event-like).
+   Steam's thread pool is CV-driven; without real CVs the pool can't coordinate.
+3. **tid logging**: handle_blink_thunk's "[tid=%X] Win32:" uses
+   wg_sched_current_tid (cooperative); in real-threads mode use s_cur_guest_tid.
+4. Worker abort-recovery + first-run warm-up parity with the main VM (defensive).
+5. Then: manifest/packages end-to-end with real threads; measure reliability.
+
+## ⚠ (RESOLVED — see above) BLOCKER (found during P2c bring-up): blink threading model vs our manual stepping
 P2c/P4 are fully coded + gated behind `s_use_real_threads` (default OFF). First
 real-threads run got a real worker pthread spawned + running, then crashed — and
 bring-up exposed a blink-internals wall. Three blink configs, none clean:
