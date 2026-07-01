@@ -80,21 +80,24 @@ Commit 6328f9a. Now: a real worker pthread spawns + runs its own Machine, the
 MAIN thread is NOT clobbered (no crash, no fault), and the cooperative shipping
 path is unregressed (202k lines, 5 handshakes).
 
-**Remaining P2c work (next):**
-1. **Pool worker exits early.** Steam's pool worker `0x53CEE0` (does SEH setup,
-   reads its param struct, calls IAT `*0x6e2174`/`*0x6e2350`, then returns
-   code=0) — Steam's tier0 then logs threadtools.cpp:3972 "Probably deadlock or
-   failure". Debug why the pool loop returns immediately: does an IAT call return
-   an exit-condition value? Is a shared struct field (its work-queue/CV) not in
-   the expected state? Likely needs the real CV handlers (SleepConditionVariableCS
-   / Wake*ConditionVariable) wired to wg_sync too (not yet done for real-threads).
-2. **Wire condition variables** for real-threads (SleepConditionVariableCS,
-   WakeConditionVariable, WakeAllConditionVariable) → wg_sync (CV = event-like).
-   Steam's thread pool is CV-driven; without real CVs the pool can't coordinate.
-3. **tid logging**: handle_blink_thunk's "[tid=%X] Win32:" uses
-   wg_sched_current_tid (cooperative); in real-threads mode use s_cur_guest_tid.
-4. Worker abort-recovery + first-run warm-up parity with the main VM (defensive).
-5. Then: manifest/packages end-to-end with real threads; measure reliability.
+**Done since:** CVs + SRW locks wired to wg_sync (4a31ffb); tid logging fixed;
+wg_sync CV type added. Corrected earlier misread: the pool worker does NOT exit
+early — "exited code=0" was just the time-limit shutdown breaking its loop.
+
+**Current stall (real target):** Steam's startup coordination cycle under real
+threads. Sequence: main reaches set_cipher_list, spawns pool worker 0x53CEE0
+(handle 0x90028), then CloseHandles it (normal) and sits in the GetMessageW pump
+cycling WM_TIMER (0x113); the worker blocks waiting for work. tier0 logs
+threadtools.cpp:3972 "Probably deadlock or failure". Neither advances to
+"Downloading manifest". Hypothesis: a main<->worker cycle that the cooperative
+scheduler happened to break by interleaving, but real preemptive threads
+genuinely deadlock — main waits for a message the worker should post; worker
+waits for work main should queue. NEXT: trace what 0x53CEE0 blocks on (its
+WFSO/CV handle) and who is supposed to signal it; check the thread-message queue
+(PostThreadMessageW/GetMessageW) delivery between real threads; check GetMessageW
+real-threads behaviour (should block on a real event, not cooperative-yield).
+**Remaining P2c also:** worker abort-recovery + first-run warm-up parity
+(defensive); then manifest/packages end-to-end + reliability measurement.
 
 ## ⚠ (RESOLVED — see above) BLOCKER (found during P2c bring-up): blink threading model vs our manual stepping
 P2c/P4 are fully coded + gated behind `s_use_real_threads` (default OFF). First
