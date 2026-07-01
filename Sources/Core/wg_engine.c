@@ -124,6 +124,26 @@ static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
                                      uint32_t param, uint32_t flags,
                                      uint32_t *out_tid);
 
+// Critical-section support for real threads: map each guest CRITICAL_SECTION
+// pointer to a recursive wg_sync mutex (lazily created). Steam wraps its heap
+// allocator + many structures in critical sections, so real mutual exclusion is
+// required once guest threads run concurrently. Accessed only from thunk
+// handlers (under s_thunk_lock), so the map itself needs no extra lock.
+#define WG_MAX_CS 1024
+static struct { uint32_t cs_ptr; uint32_t mtx; } s_cs_map[WG_MAX_CS];
+static int s_cs_count = 0;
+static uint32_t wg_cs_mutex_for(uint32_t cs_ptr) {
+    for (int i = 0; i < s_cs_count; i++) if (s_cs_map[i].cs_ptr == cs_ptr) return s_cs_map[i].mtx;
+    if (s_cs_count < WG_MAX_CS) {
+        uint32_t m = wg_sync_create_mutex(false, 0);
+        s_cs_map[s_cs_count].cs_ptr = cs_ptr;
+        s_cs_map[s_cs_count].mtx = m;
+        s_cs_count++;
+        return m;
+    }
+    return 0;
+}
+
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
 static void wg_rmtree(const char *path) {
@@ -3537,9 +3557,38 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = dst;
+        } else if (s_use_real_threads &&
+                   (strcmp(fn, "EnterCriticalSection") == 0 ||
+                    strcmp(fn, "TryEnterCriticalSection") == 0)) {
+            uint32_t m = wg_cs_mutex_for(args[0]);
+            if (strcmp(fn, "TryEnterCriticalSection") == 0) {
+                uint32_t r = m ? wg_sync_wait_single(m, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
+                ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
+            } else {
+                if (m) {
+                    wg_thunk_block_begin();
+                    wg_sync_wait_single(m, WG_SYNC_INFINITE, s_cur_guest_tid);
+                    wg_thunk_block_end();
+                }
+                ret_val = 1;
+            }
+        } else if (s_use_real_threads && strcmp(fn, "LeaveCriticalSection") == 0) {
+            uint32_t m = wg_cs_mutex_for(args[0]);
+            if (m) wg_sync_release_mutex(m, s_cur_guest_tid);
+            ret_val = 1;
+        } else if (s_use_real_threads &&
+                   (strcmp(fn, "InitializeCriticalSection") == 0 ||
+                    strcmp(fn, "InitializeCriticalSectionAndSpinCount") == 0 ||
+                    strcmp(fn, "InitializeCriticalSectionEx") == 0)) {
+            ret_val = 1;   // wg_sync mutex is lazily created on first Enter
+        } else if (s_use_real_threads && strcmp(fn, "DeleteCriticalSection") == 0) {
+            ret_val = 1;
         } else if (strcmp(fn, "CreateEventA") == 0 ||
                    strcmp(fn, "CreateEventW") == 0) {
             // CreateEvent(lpSecurityAttributes, bManualReset, bInitialState, lpName)
+            if (s_use_real_threads) {
+                ret_val = wg_sync_create_event(args[1] != 0, args[2] != 0);
+            } else {
             uint32_t handle = 0;
             if (s_event_next < WG_MAX_EVENTS) {
                 uint32_t idx = s_event_next++;
@@ -3550,18 +3599,25 @@ static bool handle_blink_thunk(WGEngine *engine) {
             WG_LOGI(TAG, "CreateEvent(manualReset=%u, initState=%u) -> h=0x%X",
                     args[1], args[2], handle);
             ret_val = handle;
+            }
         } else if (strcmp(fn, "SetEvent") == 0) {
             uint32_t h = args[0];
+            if (s_use_real_threads) { ret_val = wg_sync_set_event(h) ? 1 : 0; }
+            else {
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = true;
             WG_LOGI(TAG, "SetEvent(h=0x%X)", h);
             wg_sched_wake(engine->scheduler, h);
             ret_val = 1;
+            }
         } else if (strcmp(fn, "ResetEvent") == 0) {
             uint32_t h = args[0];
+            if (s_use_real_threads) { ret_val = wg_sync_reset_event(h) ? 1 : 0; }
+            else {
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = false;
             ret_val = 1;
+            }
         } else if (strcmp(fn, "CreateIoCompletionPort") == 0) {
             // CreateIoCompletionPort(FileHandle, ExistingPort, CompletionKey, NumberOfConcurrentThreads)
             // FileHandle == INVALID_HANDLE_VALUE (-1 / 0xFFFFFFFF): create new IOCP
@@ -3679,6 +3735,26 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = 0; // void return
+        } else if (strcmp(fn, "WaitForSingleObject") == 0 && s_use_real_threads) {
+            // Real-threads: block THIS pthread on the wg_sync object. Release the
+            // thunk lock around the block so other threads' SetEvent thunks run.
+            uint32_t h = args[0], timeout = args[1];
+            if (wg_sync_is_known(h)) {
+                wg_thunk_block_begin();
+                uint32_t wr = wg_sync_wait_single(h, timeout, s_cur_guest_tid);
+                wg_thunk_block_end();
+                ret_val = wr;   // WAIT_OBJECT_0(0) / WAIT_TIMEOUT(0x102) / WAIT_FAILED
+            } else {
+                // Unknown handle (e.g. the process pseudo-handle 0xFFFFFFFF, which
+                // never signals). Don't hang: finite timeout -> sleep+TIMEOUT,
+                // INFINITE -> WAIT_OBJECT_0 to avoid a permanent block.
+                if (timeout == 0xFFFFFFFFu) { ret_val = 0; }
+                else {
+                    uint32_t ms = timeout > 50 ? 50 : timeout;
+                    wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                    ret_val = 258;
+                }
+            }
         } else if (strcmp(fn, "WaitForSingleObject") == 0) {
             uint32_t h = args[0];
             uint32_t timeout = args[1];
@@ -3747,6 +3823,30 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258; // alone: INFINITE→OBJ_0, else TIMEOUT
                 }
             }
+        } else if ((strcmp(fn, "WaitForMultipleObjects") == 0 ||
+                    strcmp(fn, "WaitForMultipleObjectsEx") == 0) && s_use_real_threads) {
+            // Real-threads WFMO over wg_sync objects.
+            uint32_t ncount = args[0], hptr = args[1];
+            bool wait_all = (args[2] != 0);
+            uint32_t timeout = args[3];
+            if (ncount > 64) ncount = 64;
+            uint32_t handles[64] = {0};
+            if (hptr && ncount) wg_blink_read_mem(engine->blink, hptr, handles, ncount * 4);
+            // Only wait if all handles are wg_sync objects; otherwise fall back to
+            // a short timeout so an unknown handle can't hang the thread.
+            bool all_known = ncount > 0;
+            for (uint32_t i = 0; i < ncount; i++) if (!wg_sync_is_known(handles[i])) { all_known = false; break; }
+            if (all_known) {
+                wg_thunk_block_begin();
+                uint32_t wr = wg_sync_wait_multiple(handles, (int)ncount, wait_all, timeout, s_cur_guest_tid);
+                wg_thunk_block_end();
+                ret_val = wr;
+            } else {
+                uint32_t ms = timeout > 50 ? 50 : timeout;
+                if (timeout == 0xFFFFFFFFu) ms = 50;
+                wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                ret_val = 258;
+            }
         } else if (strcmp(fn, "WaitForMultipleObjects") == 0 ||
                    strcmp(fn, "WaitForMultipleObjectsEx") == 0 ||
                    strcmp(fn, "MsgWaitForMultipleObjects") == 0 ||
@@ -3801,9 +3901,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
         } else if (strcmp(fn, "CreateMutexW") == 0 ||
                    strcmp(fn, "CreateMutexA") == 0) {
+            // CreateMutex(secAttr, bInitialOwner, lpName)
+            if (s_use_real_threads) {
+                ret_val = wg_sync_create_mutex(args[1] != 0, s_cur_guest_tid);
+            } else {
             // Return a unique fake handle. Steam uses mutexes for single-instance.
             if (s_event_next < WG_MAX_EVENTS) {
                 ret_val = WG_EVENT_BASE + s_event_next++;
+            }
             }
             s_last_error = 0; // not ERROR_ALREADY_EXISTS
         } else if (strcmp(fn, "OpenMutexW") == 0 ||
@@ -3811,7 +3916,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 0; // mutex not found
             s_last_error = 2; // ERROR_FILE_NOT_FOUND
         } else if (strcmp(fn, "ReleaseMutex") == 0) {
-            ret_val = 1;
+            if (s_use_real_threads) ret_val = wg_sync_release_mutex(args[0], s_cur_guest_tid) ? 1 : 0;
+            else ret_val = 1;
         } else if (strcmp(fn, "CreateThread") == 0) {
             // CreateThread(secAttr, stackSize, start=args[2], param=args[3],
             //              flags=args[4], lpThreadId=args[5]).
@@ -3922,6 +4028,18 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             } else {
                 ret_val = 0;
+            }
+        } else if (strcmp(fn, "WaitForSingleObjectEx") == 0 && s_use_real_threads) {
+            uint32_t h = args[0], timeout = args[1];
+            if (wg_sync_is_known(h)) {
+                wg_thunk_block_begin();
+                ret_val = wg_sync_wait_single(h, timeout, s_cur_guest_tid);
+                wg_thunk_block_end();
+            } else if (timeout == 0xFFFFFFFFu) { ret_val = 0; }
+            else {
+                uint32_t ms = timeout > 50 ? 50 : timeout;
+                wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                ret_val = 258;
             }
         } else if (strcmp(fn, "WaitForSingleObjectEx") == 0) {
             // WaitForSingleObjectEx(hObject, dwMilliseconds, bAlertable) — treat same as WaitForSingleObject
@@ -4278,8 +4396,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 0;
         } else if (strcmp(fn, "GetCurrentThreadId") == 0) {
+            if (s_use_real_threads) { ret_val = s_cur_guest_tid; }
+            else {
             ret_val = wg_sched_current_tid(engine->scheduler);
             if (!ret_val) ret_val = 1;
+            }
+        } else if ((strcmp(fn, "Sleep") == 0 || strcmp(fn, "SleepEx") == 0) && s_use_real_threads) {
+            // Real-threads: a real sleep on this pthread (release the thunk lock).
+            uint32_t ms = args[0];
+            if (ms == 0xFFFFFFFFu) ms = 100;   // INFINITE sleep -> cap so we stay responsive
+            if (ms > 0) { wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end(); }
+            ret_val = 0;
         } else if (strcmp(fn, "Sleep") == 0 || strcmp(fn, "SleepEx") == 0) {
             if (args[0] > 0) {
                 // On first few calls, dump guest call stack so we know what's looping.
@@ -4572,6 +4699,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 return true; // no other threads; state already cleaned
             }
             ret_val = 0;
+        } else if (strcmp(fn, "ExitThread") == 0 && s_use_real_threads) {
+            // Real-threads: setting rip=0 makes THIS pthread's blink loop return;
+            // wg_worker_thread_entry then does wg_sync_thread_exit + frees the
+            // Machine. (The main thread never calls ExitThread.)
+            WG_LOGI(TAG, "[realthr] ExitThread(%u) tid=0x%X", args[0], s_cur_guest_tid);
+            wg_blink_set_reg(engine->blink, 0, args[0]); // EAX = exit code
+            wg_blink_set_rip(engine->blink, 0);
+            return true;
         } else if (strcmp(fn, "ExitThread") == 0) {
             WG_LOGI(TAG, "ExitThread(%u)", args[0]);
             wg_dump_threads(engine, "ExitThread");
@@ -4595,6 +4730,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "CloseHandle") == 0) {
+            if (s_use_real_threads && wg_sync_is_known(args[0])) wg_sync_close(args[0]);
             wg_files_close(args[0]);
             ret_val = 1;
         } else if (strcmp(fn, "GlobalUnlock") == 0 || strcmp(fn, "FindClose") == 0) {

@@ -17,6 +17,12 @@ CC="clang -arch arm64 -isysroot $SDK -O1 -g -Wno-everything"
 
 # 1. blink.a for macOS arm64 (only if missing — slow). Uses blink's current
 #    config.h (copy config.h.ios over it first if you changed flags).
+# Always sync config.h from config.h.ios so flag changes (e.g. DISABLE_THREADS)
+# actually take effect; rebuild the lib if the config changed.
+if [ ! -f "$BLINK/config.h" ] || ! cmp -s "$BLINK/config.h.ios" "$BLINK/config.h"; then
+  cp "$BLINK/config.h.ios" "$BLINK/config.h"
+  rm -f "$BUILD/blink_macos.a"   # config changed -> force blink rebuild
+fi
 if [ ! -f "$BUILD/blink_macos.a" ]; then
   echo "building blink_macos.a ..."
   ( cd "$BLINK"
