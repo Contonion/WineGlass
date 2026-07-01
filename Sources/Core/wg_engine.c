@@ -6066,6 +6066,14 @@ static bool load_pe_blink(WGEngine *engine) {
     // harness. Initialise the pthread-backed sync subsystem + the global thunk
     // lock, and mark the main guest thread's id.
     if (getenv("WG_REAL_THREADS")) s_use_real_threads = true;
+    if (s_use_real_threads && !wg_sync_init) {
+        // wg_sync.c didn't get linked (stale Xcode project — the app's
+        // -undefined dynamic_lookup masks the missing symbols as NULL). Don't
+        // crash: stay on the cooperative path and tell the user how to fix it.
+        WG_LOGE(TAG, "[realthr] wg_sync NOT LINKED — disabling real-threads. "
+                "Run 'xcodegen generate', reopen Xcode, Clean Build Folder, rebuild.");
+        s_use_real_threads = false;
+    }
     if (s_use_real_threads) {
         wg_thunk_lock_init();
         wg_sync_init();

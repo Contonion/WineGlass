@@ -24,7 +24,12 @@
 #define WG_WAIT_TIMEOUT    0x00000102u
 #define WG_WAIT_FAILED     0xFFFFFFFFu
 
-void wg_sync_init(void);
+// Declared weak so the engine can detect (via &wg_sync_init) whether wg_sync.c
+// actually got linked. With the app's -undefined dynamic_lookup, a missing
+// wg_sync.c would otherwise resolve all wg_sync_* symbols to NULL and crash the
+// first call (0x0). If it's not linked, the engine disables real-threads and
+// stays on the cooperative path instead of crashing.
+void wg_sync_init(void) __attribute__((weak));
 
 // Creation — return a nonzero Win32-style handle, or 0 on failure. Handles are
 // allocated from a distinct range (won't collide with file/socket/thread handles).
