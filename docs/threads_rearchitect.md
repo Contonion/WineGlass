@@ -80,7 +80,24 @@ Commit 6328f9a. Now: a real worker pthread spawns + runs its own Machine, the
 MAIN thread is NOT clobbered (no crash, no fault), and the cooperative shipping
 path is unregressed (202k lines, 5 handshakes).
 
-**Done since:** CVs + SRW locks wired to wg_sync (4a31ffb); tid logging fixed;
+**MILESTONE (76f0607): real threads run Steam's reactor to the manifest download.**
+Three fixes cleared the startup coordination stall:
+1. **Worker thunk dispatch** — the worker loop only handled WG_BLINK_ERROR, but a
+   HLT thunk returns WG_BLINK_HALT, so every Win32 call from a worker spun forever
+   on its HLT at 0xC000xx. Now handles BOTH (like the main tick). THE core fix.
+2. **GetMessageW real-threads branch** — main is a real pthread (driven by
+   wg_engine_tick); don't cooperative-yield/PAUSE (froze it). Deliver msg/WM_TIMER,
+   return, brief sleep.
+3. **Skip armed HLT diag traps** (0x6BB882 etc.) in real-threads mode — only the
+   main tick handles them; a worker hitting one took an unhandled halt. Functional
+   TLS config-string/cert/manifest patch still runs (s_tls_setup_done once-guard).
+Result: no crash/deadlock/fault; Steam spawns its full 4-thread pool, reaches
+"Downloading manifest" -> connect -> send request -> finished -> retry.
+**Manifest not yet CONFIRMED downloaded** under real threads: rapid testing hit
+Fastly CDN 429/403 rate-limiting (needs cooldown, or verify on device). The retry
+loop + "http error 0" is the same pre-existing GET-queue race as cooperative.
+
+**Done earlier:** CVs + SRW locks wired to wg_sync (4a31ffb); tid logging fixed;
 wg_sync CV type added. Corrected earlier misread: the pool worker does NOT exit
 early — "exited code=0" was just the time-limit shutdown breaking its loop.
 
