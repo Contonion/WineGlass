@@ -6483,8 +6483,16 @@ bool wg_engine_run(WGEngine *engine) {
     // through this fn before a level-filtered spew, so it's the only reliable
     // way to learn WHY SSL_do_handshake fails. Guarded to steam's image base.
     static bool s_tls_setup_done = false;
+    // Only the real Steam.exe (~4MB, image_base 0x400000). The size gate is
+    // essential: the iOS self-test runs tiny 32-bit PEs (also image_base
+    // 0x400000) BEFORE Steam, and without it one of them would trip the
+    // once-guard (set unconditionally below) so Steam skipped the whole TLS
+    // patch/trap block -> empty cipher list -> fatal internal_error alert
+    // instead of a ClientHello. (The macOS harness loads Steam directly, so it
+    // never hit this — device-only regression.)
     if (engine->blink && engine->pe_image &&
-        engine->pe_image->image_base == 0x400000 && !s_tls_setup_done) {
+        engine->pe_image->image_base == 0x400000 &&
+        engine->pe_image->raw_size > 0x100000 && !s_tls_setup_done) {
       // The armed HLT diagnostic traps (below) are handled only by the main tick,
       // not by worker pthreads — a worker hitting one (e.g. 0x6BB882) would take an
       // unhandled halt. They're cooperative-era diagnostics + the cipher max_ver
