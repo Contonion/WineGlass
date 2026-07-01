@@ -345,8 +345,10 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("KERNEL32.dll", SetLastError, 1);
     RS("KERNEL32.dll", IsDebuggerPresent, 0);
     RS("KERNEL32.dll", OutputDebugStringA, 1);
-    RS("KERNEL32.dll", VirtualAlloc, 4);
+    RS("KERNEL32.dll", VirtualAlloc, 4);     // real handler in wg_engine.c (maps guest heap)
     R1S("KERNEL32.dll", VirtualFree, 3);
+    R1S("KERNEL32.dll", VirtualProtect, 4);  // TRUE=success; 4 args so stdcall cleanup is correct
+    R1S("KERNEL32.dll", VirtualProtectEx, 5);
     RS("KERNEL32.dll", HeapCreate, 3);
     RS("KERNEL32.dll", HeapAlloc, 3);
     R1S("KERNEL32.dll", HeapFree, 3);

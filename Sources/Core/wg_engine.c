@@ -3343,6 +3343,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = np;
+        } else if (strcmp(fn, "VirtualAlloc") == 0) {
+            // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect).
+            // The old stub returned a bogus, UNMAPPED pointer. Steam's client
+            // downloader buffers each package with VirtualAlloc (small packages
+            // go through the CRT heap/HeapAlloc which we back, but the big 25-94MB
+            // ones use VirtualAlloc), so it was writing tens of MB into unmapped
+            // memory -> page-fault storm + heap corruption (the manifest/first few
+            // small packages worked, then it blew up on the large ones). Back it
+            // with real, mapped, zeroed guest heap. A commit at an address we
+            // already reserved+mapped just returns that address.
+            uint32_t va_addr = args[0], va_size = args[1];
+            if (va_addr != 0) {
+                ret_val = va_addr;               // commit into an already-mapped reservation
+            } else {
+                ret_val = wg_guest_alloc(engine, va_size);
+            }
+            WG_LOGI(TAG, "VirtualAlloc(addr=0x%X, size=%u, type=0x%X) -> 0x%llX",
+                    args[0], va_size, args[2], (unsigned long long)ret_val);
         } else if (strcmp(fn, "??2@YAPAXI@Z") == 0 ||   // operator new(uint)
                    strcmp(fn, "malloc") == 0) {
             // CRT allocators used by real DLLs (StdUtils, etc.). Returning 0
