@@ -11,13 +11,14 @@
 //
 // BLOCKS the calling thread until the download finishes. Only call it from the
 // engine thread (never the UI main thread — iOS would watchdog-kill a long block
-// there). Implemented in WGNativeDownload.m (Foundation/NSURLSession).
+// there). Implemented in wg_winhttp.c (pure C over SecureTransport), which is
+// already compiled into every build — no separate .m that xcodegen/Xcode can
+// drop (an earlier NSURLSession .m kept not linking -> null-symbol 0x0 crash).
 //
-// Declared weak so that if WGNativeDownload.m ever isn't compiled into the build
-// (e.g. `xcodegen generate` wasn't run after adding it), the symbol resolves to
-// NULL instead of the link failing — callers MUST null-check `wg_native_download`
-// before calling so a missing build artifact degrades to the fallback path
-// rather than jumping to 0x0 (-undefined dynamic_lookup makes that a hard crash).
-int wg_native_download(const char *url, const char *dest_path) __attribute__((weak));
+// wg_engine.c provides a weak fallback stub (returns 0 -> caller degrades to the
+// reactor), which the strong iOS definition in WGSceneDelegate.m overrides. So
+// every build links: the macOS harness (no UIKit) uses the stub, iOS uses the
+// real NSURLSession download.
+int wg_native_download(const char *url, const char *dest_path);
 
 #endif

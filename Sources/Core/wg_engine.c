@@ -9,6 +9,15 @@
 #include "wg_win32_windows.h"
 #include "wg_win32_files.h"
 #include "wg_native_download.h"
+
+// Weak fallback so every build links. iOS provides a strong wg_native_download
+// (NSURLSession) in WGSceneDelegate.m which overrides this; the macOS harness
+// (no UIKit) uses this stub, so native fetch is a no-op there and the caller
+// degrades to the reactor.
+__attribute__((weak)) int wg_native_download(const char *url, const char *dest_path) {
+    (void)url; (void)dest_path;
+    return 0;
+}
 #include "wg_win32_gdi.h"
 #include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
@@ -1003,13 +1012,6 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     if (stat(hostpath, &pst) == 0 && (expected < 0 || pst.st_size == expected))
         return true; // already downloaded (and correct size, if known)
 
-    // Guard: if WGNativeDownload.m isn't in the build, the weak symbol is NULL —
-    // calling it would jump to 0x0 (hard crash). Fall back to the reactor instead.
-    if (!wg_native_download) {
-        WG_LOGW(TAG, "Native package fetch unavailable (wg_native_download not linked "
-                "— run 'xcodegen generate'); leaving to reactor: %s", name);
-        return false;
-    }
     char url[600];
     snprintf(url, sizeof(url), "https://cdn.steamstatic.com/client/%s", name);
     WG_LOGW(TAG, "Native package fetch START: %s (expect %ld bytes)", name, expected);

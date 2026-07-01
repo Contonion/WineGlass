@@ -16,6 +16,7 @@
 		4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */ = {isa = PBXBuildFile; fileRef = A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */; };
 		5494348BA4CC03DFE4DFB7F0 /* WGMetalView.m in Sources */ = {isa = PBXBuildFile; fileRef = 042AC091820A57501F4AF53C /* WGMetalView.m */; };
 		5C76D7361C8A253289AE0FAE /* wg_blink_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = 0163ED821E449B867D15803F /* wg_blink_bridge.c */; };
+		6040233400B5005F6DCDFA12 /* wg_openssl_shim.c in Sources */ = {isa = PBXBuildFile; fileRef = 217E830EDE87417D4827F94A /* wg_openssl_shim.c */; };
 		614C0B5B9DE8BE86A2072C8A /* wg_x86_state.c in Sources */ = {isa = PBXBuildFile; fileRef = 7F2AEF7511EB4DBFF0E62487 /* wg_x86_state.c */; };
 		6F440B002DECA62AC5C07C6A /* wg_pe_loader.c in Sources */ = {isa = PBXBuildFile; fileRef = 405864B3D661FEFA0748A820 /* wg_pe_loader.c */; };
 		6F9AB469C33729911B5FD5AA /* WGConsoleOverlay.m in Sources */ = {isa = PBXBuildFile; fileRef = 41538A1F449EDD392895A884 /* WGConsoleOverlay.m */; };
@@ -42,6 +43,7 @@
 		03190A8CA61C6EEB2E21D3A5 /* wg_engine.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_engine.c; sourceTree = "<group>"; };
 		042AC091820A57501F4AF53C /* WGMetalView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGMetalView.m; sourceTree = "<group>"; };
 		1C5AD0E5FDE519C886FF2861 /* LzmaDec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = LzmaDec.c; sourceTree = "<group>"; };
+		217E830EDE87417D4827F94A /* wg_openssl_shim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_openssl_shim.c; sourceTree = "<group>"; };
 		226AD25F32031E477E58E6E4 /* WGAppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGAppDelegate.m; sourceTree = "<group>"; };
 		3FF677A62CF2185A8B4B6553 /* wg_win32_gdi.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_win32_gdi.c; sourceTree = "<group>"; };
 		405864B3D661FEFA0748A820 /* wg_pe_loader.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_pe_loader.c; sourceTree = "<group>"; };
@@ -65,8 +67,8 @@
 		DB2B57F8BFF770D88A534CC7 /* WGCompositor.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGCompositor.m; sourceTree = "<group>"; };
 		DECF5F763F05FA39E7C8F1E9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E34BB822637517989EE3C436 /* wg_winhttp.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_winhttp.c; sourceTree = "<group>"; };
-		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitkeep; sourceTree = "<group>"; };
+		E84CC81DA8A511D4C43A0A98 /* WineGlass.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WineGlass.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ECDE2E3D8A12F899BE4FC0CD /* .gitkeep */ = {isa = PBXFileReference; path = .gitkeep; sourceTree = "<group>"; };
 		F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_nsis_extract.c; sourceTree = "<group>"; };
 		FB048112D888553F5B0BF5D5 /* wg_x86_interp.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_x86_interp.c; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -109,6 +111,7 @@
 			children = (
 				AC9B150F4EC3486672F48BA3 /* wg_dll_mapper.c */,
 				F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */,
+				217E830EDE87417D4827F94A /* wg_openssl_shim.c */,
 				C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */,
 				CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */,
 				A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */,
@@ -228,11 +231,12 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					CBA7DB16A594539BDCE7004E = {
+						DevelopmentTeam = 45T6E86225;
 						ProvisioningStyle = Automatic;
 					};
 				};
 			};
-			buildConfigurationList = 7DE0709D061D20CD4C9316ED /* Build configuration list for PBXProject ".xcodeproj" */;
+			buildConfigurationList = 7DE0709D061D20CD4C9316ED /* Build configuration list for PBXProject "WineGlass" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -281,6 +285,7 @@
 				2FD4BA58266ECC2070F84E68 /* wg_log.c in Sources */,
 				4C46330254DF76387D4B0C6C /* wg_memory.c in Sources */,
 				B99680E59A435AA4F9C5E67E /* wg_nsis_extract.c in Sources */,
+				6040233400B5005F6DCDFA12 /* wg_openssl_shim.c in Sources */,
 				6F440B002DECA62AC5C07C6A /* wg_pe_loader.c in Sources */,
 				E65EEA043C69625888F77FAF /* wg_schannel.c in Sources */,
 				DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */,
@@ -371,7 +376,7 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/App/WineGlass.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = DB78DUWP98;
+				DEVELOPMENT_TEAM = 45T6E86225;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/Core",
@@ -389,11 +394,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Vendor/blink/lib";
-				OTHER_CFLAGS = (
-					"-DTARGET_OS_IOS=1",
-					"-D_DARWIN_C_SOURCE",
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/blink/lib",
 				);
+				OTHER_CFLAGS = "-DTARGET_OS_IOS=1 -D_DARWIN_C_SOURCE";
 				OTHER_LDFLAGS = (
 					"-lbz2",
 					"-lz",
@@ -418,7 +422,7 @@
 				CODE_SIGN_ENTITLEMENTS = Sources/App/WineGlass.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = DB78DUWP98;
+				DEVELOPMENT_TEAM = 45T6E86225;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/Sources/Core",
@@ -436,11 +440,10 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/Vendor/blink/lib";
-				OTHER_CFLAGS = (
-					"-DTARGET_OS_IOS=1",
-					"-D_DARWIN_C_SOURCE",
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/Vendor/blink/lib",
 				);
+				OTHER_CFLAGS = "-DTARGET_OS_IOS=1 -D_DARWIN_C_SOURCE";
 				OTHER_LDFLAGS = (
 					"-lbz2",
 					"-lz",
@@ -525,7 +528,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		7DE0709D061D20CD4C9316ED /* Build configuration list for PBXProject ".xcodeproj" */ = {
+		7DE0709D061D20CD4C9316ED /* Build configuration list for PBXProject "WineGlass" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				158EEAF2335DB17213200366 /* Debug */,
