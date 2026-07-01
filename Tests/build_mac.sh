@@ -45,7 +45,9 @@ $CC \
   "$WG"/Sources/Win32/wg_win32_gdi.c "$WG"/Sources/Win32/wg_win32_windows.c \
   "$WG"/Sources/Win32/wg_winhttp.c "$WG"/Sources/Win32/wg_winsock.c \
   "$WG/Sources/LZMA/LzmaDec.c" "$WG/Tests/run_exe.c" \
+  "$WG/Sources/App/WGNativeDownload.m" \
   "$BUILD/wg_blink_impl_macos.o" "$BUILD/blink_macos.a" \
-  -framework Security -framework CoreFoundation -framework CoreGraphics -framework CoreText \
+  -framework Security -framework CoreFoundation -framework Foundation \
+  -framework CoreGraphics -framework CoreText \
   -o "$BUILD/wineglass_run"
 echo "built: $BUILD/wineglass_run"

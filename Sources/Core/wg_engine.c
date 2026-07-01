@@ -8,6 +8,7 @@
 #include "wg_blink_bridge.h"
 #include "wg_win32_windows.h"
 #include "wg_win32_files.h"
+#include "wg_native_download.h"
 #include "wg_win32_gdi.h"
 #include "wg_win32_bitmap.h"
 #include "wg_nsis_extract.h"
@@ -974,6 +975,30 @@ static uint32_t lookup_alloc_size(uint32_t addr) {
 // Bump-allocate `size` bytes of zeroed guest heap (shared with GlobalAlloc).
 // Returns the guest address, or 0 on failure. Used by the CRT allocators that
 // real DLLs (StdUtils, and eventually steam.exe) call.
+// When Steam checks for a client package that isn't on disk, fetch it natively
+// (host HTTPS) instead of letting the in-guest download reactor do it — the
+// reactor is unreliable on our cooperative scheduler (stalls/crashes partway),
+// while a native GET is rock-solid. `hostpath` is the mapped bottle path, e.g.
+// .../drive_c/package/<name>. The CDN URL is /client/<name>, same basename.
+// Returns true if the file is now present. Blocks the engine thread during the
+// download (safe: engine runs off the UI thread).
+static bool wg_try_native_package_fetch(const char *hostpath) {
+    const char *p = strstr(hostpath, "/package/");
+    if (!p) return false;
+    const char *name = p + 9; // strlen("/package/")
+    if (!name[0] || strchr(name, '/')) return false;   // must be directly in package/
+    if (!strstr(name, ".zip")) return false;           // packages are .zip / .zip.vz
+    // Skip Steam's control/bookkeeping files (not CDN downloads).
+    if (strstr(name, ".writable") || strstr(name, ".installed") ||
+        strstr(name, ".manifest") || strstr(name, "metrics")) return false;
+    char url[600];
+    snprintf(url, sizeof(url), "https://cdn.steamstatic.com/client/%s", name);
+    WG_LOGW(TAG, "Native package fetch START: %s", name);
+    bool ok = wg_native_download(url, hostpath) != 0;
+    WG_LOGW(TAG, "Native package fetch %s: %s", ok ? "OK" : "FAILED", name);
+    return ok;
+}
+
 static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
@@ -4752,6 +4777,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             const char *real = wg_files_map_path(args[0], engine->blink, apath, sizeof(apath));
             if (real) {
                 struct stat st;
+                // If Steam is checking for a client package that's missing, fetch
+                // it natively so it finds it present and skips its own (flaky)
+                // reactor download.
+                if (stat(real, &st) != 0)
+                    wg_try_native_package_fetch(real);
                 if (stat(real, &st) == 0) {
                     ret_val = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
                 } else {
