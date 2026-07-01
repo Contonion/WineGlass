@@ -122,6 +122,36 @@ static inline void wg_thunk_block_end(void)   { if (s_use_real_threads) pthread_
 // GetCurrentThreadId and as the caller_tid for wg_sync mutex ownership.
 static _Thread_local uint32_t s_cur_guest_tid = 1;
 
+// Per-real-thread slot index into the s_tls_slots/s_fls_slots shadow arrays.
+// The cooperative scheduler used scheduler->current as the index; under real
+// threads that's meaningless (all threads would share one slot -> corrupt
+// per-thread CRT state, e.g. _tiddata / errno). So each real thread gets its own
+// slot from a small pool. Main = 0; workers alloc/free in wg_spawn_real_thread /
+// wg_worker_thread_entry. GENERAL fix (any multithreaded guest), not app-specific.
+static _Thread_local int s_tls_slot = 0;
+static pthread_mutex_t   s_tls_slot_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool              s_tls_slot_used[WG_MAX_THREADS]; // [0] reserved for main
+static int wg_alloc_tls_slot(void) {
+    pthread_mutex_lock(&s_tls_slot_lock);
+    int s = 0; // 0 fallback (main's slot) if the pool is exhausted — safe, not ideal
+    for (int i = 1; i < WG_MAX_THREADS; i++)
+        if (!s_tls_slot_used[i]) { s_tls_slot_used[i] = true; s = i; break; }
+    pthread_mutex_unlock(&s_tls_slot_lock);
+    return s;
+}
+static void wg_free_tls_slot(int s) {
+    if (s <= 0) return;
+    pthread_mutex_lock(&s_tls_slot_lock);
+    s_tls_slot_used[s] = false;
+    pthread_mutex_unlock(&s_tls_slot_lock);
+}
+// Current shadow-array index: real per-thread slot in real-threads mode, else the
+// cooperative scheduler's current thread. `coop` is scheduler->current (or -1).
+static inline int wg_tls_index(int coop) {
+    if (s_use_real_threads) return s_tls_slot;
+    return coop >= 0 ? coop : 0;
+}
+
 // Spawn a real pthread for a guest CreateThread/_beginthreadex (real-threads
 // mode). Defined after wg_alloc_thread_teb; forward-declared for the CreateThread
 // handler inside handle_blink_thunk.
@@ -3446,13 +3476,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // TLS slot indices are process-global (shared across threads).
             ret_val = (s_tls_next < 1088) ? s_tls_next++ : 0xFFFFFFFF;
         } else if (strcmp(fn, "TlsGetValue") == 0) {
-            int ti = (engine->scheduler && engine->scheduler->current >= 0)
-                     ? engine->scheduler->current : 0;
+            int ti = wg_tls_index(engine->scheduler ? engine->scheduler->current : -1);
             ret_val = (args[0] < 1088) ? s_tls_slots[ti][args[0]] : 0;
             s_last_error = 0;
         } else if (strcmp(fn, "TlsSetValue") == 0) {
-            int ti = (engine->scheduler && engine->scheduler->current >= 0)
-                     ? engine->scheduler->current : 0;
+            int ti = wg_tls_index(engine->scheduler ? engine->scheduler->current : -1);
             if (args[0] < 1088) s_tls_slots[ti][args[0]] = args[1];
             ret_val = 1;
         } else if (strcmp(fn, "TlsFree") == 0) {
@@ -3461,13 +3489,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // FLS slot indices are process-global; values are per-thread.
             ret_val = (s_fls_next < 1088) ? s_fls_next++ : 0xFFFFFFFF;
         } else if (strcmp(fn, "FlsGetValue") == 0) {
-            int fi = (engine->scheduler && engine->scheduler->current >= 0)
-                     ? engine->scheduler->current : 0;
+            int fi = wg_tls_index(engine->scheduler ? engine->scheduler->current : -1);
             ret_val = (args[0] < 1088) ? s_fls_slots[fi][args[0]] : 0;
             s_last_error = 0;
         } else if (strcmp(fn, "FlsSetValue") == 0) {
-            int fi = (engine->scheduler && engine->scheduler->current >= 0)
-                     ? engine->scheduler->current : 0;
+            int fi = wg_tls_index(engine->scheduler ? engine->scheduler->current : -1);
             if (args[0] < 1088) s_fls_slots[fi][args[0]] = args[1];
             ret_val = 1;
         } else if (strcmp(fn, "FlsFree") == 0) {
@@ -6029,6 +6055,7 @@ typedef struct {
     uint32_t teb;        // guest TEB
     uint32_t thread_h;   // wg_sync THREAD handle (for join/WFSO)
     uint32_t tid;        // guest thread id
+    int      tls_slot;   // per-thread index into s_tls_slots/s_fls_slots
 } WGWorkerArgs;
 
 static void *wg_worker_thread_entry(void *arg) {
@@ -6037,6 +6064,7 @@ static void *wg_worker_thread_entry(void *arg) {
     WGEngine *engine = wa.engine;
 
     s_cur_guest_tid = wa.tid;
+    s_tls_slot = wa.tls_slot;             // this pthread's TLS/FLS shadow slot
     wg_blink_adopt_machine(wa.machine);   // g_machine = this pthread's Machine
 
     // Seed the stdcall entry frame: [esp]=return addr 0 (a plain `ret` from the
@@ -6081,6 +6109,7 @@ static void *wg_worker_thread_entry(void *arg) {
 
     WG_LOGI(TAG, "[realthr] worker tid=0x%X exited code=%u", wa.tid, exit_code);
     wg_sync_thread_exit(wa.thread_h, exit_code);
+    wg_free_tls_slot(wa.tls_slot);
     wg_blink_free_thread_machine(wa.machine);
     return NULL;
 }
@@ -6111,7 +6140,7 @@ static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
     if (!wa) { wg_blink_free_thread_machine(machine); return 0; }
     wa->engine = engine; wa->machine = machine; wa->start = start;
     wa->param = param; wa->stack_top = stack_top; wa->teb = teb;
-    wa->thread_h = thread_h; wa->tid = tid;
+    wa->thread_h = thread_h; wa->tid = tid; wa->tls_slot = wg_alloc_tls_slot();
 
     pthread_t pt;
     if (pthread_create(&pt, NULL, wg_worker_thread_entry, wa) != 0) {
