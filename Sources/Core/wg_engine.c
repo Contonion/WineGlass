@@ -329,6 +329,7 @@ static uint32_t s_fls_next = 0;
 // signalled/unsignalled flags. Handles start at 0x200 to avoid collisions.
 #define WG_EVENT_BASE   0x200u
 #define WG_MAX_EVENTS   256
+#define WG_SELECT_WAIT  0x5E1EC7u   // sentinel wait_handle: thread is pacing a select() timeout
 static bool s_event_signalled[WG_MAX_EVENTS];
 static bool s_event_manual[WG_MAX_EVENTS];   // true = manual-reset, false = auto-reset
 static uint32_t s_event_next = 0;
@@ -5089,6 +5090,44 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 if (wg_winsock_handle(engine->winsock, ws_fn, args, &ws_ret, engine->blink)) {
                     ret_val = ws_ret;
+                    // Real select() timeout (device-gated). Our winsock select polls
+                    // without honoring the timeval, so a select-based poll loop that
+                    // finds nothing ready busy-spins at JIT speed instead of waiting.
+                    // Steam's main thread does exactly this after the handshake — it
+                    // hammers select tens of thousands of times and never advances to
+                    // spawn the request-sender. Honor the timeout: when nothing is
+                    // ready and a timeout was given, cooperatively yield and only
+                    // return 0 once the real wall-clock deadline passes, so the loop
+                    // paces like real hardware (matching the slow-interpreter Mac path
+                    // that does get Steam through). NULL timeval = block until ready.
+                    if (s_real_timeouts && strcmp(ws_fn, "select") == 0) {
+                        WGThread *scur = wg_sched_current(engine->scheduler);
+                        if (ws_ret != 0) {
+                            if (scur && scur->wait_handle == WG_SELECT_WAIT) scur->wait_handle = 0;
+                        } else if (scur) {
+                            bool infinite = (args[4] == 0);
+                            uint64_t tmo_ms = 0;
+                            if (!infinite) {
+                                uint32_t sec = 0, usec = 0;
+                                wg_blink_read_mem(engine->blink, args[4], &sec, 4);
+                                wg_blink_read_mem(engine->blink, args[4] + 4, &usec, 4);
+                                tmo_ms = (uint64_t)sec * 1000 + usec / 1000;
+                            }
+                            struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                            uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+                            if (scur->wait_handle != WG_SELECT_WAIT) {
+                                scur->wait_handle = WG_SELECT_WAIT; scur->wait_start_ms = now;
+                            }
+                            bool expired = !infinite && (now - scur->wait_start_ms >= tmo_ms);
+                            if (!expired) {
+                                if (wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY))
+                                    return true; // paced wait — re-poll select next turn
+                                // alone: fall through, return 0 (nothing ready)
+                            } else {
+                                scur->wait_handle = 0; // deadline hit
+                            }
+                        }
+                    }
                     // If the socket has an OVERLAPPED argument and the call succeeded,
                     // post an IOCP completion so GetQueuedCompletionStatus fires.
                     // ConnectEx: args[6]=overlapped, success = ret==1
