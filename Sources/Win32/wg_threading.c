@@ -135,15 +135,19 @@ bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink) {
             sched->current = idx;
             t->state = WG_THREAD_RUNNING;
             restore_regs(&t->regs, blink);
-            // Only log real context switches, not self-reswitches in a spin loop.
-            // Rate-limit: a steady-state ping-pong between two threads otherwise
-            // floods the device ring buffer (170k+ lines) and scrolls off the real
-            // activity. Log the first switches, then 1/256.
+            // Only log real context switches, not self-reswitches. In a deadlock a
+            // handful of threads cycle millions of times, so: log a switch only when
+            // the target thread differs from the last one we LOGGED (collapses a
+            // steady 0<->N ping-pong to nothing), and hard-cap the rest at 1/8192 so
+            // even a long spin adds only a trickle. First 64 always log.
             if (prev != idx) {
-                static uint32_t sw = 0;
-                if (sw++ < 64 || (sw & 0xFF) == 0)
+                static uint32_t sw = 0; static int lg1 = -1, lg2 = -1;
+                if (sw < 64 || (idx != lg1 && idx != lg2) || (sw & 0x1FFF) == 0) {
                     WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
                             idx, t->id, t->regs.rip);
+                    lg2 = lg1; lg1 = idx;
+                }
+                sw++;
             }
             return true;
         }
