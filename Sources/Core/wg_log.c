@@ -8,7 +8,23 @@ static void          *s_userdata = NULL;
 static WGLogLevel     s_minLevel = WG_LOG_DEBUG;
 static pthread_mutex_t s_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
+// Optional file sink — the engine points this at {bottle}/logs so the FULL,
+// untruncated log rides along when the bottle is copied off the device (the
+// Xcode console ring-buffers + the .xcresult doesn't always sync). Capped so a
+// runaway loop can't fill the device.
+static FILE          *s_logfile = NULL;
+static long           s_logfile_bytes = 0;
+static const long     s_logfile_cap = 150L * 1024 * 1024; // 150MB
+
 static const char *level_names[] = { "DBG", "INF", "WRN", "ERR", "FTL" };
+
+void wg_log_set_file(const char *path) {
+    pthread_mutex_lock(&s_mutex);
+    if (s_logfile) { fclose(s_logfile); s_logfile = NULL; }
+    s_logfile_bytes = 0;
+    if (path && path[0]) s_logfile = fopen(path, "w");
+    pthread_mutex_unlock(&s_mutex);
+}
 
 void wg_log_init(void) {
     s_callback = NULL;
@@ -53,6 +69,14 @@ void wg_log(WGLogLevel level, const char *tag, const char *fmt, ...) {
         char tagged[600];
         snprintf(tagged, sizeof(tagged), "[%s] %s", safe_tag, buf);
         s_callback((WGLogLevel)lvl, safe_tag, tagged, s_userdata);
+    }
+    if (s_logfile && s_logfile_bytes < s_logfile_cap) {
+        int n = fprintf(s_logfile, "[%s/%s] %s\n", level_names[lvl], safe_tag, buf);
+        if (n > 0) s_logfile_bytes += n;
+        // Flush on warnings/errors (so a crash's context survives) and periodically.
+        if (lvl >= WG_LOG_WARN || (s_logfile_bytes & 0xFFFF) < 256) fflush(s_logfile);
+        if (s_logfile_bytes >= s_logfile_cap)
+            fprintf(s_logfile, "[INF/Log] === log cap (150MB) reached; further lines dropped ===\n");
     }
     pthread_mutex_unlock(&s_mutex);
 }

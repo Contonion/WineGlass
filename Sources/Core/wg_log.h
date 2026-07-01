@@ -17,6 +17,9 @@ typedef void (*WGLogCallback)(WGLogLevel level, const char *tag, const char *mes
 void wg_log_init(void);
 void wg_log_set_callback(WGLogCallback callback, void *userdata);
 void wg_log_set_level(WGLogLevel minLevel);
+// Mirror all log output to a file (full, untruncated; capped at 150MB). Pass
+// NULL to disable/close. Used to capture the engine log inside the bottle.
+void wg_log_set_file(const char *path);
 
 void wg_log(WGLogLevel level, const char *tag, const char *fmt, ...);
 

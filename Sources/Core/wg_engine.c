@@ -5878,6 +5878,15 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
 
     // Set the exe path for file I/O mapping (also anchors the bottle's drive_c).
     wg_files_set_exe_path(path);
+    // Mirror the full engine log into the bottle so it rides along when drive_c is
+    // copied off the device (the Xcode console ring-buffers and the .xcresult
+    // doesn't reliably sync). This is the untruncated source of truth.
+    {
+        char logpath[1200];
+        snprintf(logpath, sizeof(logpath), "%s/wineglass_engine.log", wg_files_drive_c());
+        wg_log_set_file(logpath);
+        WG_LOGI(TAG, "Engine log mirrored -> %s", logpath);
+    }
     // Clear stale NSIS plug-in dirs from the bottle's Temp so this run gets a
     // fresh plug-ins directory (NSIS bails if one already exists).
     wg_files_reset_temp();
