@@ -978,6 +978,10 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
     uint32_t alloc = (size + 0xFFF) & ~0xFFFu;
+    // Never let the bump heap grow into the thread-stack region (0x60000000).
+    // Steam buffers hundreds of MB of packages here; running into the stacks
+    // corrupts thread return addresses and crashes. Fail cleanly instead.
+    if (s_heap_ptr + alloc > 0x5F000000u || s_heap_ptr + alloc < s_heap_ptr) return 0;
     uint32_t addr = s_heap_ptr;
     uint8_t *zeros = calloc(1, alloc);
     if (!zeros) return 0;
@@ -4813,6 +4817,9 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0;
             } else {
                 size = (size + 0xFFF) & ~0xFFF;
+                if (s_heap_ptr + size > 0x5F000000u || s_heap_ptr + size < s_heap_ptr) {
+                    ret_val = 0; // would collide with the thread-stack region
+                } else {
                 uint32_t addr = s_heap_ptr;
                 uint8_t *zeros = calloc(1, size);
                 if (zeros) {
@@ -4821,6 +4828,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     s_heap_ptr += size;
                     s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFF;
                     ret_val = addr;
+                }
                 }
             }
         } else if (strcmp(fn, "GlobalLock") == 0) {
@@ -5732,7 +5740,7 @@ static bool load_pe_blink(WGEngine *engine) {
         memset(engine->scheduler->threads, 0, sizeof(engine->scheduler->threads));
         engine->scheduler->next_id = 0x1000;
         engine->scheduler->next_handle = 0x7100;
-        engine->scheduler->next_stack_addr = 0x30000000u;
+        engine->scheduler->next_stack_addr = 0x60000000u; // above the heap's growth (see wg_sched_create)
         WGThread *mt = &engine->scheduler->threads[0];
         mt->state = WG_THREAD_RUNNING;
         mt->id = 1;

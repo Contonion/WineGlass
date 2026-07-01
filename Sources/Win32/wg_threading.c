@@ -12,7 +12,11 @@ WGThreadScheduler *wg_sched_create(void) {
     s->current = -1;
     s->next_id = 0x1000;
     s->next_handle = 0x7100;
-    s->next_stack_addr = 0x30000000u;
+    s->next_stack_addr = 0x60000000u; // well above the guest heap (0x20000000, grows
+                                      // up): Steam buffers ~250MB of packages on the
+                                      // heap, which used to grow into the old
+                                      // 0x30000000 stack region and corrupt thread
+                                      // stacks (garbage RIP/EBP crashes on big downloads)
     return s;
 }
 
