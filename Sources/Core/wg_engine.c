@@ -81,11 +81,16 @@ static bool s_real_timeouts   = false;  // macOS harness: legacy no-timeout path
 // its own blink Machine over the shared System, and the Win32 sync handlers
 // (WaitForSingleObject/Sleep/events/mutexes/critical sections) use the real
 // pthread-backed wg_sync objects instead of the cooperative wg_sched_yield.
-// Default OFF so the shipping cooperative path is untouched until this is proven
-// on the Mac harness, then the device (needs iOS blink.a rebuilt w/o
-// DISABLE_THREADS). Set via wg_engine_set_real_threads() or the WG_REAL_THREADS
-// env var (macOS harness).
+// This eliminates the cooperative-scheduler deadlocks (0x207 / "Illegal
+// termination"). DEFAULT ON for the iOS device (JIT is fast enough + the
+// deadlocks are gone); the macOS harness stays cooperative by default (it's the
+// slow interpreter used for A/B debugging). Override either way at runtime:
+//   WG_REAL_THREADS=1     force ON     WG_NO_REAL_THREADS=1  force OFF
+#if TARGET_OS_IPHONE
+static bool s_use_real_threads = true;
+#else
 static bool s_use_real_threads = false;
+#endif
 
 // Global "big lock" serialising Win32 thunk dispatch across guest threads. Guest
 // CODE (blink execution) runs concurrently; only handle_blink_thunk (which
@@ -6119,6 +6124,7 @@ static bool load_pe_blink(WGEngine *engine) {
     // harness. Initialise the pthread-backed sync subsystem + the global thunk
     // lock, and mark the main guest thread's id.
     if (getenv("WG_REAL_THREADS")) s_use_real_threads = true;
+    if (getenv("WG_NO_REAL_THREADS")) s_use_real_threads = false;
     if (s_use_real_threads && !wg_sync_init) {
         // wg_sync.c didn't get linked (stale Xcode project — the app's
         // -undefined dynamic_lookup masks the missing symbols as NULL). Don't
