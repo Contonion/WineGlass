@@ -26,3 +26,7 @@ Vendor/blink/lib/*.o
 
 # Claude Code local memory / session data
 .claude/
+
+# xcodegen/user scheme noise
+WineGlass.xcodeproj/xcshareddata/
+.xcodeproj.xcodeproj/
