@@ -70,6 +70,47 @@ blink must be rebuilt **without** `DISABLE_THREADS`:
   force a rebuild after editing `config.h.ios`).
 - iOS: rebuild `Vendor/blink/lib/blink.a` from the same `config.h.ios`.
 
+## ⚠ BLOCKER (found during P2c bring-up): blink threading model vs our manual stepping
+P2c/P4 are fully coded + gated behind `s_use_real_threads` (default OFF). First
+real-threads run got a real worker pthread spawned + running, then crashed — and
+bring-up exposed a blink-internals wall. Three blink configs, none clean:
+
+1. **`DISABLE_THREADS` (original / current, shipping):** `thread.h` `#define`s
+   `_Thread_local` to *nothing* → `g_machine` is a **shared global**. Cooperative
+   works, but a worker's `adopt_machine` clobbers the main thread's Machine →
+   main's RIP goes wild → SIGSEGV in int3 padding (observed at 0x53648b). So real
+   threads are impossible here.
+2. **Threads fully ON (`HAVE_THREADS`, config.h.ios DISABLE_THREADS off):**
+   `_Thread_local` real (good) BUT the SMP `LOCK()`s (pagelocks per memory access,
+   exec_lock) are real and **DEADLOCK our manual per-instruction
+   LoadInstruction/ExecuteInstruction stepping** — Steam hangs at ~CRT init
+   (VirtualAlloc 0xFFEEFFEE / WakeAllConditionVariable), never progresses. blink's
+   locks assume blink's own Actor/run loop manages them; we bypass it.
+3. **Hybrid (edit thread.h: keep `_Thread_local` real but `LOCK`=no-op):** blink
+   **hangs at init**, right after "VM created", before executing sections. Cause
+   not yet diagnosed (possibly a g_machine def/decl mismatch across TUs, or blink
+   touching g_machine before TLS is ready). Reverted.
+
+**Core need:** per-thread current-Machine WITHOUT blink's SMP lock deadlock.
+**Next-session options (in promise order):**
+- **(A) Own TLS in the bridge (most promising).** Keep `DISABLE_THREADS`
+  (fast, no deadlock). In `wg_blink_impl.c` use OUR OWN `static _Thread_local
+  struct Machine *wg_tls_machine` for `cur_m()`/`AdoptMachine` instead of blink's
+  `g_machine`. *Precondition to verify first:* does blink's interpreter path
+  (ExecuteInstruction, memory ops, fault handling) read the global `g_machine`
+  internally, or only the `m` we pass? If only `m`, (A) works cleanly. If it
+  reads g_machine, workers would hit the wrong Machine → (A) fails. Grep blink
+  for `g_machine` uses in the hot path to decide.
+- **(B) Diagnose the config-3 init hang** (lldb: where it stalls after VM create
+  with `_Thread_local` real + locks off). If fixable, gives per-thread g_machine
+  + no deadlock.
+- **(C) Make blink's SMP locks compatible** with manual stepping (understand the
+  pagelock lifecycle; release between steps). Deepest.
+
+Build note: `build_mac.sh` now always syncs `config.h` from `config.h.ios` and
+force-rebuilds blink on change (a stale config.h silently kept threads off,
+masking all of this during P1's "verified" step — P1 never actually had threads).
+
 ## Risks / open questions
 - blink SMP correctness in **interpreter** mode on iOS (no JIT) — untested at scale.
 - `_Thread_local` availability/behavior on iOS.
