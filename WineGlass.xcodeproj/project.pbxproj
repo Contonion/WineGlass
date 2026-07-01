@@ -15,6 +15,7 @@
 		4C46330254DF76387D4B0C6C /* wg_memory.c in Sources */ = {isa = PBXBuildFile; fileRef = 9B7C6CA02B6DFA3DC5F82359 /* wg_memory.c */; };
 		4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */ = {isa = PBXBuildFile; fileRef = A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */; };
 		5494348BA4CC03DFE4DFB7F0 /* WGMetalView.m in Sources */ = {isa = PBXBuildFile; fileRef = 042AC091820A57501F4AF53C /* WGMetalView.m */; };
+		54E54B23D3F6E540F60FF6F0 /* wg_sync.c in Sources */ = {isa = PBXBuildFile; fileRef = 121A511D1D6AC534B11B909D /* wg_sync.c */; };
 		5C76D7361C8A253289AE0FAE /* wg_blink_bridge.c in Sources */ = {isa = PBXBuildFile; fileRef = 0163ED821E449B867D15803F /* wg_blink_bridge.c */; };
 		6040233400B5005F6DCDFA12 /* wg_openssl_shim.c in Sources */ = {isa = PBXBuildFile; fileRef = 217E830EDE87417D4827F94A /* wg_openssl_shim.c */; };
 		614C0B5B9DE8BE86A2072C8A /* wg_x86_state.c in Sources */ = {isa = PBXBuildFile; fileRef = 7F2AEF7511EB4DBFF0E62487 /* wg_x86_state.c */; };
@@ -42,6 +43,7 @@
 		0163ED821E449B867D15803F /* wg_blink_bridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_blink_bridge.c; sourceTree = "<group>"; };
 		03190A8CA61C6EEB2E21D3A5 /* wg_engine.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_engine.c; sourceTree = "<group>"; };
 		042AC091820A57501F4AF53C /* WGMetalView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGMetalView.m; sourceTree = "<group>"; };
+		121A511D1D6AC534B11B909D /* wg_sync.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_sync.c; sourceTree = "<group>"; };
 		1C5AD0E5FDE519C886FF2861 /* LzmaDec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = LzmaDec.c; sourceTree = "<group>"; };
 		217E830EDE87417D4827F94A /* wg_openssl_shim.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wg_openssl_shim.c; sourceTree = "<group>"; };
 		226AD25F32031E477E58E6E4 /* WGAppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WGAppDelegate.m; sourceTree = "<group>"; };
@@ -113,6 +115,7 @@
 				F44A8E6CB4C794B3C65669A0 /* wg_nsis_extract.c */,
 				217E830EDE87417D4827F94A /* wg_openssl_shim.c */,
 				C4E29D72934D4C7A3E60FE2F /* wg_schannel.c */,
+				121A511D1D6AC534B11B909D /* wg_sync.c */,
 				CFAE981533D37EFE8C0CA5C6 /* wg_threading.c */,
 				A015D603CC44751FE81C5CF5 /* wg_win32_bitmap.c */,
 				B2E1DBEB8D28CABF3D1D6753 /* wg_win32_files.c */,
@@ -289,6 +292,7 @@
 				6F440B002DECA62AC5C07C6A /* wg_pe_loader.c in Sources */,
 				E65EEA043C69625888F77FAF /* wg_schannel.c in Sources */,
 				DA16FE0A0D1788B57F5B952D /* wg_selftest.c in Sources */,
+				54E54B23D3F6E540F60FF6F0 /* wg_sync.c in Sources */,
 				FF0C10672178332D27C8A826 /* wg_threading.c in Sources */,
 				4F74211DF56DC12F02403CAC /* wg_win32_bitmap.c in Sources */,
 				FE3F13C8B6A240DCDBC01555 /* wg_win32_files.c in Sources */,

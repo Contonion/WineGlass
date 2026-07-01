@@ -40,7 +40,7 @@ $CC \
   "$WG/Sources/CPU/wg_x86_decode.c" "$WG/Sources/CPU/wg_x86_interp.c" "$WG/Sources/CPU/wg_x86_state.c" \
   "$WG/Sources/PE/wg_pe_loader.c" "$WG/Sources/Memory/wg_memory.c" \
   "$WG"/Sources/Win32/wg_dll_mapper.c "$WG"/Sources/Win32/wg_nsis_extract.c \
-  "$WG"/Sources/Win32/wg_schannel.c "$WG"/Sources/Win32/wg_threading.c \
+  "$WG"/Sources/Win32/wg_schannel.c "$WG"/Sources/Win32/wg_threading.c "$WG"/Sources/Win32/wg_sync.c \
   "$WG"/Sources/Win32/wg_win32_bitmap.c "$WG"/Sources/Win32/wg_win32_files.c \
   "$WG"/Sources/Win32/wg_win32_gdi.c "$WG"/Sources/Win32/wg_win32_windows.c \
   "$WG"/Sources/Win32/wg_winhttp.c "$WG"/Sources/Win32/wg_winsock.c \
