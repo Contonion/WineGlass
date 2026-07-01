@@ -9,7 +9,7 @@
 #define WG_SYNC_MAX   256
 #define WG_SYNC_BASE  0x00090000u   // distinct from file(0x1xx)/socket(0x1xxx)/thread(0x71xx) handles
 
-enum { WGO_FREE = 0, WGO_EVENT, WGO_MUTEX, WGO_SEM, WGO_THREAD };
+enum { WGO_FREE = 0, WGO_EVENT, WGO_MUTEX, WGO_SEM, WGO_THREAD, WGO_CV };
 
 typedef struct {
     int      type;
@@ -99,6 +99,15 @@ uint32_t wg_sync_create_thread_obj(uint32_t tid) {
     WGSyncObj *o = alloc_obj_locked(WGO_THREAD);
     uint32_t h = 0;
     if (o) { o->owner_tid = tid; o->exited = false; h = o->handle; }
+    pthread_mutex_unlock(&g_lock);
+    return h;
+}
+
+uint32_t wg_sync_create_cv(void) {
+    pthread_mutex_lock(&g_lock);
+    WGSyncObj *o = alloc_obj_locked(WGO_CV);
+    uint32_t h = 0;
+    if (o) { o->count = 0; h = o->handle; }   // count = wake generation
     pthread_mutex_unlock(&g_lock);
     return h;
 }
@@ -269,6 +278,66 @@ uint32_t wg_sync_wait_multiple(const uint32_t *handles, int count, bool wait_all
             int rc = pthread_cond_timedwait(&g_cond, &g_lock, &ts);
             if (rc == ETIMEDOUT) { rv = WG_WAIT_TIMEOUT; break; }
         }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rv;
+}
+
+// ── Condition variables (Win32 SleepConditionVariableCS) ─────────────────────
+
+void wg_sync_cv_wake(uint32_t cv, bool wake_all) {
+    (void)wake_all;   // broadcast-and-recheck wakes all; spurious wakeups are legal
+    pthread_mutex_lock(&g_lock);
+    WGSyncObj *o = find_locked(cv);
+    if (o && o->type == WGO_CV) { o->count++; pthread_cond_broadcast(&g_cond); }
+    pthread_mutex_unlock(&g_lock);
+}
+
+uint32_t wg_sync_cv_sleep(uint32_t cv, uint32_t cs_mtx, uint32_t timeout_ms, uint32_t caller_tid) {
+    pthread_mutex_lock(&g_lock);
+    WGSyncObj *c  = find_locked(cv);
+    WGSyncObj *m  = find_locked(cs_mtx);
+    if (!c || c->type != WGO_CV || !m || m->type != WGO_MUTEX) {
+        pthread_mutex_unlock(&g_lock);
+        return WG_WAIT_FAILED;
+    }
+
+    // Release the critical-section mutex (Windows drops it while waiting). Save the
+    // recursion depth to restore on re-acquire.
+    int saved = m->recursion > 0 ? m->recursion : 1;
+    m->owner_tid = 0; m->recursion = 0;
+    pthread_cond_broadcast(&g_cond);
+
+    struct timespec ts;
+    bool have_deadline = (timeout_ms != WG_SYNC_INFINITE && timeout_ms != 0);
+    if (have_deadline) deadline_from_ms(&ts, timeout_ms);
+
+    long gen = c->count;
+    uint32_t rv = WG_WAIT_OBJECT_0;
+    while (1) {
+        c = find_locked(cv);
+        if (!c) { rv = WG_WAIT_FAILED; break; }
+        if (c->count != gen) { rv = WG_WAIT_OBJECT_0; break; }   // woken
+        if (timeout_ms == 0) { rv = WG_WAIT_TIMEOUT; break; }
+        if (timeout_ms == WG_SYNC_INFINITE) {
+            pthread_cond_wait(&g_cond, &g_lock);
+        } else {
+            if (pthread_cond_timedwait(&g_cond, &g_lock, &ts) == ETIMEDOUT) {
+                rv = (c && c->count != gen) ? WG_WAIT_OBJECT_0 : WG_WAIT_TIMEOUT;
+                break;
+            }
+        }
+    }
+
+    // Re-acquire the CS mutex unconditionally before returning (Windows semantics).
+    m = find_locked(cs_mtx);
+    if (m && m->type == WGO_MUTEX) {
+        while (m->owner_tid != 0 && m->owner_tid != caller_tid) {
+            pthread_cond_wait(&g_cond, &g_lock);
+            m = find_locked(cs_mtx);
+            if (!m) break;
+        }
+        if (m) { m->owner_tid = caller_tid; m->recursion = saved; }
     }
     pthread_mutex_unlock(&g_lock);
     return rv;

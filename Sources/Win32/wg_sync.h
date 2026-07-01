@@ -32,6 +32,15 @@ uint32_t wg_sync_create_event(bool manual_reset, bool initial_signalled);
 uint32_t wg_sync_create_mutex(bool initially_owned, uint32_t owner_tid);
 uint32_t wg_sync_create_semaphore(long initial_count, long max_count);
 uint32_t wg_sync_create_thread_obj(uint32_t tid);  // waitable handle for a guest thread
+uint32_t wg_sync_create_cv(void);                  // Win32 CONDITION_VARIABLE
+
+// Condition variables (Win32 SleepConditionVariableCS semantics). cv_sleep
+// atomically releases the critical-section mutex `cs_mtx` (held by caller_tid),
+// blocks on `cv` until woken (or timeout), then RE-ACQUIRES `cs_mtx` before
+// returning (unconditionally, as Windows does). Returns WG_WAIT_OBJECT_0 (woken)
+// or WG_WAIT_TIMEOUT. cv_wake wakes one (all=false) or all (all=true) waiters.
+uint32_t wg_sync_cv_sleep(uint32_t cv, uint32_t cs_mtx, uint32_t timeout_ms, uint32_t caller_tid);
+void     wg_sync_cv_wake(uint32_t cv, bool wake_all);
 
 // Signalling.
 bool wg_sync_set_event(uint32_t h);

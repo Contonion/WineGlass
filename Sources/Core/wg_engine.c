@@ -143,6 +143,20 @@ static uint32_t wg_cs_mutex_for(uint32_t cs_ptr) {
     }
     return 0;
 }
+// Same idea for guest CONDITION_VARIABLE pointers -> a wg_sync CV handle.
+static struct { uint32_t cv_ptr; uint32_t cvh; } s_cv_map[WG_MAX_CS];
+static int s_cv_count = 0;
+static uint32_t wg_cv_handle_for(uint32_t cv_ptr) {
+    for (int i = 0; i < s_cv_count; i++) if (s_cv_map[i].cv_ptr == cv_ptr) return s_cv_map[i].cvh;
+    if (s_cv_count < WG_MAX_CS) {
+        uint32_t h = wg_sync_create_cv();
+        s_cv_map[s_cv_count].cv_ptr = cv_ptr;
+        s_cv_map[s_cv_count].cvh = h;
+        s_cv_count++;
+        return h;
+    }
+    return 0;
+}
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
 // plugins temp dir when a stale one survives from a prior run).
@@ -1733,7 +1747,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (strcmp(entry->func_name, quiet_funcs[i]) == 0) { quiet = true; break; }
         }
         if (!quiet) {
-            uint32_t cur_tid = wg_sched_current_tid(engine->scheduler);
+            uint32_t cur_tid = s_use_real_threads ? s_cur_guest_tid
+                                                  : wg_sched_current_tid(engine->scheduler);
             // Read first 3 args speculatively (safe — within the guest stack page)
             uint64_t peek_rsp = wg_blink_get_reg(engine->blink, 4);
             bool peek_32 = (engine->pe_image && !engine->pe_image->is_64bit);
@@ -4066,9 +4081,36 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (sw) return true;
                 ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258;
             }
+        } else if (s_use_real_threads &&
+                   (strcmp(fn, "AcquireSRWLockExclusive") == 0 ||
+                    strcmp(fn, "AcquireSRWLockShared") == 0)) {
+            uint32_t m = wg_cs_mutex_for(args[0]);   // SRW lock ptr -> shared mutex
+            if (m) { wg_thunk_block_begin(); wg_sync_wait_single(m, WG_SYNC_INFINITE, s_cur_guest_tid); wg_thunk_block_end(); }
+            ret_val = 0;
+        } else if (s_use_real_threads &&
+                   (strcmp(fn, "ReleaseSRWLockExclusive") == 0 ||
+                    strcmp(fn, "ReleaseSRWLockShared") == 0)) {
+            uint32_t m = wg_cs_mutex_for(args[0]);
+            if (m) wg_sync_release_mutex(m, s_cur_guest_tid);
+            ret_val = 0;
+        } else if (s_use_real_threads &&
+                   (strcmp(fn, "TryAcquireSRWLockExclusive") == 0 ||
+                    strcmp(fn, "TryAcquireSRWLockShared") == 0)) {
+            uint32_t m = wg_cs_mutex_for(args[0]);
+            uint32_t r = m ? wg_sync_wait_single(m, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
+            ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
+        } else if (s_use_real_threads && strcmp(fn, "InitializeSRWLock") == 0) {
+            ret_val = 0;   // wg_sync mutex lazily created on first Acquire
         } else if (strcmp(fn, "InitializeConditionVariable") == 0) {
+            if (s_use_real_threads) { wg_cv_handle_for(args[0]); ret_val = 0; }
+            else {
             uint32_t *g = cv_slot(args[0]);
             if (g) *g = 0;
+            ret_val = 0;
+            }
+        } else if ((strcmp(fn, "WakeConditionVariable") == 0 ||
+                    strcmp(fn, "WakeAllConditionVariable") == 0) && s_use_real_threads) {
+            wg_sync_cv_wake(wg_cv_handle_for(args[0]), strcmp(fn, "WakeAllConditionVariable") == 0);
             ret_val = 0;
         } else if (strcmp(fn, "WakeConditionVariable") == 0 ||
                    strcmp(fn, "WakeAllConditionVariable") == 0) {
@@ -4079,6 +4121,18 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (g) (*g)++;
             wg_sched_wake(engine->scheduler, cv);
             ret_val = 0;
+        } else if ((strcmp(fn, "SleepConditionVariableCS") == 0 ||
+                    strcmp(fn, "SleepConditionVariableSRW") == 0) && s_use_real_threads) {
+            // Real-threads: atomically release the CS/SRW mutex, block on the CV,
+            // re-acquire. Returns TRUE if woken, FALSE (0) on timeout (Steam
+            // re-checks its work-queue predicate either way).
+            uint32_t cvh = wg_cv_handle_for(args[0]);
+            uint32_t csm = wg_cs_mutex_for(args[1]);   // CS or SRW pointer -> its mutex
+            uint32_t ms  = args[2];
+            wg_thunk_block_begin();
+            uint32_t r = wg_sync_cv_sleep(cvh, csm, ms, s_cur_guest_tid);
+            wg_thunk_block_end();
+            ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
         } else if (strcmp(fn, "SleepConditionVariableCS") == 0 ||
                    strcmp(fn, "SleepConditionVariableSRW") == 0) {
             // SleepConditionVariableCS(cv, cs, dwMs[, flags]). The old stub returned
