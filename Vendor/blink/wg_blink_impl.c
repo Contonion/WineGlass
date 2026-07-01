@@ -31,14 +31,19 @@ struct WGBlinkVM {
 };
 
 // Real-threads rearchitecture: each guest thread runs its OWN blink Machine on
-// its own pthread, all sharing one System (guest memory). blink already keeps
-// the current Machine in the thread-local g_machine. So every per-thread
-// accessor routes through the CALLING thread's Machine via cur_m(): the main
-// engine thread has g_machine == vm->m (identical to the old behavior), and a
-// worker pthread has g_machine == its own Machine. Falls back to vm->m if a
-// caller runs before g_machine is seeded (setup on the main thread).
+// its own pthread, all sharing one System (guest memory). We keep blink built
+// with DISABLE_THREADS (its SMP pagelocks deadlock our manual per-instruction
+// stepping; and blink's g_machine is a plain global there). blink's interpreter
+// hot path uses the `m` we PASS (not g_machine — verified: memory.c has zero
+// g_machine reads), so we track the current thread's Machine in OUR OWN real
+// TLS (`__thread`, which blink's `#define _Thread_local` macro does NOT touch)
+// and route every per-thread accessor through cur_m(). The main engine thread
+// gets wg_tls_m == vm->m (identical to the old behaviour); a worker pthread gets
+// its own. We also mirror into blink's global g_machine for the rare paths that
+// read it (diagnostics/FreeMachine/asserts).
+static __thread struct Machine *wg_tls_m = (struct Machine *)0;
 static inline struct Machine *cur_m(struct WGBlinkVM *vm) {
-    if (g_machine) return g_machine;
+    if (wg_tls_m) return wg_tls_m;
     return vm ? vm->m : (struct Machine *)0;
 }
 
@@ -73,7 +78,8 @@ static struct WGBlinkVM *create_vm_with_mode(struct XedMachineMode mode) {
 
     vm->m = NewMachine(vm->s, NULL);
     if (!vm->m) { FreeSystem(vm->s); free(vm); return NULL; }
-    g_machine = vm->m;   // seed the creating (main engine) thread's current Machine
+    wg_tls_m = vm->m;    // this (main engine) thread's current Machine (real TLS)
+    g_machine = vm->m;   // mirror into blink's global for its diagnostic paths
 
     if (mode.omode == XED_MODE_LONG) {
         // 64-bit: paging required, set up page tables
@@ -320,7 +326,8 @@ void *WGBlinkVM_NewThreadMachine(struct WGBlinkVM *vm) {
 // the worker pthread, before any wg_blink_* accessor (they route via g_machine).
 void WGBlinkVM_AdoptMachine(void *mp) {
     struct Machine *m = (struct Machine *)mp;
-    g_machine = m;
+    wg_tls_m = m;        // this worker pthread's current Machine (real TLS)
+    g_machine = m;       // mirror into blink's global (racy but only diagnostics use it)
     if (m) m->thread = pthread_self();
 }
 
