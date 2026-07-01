@@ -991,6 +991,18 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     // Skip Steam's control/bookkeeping files (not CDN downloads).
     if (strstr(name, ".writable") || strstr(name, ".installed") ||
         strstr(name, ".manifest") || strstr(name, "metrics")) return false;
+
+    // Most package names end in "_<size>" — use it to verify. If the file is
+    // already present at the right size, we're done (don't re-download). This
+    // also lets us replace a wrong-size leftover from a prior reactor attempt.
+    long expected = -1;
+    const char *us = strrchr(name, '_');
+    if (us && us[1]) { char *end = NULL; long v = strtol(us + 1, &end, 10);
+                       if (end && *end == '\0') expected = v; }
+    struct stat pst;
+    if (stat(hostpath, &pst) == 0 && (expected < 0 || pst.st_size == expected))
+        return true; // already downloaded (and correct size, if known)
+
     // Guard: if WGNativeDownload.m isn't in the build, the weak symbol is NULL —
     // calling it would jump to 0x0 (hard crash). Fall back to the reactor instead.
     if (!wg_native_download) {
@@ -1000,8 +1012,13 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     }
     char url[600];
     snprintf(url, sizeof(url), "https://cdn.steamstatic.com/client/%s", name);
-    WG_LOGW(TAG, "Native package fetch START: %s", name);
+    WG_LOGW(TAG, "Native package fetch START: %s (expect %ld bytes)", name, expected);
     bool ok = wg_native_download(url, hostpath) != 0;
+    if (ok && expected >= 0 && stat(hostpath, &pst) == 0 && pst.st_size != expected) {
+        WG_LOGW(TAG, "Native package fetch SIZE MISMATCH (%lld != %ld): %s",
+                (long long)pst.st_size, expected, name);
+        ok = false;
+    }
     WG_LOGW(TAG, "Native package fetch %s: %s", ok ? "OK" : "FAILED", name);
     return ok;
 }
@@ -4784,11 +4801,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             const char *real = wg_files_map_path(args[0], engine->blink, apath, sizeof(apath));
             if (real) {
                 struct stat st;
-                // If Steam is checking for a client package that's missing, fetch
-                // it natively so it finds it present and skips its own (flaky)
-                // reactor download.
-                if (stat(real, &st) != 0)
-                    wg_try_native_package_fetch(real);
+                // If Steam is checking for a client package that's missing (or a
+                // wrong-size leftover), fetch it natively so it finds it present and
+                // skips its own (flaky) reactor download. No-op for non-packages and
+                // for packages already present at the correct size.
+                wg_try_native_package_fetch(real);
                 if (stat(real, &st) == 0) {
                     ret_val = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
                 } else {
