@@ -1664,11 +1664,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (s_use_real_threads && s_watch_armed && rip == s_watch_addr) {
         uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
         uint32_t sub = 0; wg_blink_read_mem(engine->blink, esi + 0x7c, &sub, 4);
+        uint32_t ver = 0;
         if (sub) {
-            uint32_t ver = 0;
             wg_blink_read_mem(engine->blink, sub + 0x2ac, &ver, 4);
             if (ver > 0x303) { uint32_t v12 = 0x303; wg_blink_write_mem(engine->blink, sub + 0x2ac, &v12, 4); }
         }
+        if (s_watch_count < 6)
+            WG_LOGW(TAG, "*** [realthr] s_watch FIRED tid=0x%X esi=0x%X sub=0x%X max_ver 0x%X->0x303",
+                    s_cur_guest_tid, esi, sub, ver);
+        s_watch_count++;
         wg_blink_write_mem(engine->blink, s_watch_addr, &s_watch_orig, 1);
         wg_blink_set_rip(engine->blink, s_watch_addr);
         wg_blink_step(engine->blink);
@@ -6620,7 +6624,10 @@ bool wg_engine_run(WGEngine *engine) {
                 uint8_t hlt = 0xF4;
                 wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
                 s_watch_armed = true;
-                WG_LOGI(TAG, "Armed cipher-list max_ver trap @0x%X", s_watch_addr);
+                WG_LOGW(TAG, "Armed cipher-list max_ver trap @0x%X (orig=0x%02X)",
+                        s_watch_addr, s_watch_orig);
+            } else if (!s_watch_armed) {
+                WG_LOGE(TAG, "s_watch ARM FAILED: cannot read 0x%X", s_watch_addr);
             }
         }
         s_tls_setup_done = true;
