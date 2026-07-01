@@ -59,4 +59,12 @@ bool wg_blink_read_mem(WGBlinkInstance *inst, uint64_t addr,
 bool wg_blink_has_jit(void);
 const char *wg_blink_version(void);
 
+// Real-threads support: a blink Machine per guest thread over the shared System.
+// wg_blink_new_thread_machine() is called on the parent thread; the spawned
+// pthread calls wg_blink_adopt_machine() to make it current, then seeds regs via
+// the normal wg_blink_set_* accessors and drives its own wg_blink_run loop.
+void *wg_blink_new_thread_machine(WGBlinkInstance *inst);
+void  wg_blink_adopt_machine(void *machine);
+void  wg_blink_free_thread_machine(void *machine);
+
 #endif

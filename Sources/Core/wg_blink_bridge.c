@@ -31,6 +31,9 @@ extern void WGBlinkVM_SetFsBase(WGBlinkVM *vm, unsigned long long base);
 extern void WGBlinkVM_SetGsBase(WGBlinkVM *vm, unsigned long long base);
 extern int WGBlinkVM_GetStopReason(WGBlinkVM *vm);
 extern unsigned long long WGBlinkVM_GetFaultAddr(WGBlinkVM *vm);
+extern void *WGBlinkVM_NewThreadMachine(WGBlinkVM *vm);
+extern void WGBlinkVM_AdoptMachine(void *m);
+extern void WGBlinkVM_FreeThreadMachine(void *m);
 
 // From wg_blink_stubs.c — our Abort() override recovery point
 extern void wg_blink_set_abort_recovery(sigjmp_buf *buf);
@@ -258,3 +261,13 @@ bool wg_blink_has_jit(void) {
 const char *wg_blink_version(void) {
     return "blink x86-64 emulator (ARM64 JIT via MAP_JIT)";
 }
+
+// ── Real-threads support ─────────────────────────────────────────────────────
+// Create a Machine sharing this instance's System (guest memory). The engine
+// spawns a pthread that adopts it and drives its own blink loop.
+void *wg_blink_new_thread_machine(WGBlinkInstance *inst) {
+    return (inst && inst->vm) ? WGBlinkVM_NewThreadMachine(inst->vm) : NULL;
+}
+// Make Machine `m` the calling pthread's current Machine (call on the worker).
+void wg_blink_adopt_machine(void *m) { WGBlinkVM_AdoptMachine(m); }
+void wg_blink_free_thread_machine(void *m) { WGBlinkVM_FreeThreadMachine(m); }

@@ -293,3 +293,37 @@ int WGBlinkVM_ReadMem(struct WGBlinkVM *vm, unsigned long long addr,
     CopyFromUser(cur_m(vm), buf, addr, len);
     return 1;
 }
+
+// ── Real-threads support: a Machine per guest thread, shared System ──────────
+//
+// Each guest CreateThread/_beginthreadex maps to a real pthread running its own
+// blink Machine over the SAME System (shared guest memory + page tables). The
+// engine's worker-pthread entry calls NewThreadMachine on the parent thread,
+// then (on the new pthread) AdoptMachine to make it current, seeds regs via the
+// normal wg_blink_set_* accessors (which route through g_machine), and drives it.
+
+// Create a Machine sharing vm's System. NewMachine memcpy's the parent (so it
+// inherits fs/gs base, cr3 via System, etc.) but resets its mode to the System
+// mode (LONG); restore the parent's actual decode mode (LEGACY_32 for a 32-bit
+// guest). Returns an opaque Machine* (NULL on failure). Caller reseeds regs/rip.
+void *WGBlinkVM_NewThreadMachine(struct WGBlinkVM *vm) {
+    if (!vm || !vm->s || !vm->m) return (void *)0;
+    struct Machine *m = NewMachine(vm->s, vm->m);
+    if (!m) return (void *)0;
+    m->mode = vm->m->mode;   // match the main Machine's 32/64-bit decode mode
+    m->ip = 0;
+    m->canhalt = false;
+    return m;
+}
+
+// Make Machine `mp` the calling pthread's current Machine. Call this FIRST on
+// the worker pthread, before any wg_blink_* accessor (they route via g_machine).
+void WGBlinkVM_AdoptMachine(void *mp) {
+    struct Machine *m = (struct Machine *)mp;
+    g_machine = m;
+    if (m) m->thread = pthread_self();
+}
+
+void WGBlinkVM_FreeThreadMachine(void *mp) {
+    if (mp) FreeMachine((struct Machine *)mp);
+}
