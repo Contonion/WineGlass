@@ -1623,6 +1623,26 @@ static void wg_dump_threads(WGEngine *engine, const char *why) {
 static bool handle_blink_thunk(WGEngine *engine) {
     uint64_t rip = wg_blink_get_rip(engine->blink);
 
+    // Real-threads: handle the FUNCTIONAL cipher-list max_ver trap here (not just
+    // in the main tick) because the ClientHello is built on whichever thread runs
+    // the SSL — often a worker. Without it the cipher list is empty -> NO_CIPHERS
+    // -> BoringSSL sends a fatal internal_error alert instead of a ClientHello.
+    // (Cooperative mode keeps handling it in the tick.)
+    if (s_use_real_threads && s_watch_armed && rip == s_watch_addr) {
+        uint32_t esi = (uint32_t)wg_blink_get_reg(engine->blink, 6);
+        uint32_t sub = 0; wg_blink_read_mem(engine->blink, esi + 0x7c, &sub, 4);
+        if (sub) {
+            uint32_t ver = 0;
+            wg_blink_read_mem(engine->blink, sub + 0x2ac, &ver, 4);
+            if (ver > 0x303) { uint32_t v12 = 0x303; wg_blink_write_mem(engine->blink, sub + 0x2ac, &v12, 4); }
+        }
+        wg_blink_write_mem(engine->blink, s_watch_addr, &s_watch_orig, 1);
+        wg_blink_set_rip(engine->blink, s_watch_addr);
+        wg_blink_step(engine->blink);
+        uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
+        return true;
+    }
+
     // Check both 32-bit (0xC00000) and 64-bit (0xDEAD0000) thunk ranges
     bool in_thunk_range = false;
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
@@ -6452,11 +6472,6 @@ bool wg_engine_run(WGEngine *engine) {
             WG_LOGI(TAG, "Armed ERR_error_string_n trap @0x%X (orig=0x%02X)",
                     s_errstr_bp, s_errstr_orig);
         }
-        if (wg_blink_read_mem(engine->blink, s_watch_addr, &s_watch_orig, 1)) {
-            uint8_t hlt = 0xF4;
-            wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
-            s_watch_armed = true;
-        }
         if (wg_blink_read_mem(engine->blink, s_cloop_addr, &s_cloop_orig, 1)) {
             uint8_t hlt = 0xF4;
             wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
@@ -6547,6 +6562,19 @@ bool wg_engine_run(WGEngine *engine) {
             // real TLS connection to the real CDN, so accept it. (mov eax,1; ret)
             wg_blink_write_mem(engine->blink, 0x4611E0, verify_ok, sizeof(verify_ok));
             WG_LOGI(TAG, "Patched TLS strings + cert + manifest verify");
+            // s_watch (cipher_list_to_bytes max_ver force) is FUNCTIONAL, not
+            // diagnostic: without it the cipher list is empty -> NO_CIPHERS ->
+            // BoringSSL sends a fatal internal_error alert instead of a
+            // ClientHello (seen on device real-threads). Arm it in BOTH modes.
+            // In real-threads it's handled in handle_blink_thunk (runs on the
+            // worker that builds the ClientHello); in cooperative, in the tick.
+            if (!s_watch_armed &&
+                wg_blink_read_mem(engine->blink, s_watch_addr, &s_watch_orig, 1)) {
+                uint8_t hlt = 0xF4;
+                wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
+                s_watch_armed = true;
+                WG_LOGI(TAG, "Armed cipher-list max_ver trap @0x%X", s_watch_addr);
+            }
         }
         s_tls_setup_done = true;
     }
