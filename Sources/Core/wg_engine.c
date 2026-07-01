@@ -1125,6 +1125,28 @@ static bool wg_try_native_package_fetch(const char *hostpath) {
     return ok;
 }
 
+// Steam opens C:\package\steam_client_win32.manifest for READ (a cache) BEFORE
+// downloading the manifest over the reactor. The reactor download hits the
+// GET-queue race (full handshake never queues the GET -> "http error 0" ->
+// "needs to be online"). So native-fetch the manifest to that cache file when
+// Steam looks for it; Steam then reads a valid manifest (signature accepted via
+// the 0x4611E0 patch) and may skip the flaky reactor download. URL is
+// /client/steam_client_win32 (same as the reactor would fetch).
+static bool wg_try_native_manifest_fetch(const char *hostpath) {
+    const char *base = strrchr(hostpath, '/');
+    base = base ? base + 1 : hostpath;
+    if (strcmp(base, "steam_client_win32.manifest") != 0) return false;
+    struct stat st;
+    if (stat(hostpath, &st) == 0 && st.st_size > 0) return true; // already fetched
+    WG_LOGW(TAG, "Native manifest fetch START -> %s", base);
+    bool ok = wg_native_download("https://cdn.steamstatic.com/client/steam_client_win32",
+                                 hostpath) != 0;
+    if (ok && stat(hostpath, &st) == 0 && st.st_size == 0) ok = false;
+    WG_LOGW(TAG, "Native manifest fetch %s (%lld bytes)", ok ? "OK" : "FAILED",
+            (stat(hostpath, &st) == 0) ? (long long)st.st_size : -1);
+    return ok;
+}
+
 static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
@@ -4845,6 +4867,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     apath[i] = wpath[i] < 128 ? (char)wpath[i] : '_';
             }
             const char *real = wg_files_map_path(args[0], engine->blink, apath, sizeof(apath));
+            // Bypass the reactor manifest download (GET-queue race): when Steam
+            // opens steam_client_win32.manifest for read, native-fetch it first so
+            // the open below finds a valid cached manifest.
+            if (real && strstr(apath, "steam_client_win32.manifest"))
+                wg_try_native_manifest_fetch(real);
             if (real) {
                 ret_val = wg_files_create(real, args[1], args[4]);
             } else {
