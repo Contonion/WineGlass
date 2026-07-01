@@ -55,11 +55,17 @@ static bool s_backstop_enabled = true;  // iOS device: RE-ENABLED. It drives the
                                         // backstop only needs to carry the manifest.
                                         // Verified on the Mac device-sim (real timeouts
                                         // + backstop): manifest 3/3 vs 0/3 without it.
-static bool s_real_timeouts   = true;   // iOS device: fire finite waits on a real
-                                        // wall-clock deadline (a wait whose signaller
-                                        // has exited — or on a never-signalling
-                                        // pseudo-handle — must time out or the reactor
-                                        // freezes)
+static bool s_real_timeouts   = false;  // iOS device: DISABLED. Data says real
+                                        // timeouts HURT reliability: they make Steam's
+                                        // pool workers time out on their 250ms job
+                                        // waits and EXIT prematurely -> "Illegal
+                                        // termination of worker thread" -> deadlock,
+                                        // instead of blocking until the backstop wakes
+                                        // them. With the backstop carrying coordination
+                                        // (and packages native-fetched), the legacy
+                                        // block-until-signalled path is far more
+                                        // reliable. Mac device-sim: manifest 4/5 with
+                                        // timeouts OFF vs 2/5 with them ON.
 #else
 static bool s_backstop_enabled = true;  // macOS harness: needs the crutch
 static bool s_real_timeouts   = false;  // macOS harness: legacy no-timeout path + the
@@ -3638,10 +3644,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // when the (handle,signalled) pair is new vs the last TWO seen, and
             // hard-cap repeats at 1/1024 so a steady poll can't flood the buffer.
             static uint32_t s_wfso_h1 = ~0u, s_wfso_h2 = ~0u; static int s_wfso_s1 = -1, s_wfso_s2 = -1;
-            static uint32_t s_wfso_rl = 0;
             int si = (int)signalled;
             bool seen = (h == s_wfso_h1 && si == s_wfso_s1) || (h == s_wfso_h2 && si == s_wfso_s2);
-            if (!seen || (s_wfso_rl++ & 0x3FF) == 0) {
+            // Log only NEW (handle,signalled) transitions vs the last two seen — a
+            // steady-state poll deadlock (e.g. 0x207/0xFFFFFFFF forever) then emits
+            // nothing at all. The Sleep-spin watchdog still fires periodically to
+            // show a loop is happening.
+            if (!seen) {
                 WG_LOGI(TAG, "WaitForSingleObject(h=0x%X, timeout=0x%X) signalled=%d thread_found=%d",
                         h, timeout, (int)signalled, (wt != NULL));
                 s_wfso_h2 = s_wfso_h1; s_wfso_s2 = s_wfso_s1; s_wfso_h1 = h; s_wfso_s1 = si;

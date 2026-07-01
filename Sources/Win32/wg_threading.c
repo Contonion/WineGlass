@@ -142,7 +142,9 @@ bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink) {
             // even a long spin adds only a trickle. First 64 always log.
             if (prev != idx) {
                 static uint32_t sw = 0; static int lg1 = -1, lg2 = -1;
-                if (sw < 64 || (idx != lg1 && idx != lg2) || (sw & 0x1FFF) == 0) {
+                // Log only the first 64 switches and NEW targets vs the last two —
+                // a steady-state N<->M ping-pong deadlock then emits nothing.
+                if (sw < 64 || (idx != lg1 && idx != lg2)) {
                     WG_LOGD(TAG, "Switched to thread %d (id=0x%X, rip=0x%X)",
                             idx, t->id, t->regs.rip);
                     lg2 = lg1; lg1 = idx;
