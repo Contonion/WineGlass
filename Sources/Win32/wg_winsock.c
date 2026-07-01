@@ -453,6 +453,18 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
                     .events = (short)(si == 0 ? POLLIN : si == 1 ? POLLOUT : POLLPRI),
                     .revents = 0 };
                 poll(&pfd, 1, 0);
+                // STALL DIAG: when a readfds socket polls NOT-readable, check the
+                // OS receive queue. FIONREAD>0 here means the kernel HAS data our
+                // poll isn't surfacing (engine bug); FIONREAD==0 means the peer
+                // genuinely sent nothing (dead/idle connection). Rate-limited.
+                if (si == 0 && !(pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                    static int dn = 0;
+                    if ((dn++ % 20000) == 0) {
+                        int navail = -1; ioctl(fd, FIONREAD, &navail);
+                        WG_LOGW(TAG, "select STALL DIAG: fd=%d not-readable revents=0x%x FIONREAD=%d",
+                                fd, pfd.revents, navail);
+                    }
+                }
                 bool rdy = (si == 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) ||
                            (si == 1 && (pfd.revents & POLLOUT)) ||
                            (si == 2 && (pfd.revents & (POLLPRI | POLLERR)));
