@@ -1580,8 +1580,15 @@ static bool handle_blink_thunk(WGEngine *engine) {
             "HeapAlloc", "HeapFree", "HeapSize", "HeapReAlloc",
             "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue",
             "EnterCriticalSection", "LeaveCriticalSection",
+            "TryEnterCriticalSection",
             "TranslateMessage", "DispatchMessageW", "GetMessageW",
             "GetCurrentThreadId",
+            // Winsock poll-loop ordinals: select(18), __WSAFDIsSet(151),
+            // recv(16), setsockopt(21), htonl(8)/htons(9)/ntohl(14). These fire
+            // per-iteration during downloads and bury the actual recv/save trace.
+            // recv still logs its own "[WSock] recv(...) -> N bytes" line.
+            "Ordinal_18", "Ordinal_151", "Ordinal_16", "Ordinal_21",
+            "Ordinal_8", "Ordinal_9", "Ordinal_14",
             NULL
         };
         bool quiet = false;
@@ -3565,12 +3572,18 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Check if it's a thread handle that has exited
             WGThread *wt = wg_sched_find(engine->scheduler, h);
             if (wt && wt->state == WG_THREAD_EXITED) signalled = true;
-            // Dedup the poll spam: only log when handle or signalled state changes.
-            static uint32_t s_wfso_last_h = 0xFFFFFFFFu; static int s_wfso_last_sig = -1;
-            if (h != s_wfso_last_h || (int)signalled != s_wfso_last_sig) {
+            // Poll-loop dedup: workers alternate two handles (e.g. 0x20C/0x207) at
+            // a fixed timeout, which defeats a plain consecutive-dedup. Log only
+            // when the (handle,signalled) pair is new vs the last TWO seen, and
+            // hard-cap repeats at 1/1024 so a steady poll can't flood the buffer.
+            static uint32_t s_wfso_h1 = ~0u, s_wfso_h2 = ~0u; static int s_wfso_s1 = -1, s_wfso_s2 = -1;
+            static uint32_t s_wfso_rl = 0;
+            int si = (int)signalled;
+            bool seen = (h == s_wfso_h1 && si == s_wfso_s1) || (h == s_wfso_h2 && si == s_wfso_s2);
+            if (!seen || (s_wfso_rl++ & 0x3FF) == 0) {
                 WG_LOGI(TAG, "WaitForSingleObject(h=0x%X, timeout=0x%X) signalled=%d thread_found=%d",
                         h, timeout, (int)signalled, (wt != NULL));
-                s_wfso_last_h = h; s_wfso_last_sig = (int)signalled;
+                s_wfso_h2 = s_wfso_h1; s_wfso_s2 = s_wfso_s1; s_wfso_h1 = h; s_wfso_s1 = si;
             }
             WGThread *cur = wg_sched_current(engine->scheduler);
             if (signalled) {
