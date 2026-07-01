@@ -5100,7 +5100,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     // return 0 once the real wall-clock deadline passes, so the loop
                     // paces like real hardware (matching the slow-interpreter Mac path
                     // that does get Steam through). NULL timeval = block until ready.
-                    if (s_real_timeouts && strcmp(ws_fn, "select") == 0) {
+                    // Only PACE the MAIN thread's (tid=1) select loop. Its
+                    // message-pump busy-spin was what stalled the reactor and
+                    // pacing it is what let the state machine advance to spawn the
+                    // request-sender. Worker threads (the download workers) must
+                    // recv as fast as possible — pacing their select loop throttles
+                    // transfers enough to intermittently trip Steam's own download
+                    // timeout (empty buffer -> "http error 0"). So workers keep the
+                    // instant-select behaviour.
+                    if (s_real_timeouts && strcmp(ws_fn, "select") == 0 &&
+                        wg_sched_current_tid(engine->scheduler) == 1) {
                         WGThread *scur = wg_sched_current(engine->scheduler);
                         if (ws_ret != 0) {
                             if (scur && scur->wait_handle == WG_SELECT_WAIT) scur->wait_handle = 0;
