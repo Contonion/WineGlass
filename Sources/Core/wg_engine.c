@@ -6197,10 +6197,19 @@ void wg_engine_tick(WGEngine *engine) {
                                     cur->wait_handle, chain);
                         }
                         wg_dump_threads(engine, "thread-return");
-                        wg_sched_exit_thread(engine->scheduler, engine->blink, eax);
+                        // Wake any joiners FIRST (threads WaitForSingleObject-ing this
+                        // thread's handle) so they're READY before we switch. Then
+                        // exit_thread marks this thread EXITED and ALREADY switches to
+                        // the next runnable thread (restoring its regs). Do NOT call
+                        // switch_next again afterward: the thread it switched to is now
+                        // RUNNING (not READY), so a second switch_next would find
+                        // nothing and we'd wrongly declare "program exited" — killing
+                        // the process whenever a worker returns while another thread is
+                        // still alive (this froze the reactor test + likely Steam).
                         wg_sched_wake(engine->scheduler, cur->handle);
-                        if (wg_sched_switch_next(engine->scheduler, engine->blink))
-                            break;
+                        wg_sched_exit_thread(engine->scheduler, engine->blink, eax);
+                        if (wg_sched_current(engine->scheduler))
+                            break; // a runnable thread is now active — keep going
                     }
                     WG_LOGI(TAG, "Program exited normally after %llu ticks",
                             (unsigned long long)engine->tick_count);
