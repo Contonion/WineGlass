@@ -438,6 +438,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         // set. (Old stub returned 1 without marking which fd -> infinite re-select.)
         uint32_t set_ptrs[3] = { args[1], args[2], args[3] }; // read, write, except
         int total = 0;
+        int s_rdy_dbg[3] = {0,0,0};
         for (int si = 0; si < 3; si++) {
             if (!set_ptrs[si]) continue;
             uint32_t fd_count = 0;
@@ -465,19 +466,41 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
                                 fd, pfd.revents, navail);
                     }
                 }
+                // Windows exceptfds fires ONLY for OOB/urgent data or a failed
+                // connect — NOT for a normal readable/writable or half-closed
+                // socket. macOS poll() raises POLLPRI *alongside* POLLHUP when the
+                // peer closes (revents=0x12), which is NOT out-of-band data; a
+                // plain FIN belongs in readfds (FD_CLOSE), not exceptfds. So only
+                // mark except-ready for real OOB (POLLPRI without POLLHUP) or a
+                // genuine SO_ERROR. Reporting a closing socket in exceptfds made
+                // Steam's download select-loop treat the connection as failed and
+                // tear it down the instant the server's response (or alert) arrived.
+                bool except_rdy = false;
+                if (si == 2) {
+                    if ((pfd.revents & POLLPRI) && !(pfd.revents & POLLHUP)) {
+                        except_rdy = true; // genuine OOB
+                    } else if (pfd.revents & POLLERR) {
+                        int soerr = 0; socklen_t sl = sizeof(soerr);
+                        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr)
+                            except_rdy = true;
+                    }
+                }
                 bool rdy = (si == 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) ||
                            (si == 1 && (pfd.revents & POLLOUT)) ||
-                           (si == 2 && (pfd.revents & (POLLPRI | POLLERR)));
+                           (si == 2 && except_rdy);
                 if (rdy) ready[rc++] = arr[i];
             }
             wg_blink_write_mem(blink, set_ptrs[si], &rc, 4);
             if (rc) wg_blink_write_mem(blink, set_ptrs[si] + 4, ready, rc * 4);
+            s_rdy_dbg[si] = (int)rc;
             total += (int)rc;
         }
         // Dedup: only log when the ready-count changes — a spinning select loop
         // otherwise floods the ring buffer and scrolls off real activity.
         { static int s_last_total = -1;
-          if (total != s_last_total) { WG_LOGD(TAG, "select -> %d ready", total); s_last_total = total; } }
+          if (total != s_last_total) { WG_LOGD(TAG, "select -> %d ready (r=%d w=%d e=%d)",
+                                               total, s_rdy_dbg[0], s_rdy_dbg[1], s_rdy_dbg[2]);
+                                       s_last_total = total; } }
         *out_ret = (uint32_t)total;
         return true;
     }

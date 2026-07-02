@@ -1714,6 +1714,36 @@ static bool handle_blink_thunk(WGEngine *engine) {
         return true;
     }
 
+    // Real-threads: cap the SSL_CTX max_proto_version at SSL_CTX_set_cipher_list
+    // (0x69B720, arg1=ctx). WITHOUT this the ClientHello's supported_versions ext
+    // (and key_share) still advertise TLS1.3 (0x0304) even though s_watch clamps
+    // the CIPHER list to TLS1.2 — an inconsistent hello (offers only a TLS1.2
+    // suite yet invites TLS1.3) that the CDN rejects with a fatal handshake_failure
+    // (proven by replaying the exact bytes to cdn.steamstatic.com). Capping
+    // ctx+0xb8 -> 0x303 makes the whole hello consistently TLS1.2. Cooperative
+    // mode already does this in the tick; real-threads (device default) skipped it,
+    // which is why the manifest handshake never completed. (esp+8 = the ctx arg.)
+    if (s_use_real_threads && s_cloop_armed && rip == s_cloop_addr) {
+        uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+        uint32_t a1 = 0; wg_blink_read_mem(engine->blink, esp + 4, &a1, 4);
+        if (a1) {
+            uint32_t maxv = 0;
+            wg_blink_read_mem(engine->blink, a1 + 0xb8, &maxv, 4);
+            if (maxv == 0 || maxv > 0x303) {
+                uint32_t v12 = 0x303;
+                wg_blink_write_mem(engine->blink, a1 + 0xb8, &v12, 4);
+                if (s_cloop_count < 6)
+                    WG_LOGW(TAG, "*** [realthr] capped ctx=0x%X max_proto_version 0x%X -> 0x303", a1, maxv);
+            }
+        }
+        s_cloop_count++;
+        wg_blink_write_mem(engine->blink, s_cloop_addr, &s_cloop_orig, 1);
+        wg_blink_set_rip(engine->blink, s_cloop_addr);
+        wg_blink_step(engine->blink);
+        uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
+        return true;
+    }
+
     // Check both 32-bit (0xC00000) and 64-bit (0xDEAD0000) thunk ranges
     bool in_thunk_range = false;
     if (rip >= 0xC00000ULL && rip < 0xC00000ULL + 0x20000) in_thunk_range = true;
@@ -1821,6 +1851,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // produces multi-GB logs over a 200s run. Safe to silence.
             "HeapAlloc", "HeapFree", "HeapSize", "HeapReAlloc",
             "GetLastError", "SetLastError", "TlsGetValue", "TlsSetValue",
+            "FlsGetValue", "FlsSetValue", // download-completion poll spins on these
             "EnterCriticalSection", "LeaveCriticalSection",
             "TryEnterCriticalSection",
             "TranslateMessage", "DispatchMessageW", "GetMessageW",
@@ -6663,6 +6694,21 @@ bool wg_engine_run(WGEngine *engine) {
                         s_watch_addr, s_watch_orig);
             } else if (!s_watch_armed) {
                 WG_LOGE(TAG, "s_watch ARM FAILED: cannot read 0x%X", s_watch_addr);
+            }
+            // s_cloop (SSL_CTX_set_cipher_list) is ALSO functional in real-threads:
+            // it caps ctx max_proto_version so the ClientHello's supported_versions
+            // stops advertising TLS1.3. Cooperative arms it above (in the
+            // !s_use_real_threads block) and handles it in the tick; for real
+            // threads arm it here and handle it in handle_blink_thunk. Without this
+            // the hello is inconsistent (TLS1.2 cipher + TLS1.3 versions) and the
+            // CDN rejects it with fatal handshake_failure.
+            if (s_use_real_threads && !s_cloop_armed &&
+                wg_blink_read_mem(engine->blink, s_cloop_addr, &s_cloop_orig, 1)) {
+                uint8_t hlt = 0xF4;
+                wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
+                s_cloop_armed = true;
+                WG_LOGW(TAG, "Armed ctx max_proto_version cap @0x%X (orig=0x%02X)",
+                        s_cloop_addr, s_cloop_orig);
             }
         }
         s_tls_setup_done = true;
