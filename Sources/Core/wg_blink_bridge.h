@@ -49,11 +49,21 @@ uint64_t wg_blink_get_fault_addr(WGBlinkInstance *inst);
 void     wg_blink_set_fs_base(WGBlinkInstance *inst, uint64_t base);
 void     wg_blink_set_gs_base(WGBlinkInstance *inst, uint64_t base);
 
+// Full thread-context save/restore helpers (cooperative x86-64 switch).
+uint64_t wg_blink_get_flags(WGBlinkInstance *inst);
+void     wg_blink_set_flags(WGBlinkInstance *inst, uint64_t f);
+uint64_t wg_blink_get_fs_base(WGBlinkInstance *inst);
+uint64_t wg_blink_get_gs_base(WGBlinkInstance *inst);
+
 // Memory access
 bool wg_blink_write_mem(WGBlinkInstance *inst, uint64_t addr,
                          const void *buf, uint32_t len);
 bool wg_blink_read_mem(WGBlinkInstance *inst, uint64_t addr,
                         void *buf, uint32_t len);
+// Fast in-guest memcpy/memset (direct host page walk; no malloc). Return dst, or
+// 0 if a page was unmapped (caller should fall back).
+uint64_t wg_blink_mem_copy(WGBlinkInstance *inst, uint64_t dst, uint64_t src, uint64_t n);
+uint64_t wg_blink_mem_set(WGBlinkInstance *inst, uint64_t dst, int c, uint64_t n);
 
 // Info
 bool wg_blink_has_jit(void);
@@ -66,5 +76,11 @@ const char *wg_blink_version(void);
 void *wg_blink_new_thread_machine(WGBlinkInstance *inst);
 void  wg_blink_adopt_machine(void *machine);
 void  wg_blink_free_thread_machine(void *machine);
+
+// Force blink's JIT on (1) or off (0) before the first VM is created.
+void  wg_blink_force_jit(int on);
+// Standalone MAP_JIT capability probe (wg_jit_probe.c): returns 42 if the
+// device permits executing JIT code right now, negative on failure.
+int   wg_jit_smoke_test(void);
 
 #endif

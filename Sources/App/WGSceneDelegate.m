@@ -70,6 +70,23 @@ int wg_native_download(const char *url, const char *dest_path) {
     [self createMetalView];
     [self createMetalResources];
     [self createConsole];
+
+    // --- iOS device-JIT probe (MAP_JIT under the Xcode debugger) ------------
+    // Definitive, isolated on-device answer to "can we JIT here right now?".
+    // Must be Run from Xcode (debugger attached) for the get-task-allow +
+    // debugged state that permits MAP_JIT execution on iOS 26/27.
+    extern int wg_jit_smoke_test(void);
+    extern void wg_blink_force_jit(int on);
+    int wg_jit_ok = wg_jit_smoke_test();
+    if (wg_jit_ok == 42) {
+        WG_LOGI("JIT", "*** DEVICE-JIT SMOKE TEST: PASS *** MAP_JIT executes here — enabling blink JIT");
+        wg_blink_force_jit(1);
+    } else {
+        WG_LOGW("JIT", "*** DEVICE-JIT SMOKE TEST: FAIL (code %d) *** interpreter only "
+                       "(must Run from Xcode with the debugger attached)", wg_jit_ok);
+    }
+    // ------------------------------------------------------------------------
+
     [self createLoadButton];
     [self installTapHandler];
     [self.window makeKeyAndVisible];
@@ -99,12 +116,17 @@ int wg_native_download(const char *url, const char *dest_path) {
     WG_LOGI("App", "Window created: %.0fx%.0f", bounds.size.width, bounds.size.height);
 }
 
+// Registered with the D3D11->Metal backend so the guest's swapchain Present
+// blits onto the on-screen layer (see WGMetalBackend.m).
+extern void wg_gpu_set_present_layer(void *layer);
+
 - (void)createMetalResources {
     _device = self.metalView.metalLayer.device;
     if (!_device) {
         WG_LOGE("App", "No Metal device available");
         return;
     }
+    wg_gpu_set_present_layer((__bridge void *)self.metalView.metalLayer);
     _commandQueue = [_device newCommandQueue];
     _compositor = [[WGCompositor alloc] initWithDevice:_device];
     WG_LOGI("App", "Metal device: %s", _device.name.UTF8String);
@@ -320,14 +342,31 @@ int wg_native_download(const char *url, const char *dest_path) {
 }
 
 - (void)tryLoadBundledPE {
-    // Prefer a real .exe dropped in Documents (e.g. SteamSetup.exe). Fall back
-    // to the bundled GDI demo. (Diagnostic probes are still in the bundle and
-    // loadable via the file picker if needed.)
+    // Load order, most-specific first:
+    //   1. A packaged game (e.g. Visage) laid out in the standard bottle tree —
+    //      first under Documents (if the user copied one in), then the game
+    //      bundled INTO the app at <bundle>/GameData. Loads the launcher .exe,
+    //      which chain-loads its shipping .exe (engineLoop -> take_pending_exec).
+    //   2. Any .exe dropped at the top level of Documents (SteamSetup.exe etc.).
+    //   3. The bundled GDI demo.
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *docs = paths.firstObject;
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *files = [fm contentsOfDirectoryAtPath:docs error:nil];
 
+    NSString *game = [self findPackagedGameExeUnder:docs];
+    if (!game) {
+        // The game shipped inside the app bundle (folder reference "GameData").
+        NSString *bundleGame = [[NSBundle mainBundle].resourcePath
+                                stringByAppendingPathComponent:@"GameData"];
+        game = [self findPackagedGameExeUnder:bundleGame];
+    }
+    if (game) {
+        WG_LOGI("App", "Loading packaged game: %s", game.UTF8String);
+        [self loadAndRunPE:game];
+        return;
+    }
+
+    NSArray *files = [fm contentsOfDirectoryAtPath:docs error:nil];
     for (NSString *file in files) {
         if ([file.pathExtension.lowercaseString isEqualToString:@"exe"]) {
             NSString *path = [docs stringByAppendingPathComponent:file];
@@ -344,6 +383,58 @@ int wg_native_download(const char *url, const char *dest_path) {
         return;
     }
     WG_LOGI("App", "Tap 'Load .exe' to select a Windows executable");
+}
+
+// Locate a packaged game's entry .exe under Documents. Checks the standard
+// Steam/bottle layout at known relative paths first (fast, deterministic), then
+// falls back to a depth-limited search for the launcher or a *-Shipping.exe.
+// Returns the launcher when present (it sets up argv + chain-loads the shipping
+// exe); otherwise the shipping exe directly.
+- (NSString *)findPackagedGameExeUnder:(NSString *)docs {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // Common install roots the user might drop the game folder into.
+    NSArray<NSString *> *roots = @[
+        @"Bottle/drive_c/Program Files (x86)/Steam/steamapps/common/Visage",
+        @"drive_c/Program Files (x86)/Steam/steamapps/common/Visage",
+        @"steamapps/common/Visage",
+        @"Visage",
+        @"",
+    ];
+    // Relative to a game root: launcher first, then the UE4 shipping binary.
+    NSArray<NSString *> *rel = @[
+        @"Visage.exe",
+        @"Visage/Binaries/Win64/Visage-Win64-Shipping.exe",
+    ];
+    for (NSString *root in roots) {
+        NSString *base = root.length ? [docs stringByAppendingPathComponent:root] : docs;
+        for (NSString *r in rel) {
+            NSString *p = [base stringByAppendingPathComponent:r];
+            if ([fm fileExistsAtPath:p]) return p;
+        }
+    }
+    // Fallback: bounded breadth-first walk for the launcher or any shipping exe.
+    NSMutableArray<NSString *> *queue = [NSMutableArray arrayWithObject:docs];
+    NSString *shippingHit = nil;
+    int visited = 0;
+    while (queue.count && visited < 4000) {
+        NSString *dir = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        NSArray *entries = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *e in entries) {
+            visited++;
+            NSString *full = [dir stringByAppendingPathComponent:e];
+            BOOL isDir = NO;
+            [fm fileExistsAtPath:full isDirectory:&isDir];
+            if (isDir) {
+                [queue addObject:full];
+            } else if ([e.lowercaseString isEqualToString:@"visage.exe"]) {
+                return full; // launcher — best entry point
+            } else if ([e.lowercaseString hasSuffix:@"-shipping.exe"] && !shippingHit) {
+                shippingHit = full; // remember, but keep looking for the launcher
+            }
+        }
+    }
+    return shippingHit;
 }
 
 #pragma mark - Engine & Tests

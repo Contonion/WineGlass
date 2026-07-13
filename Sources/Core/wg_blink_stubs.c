@@ -5,7 +5,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <execinfo.h>
 
 // TerminateSignal is called when blink wants to kill the emulated process.
 // In standalone blink, this calls exit(). In library mode, we longjmp back
@@ -49,6 +51,11 @@ void wg_blink_set_abort_recovery(sigjmp_buf *buf) {
 
 void Abort(void) {
     fprintf(stderr, "[WineGlass] Blink Abort() called\n");
+    if (getenv("WG_ABORTBT")) {
+        void *bt[24];
+        int n = backtrace(bt, 24);
+        backtrace_symbols_fd(bt, n, 2);
+    }
     if (s_abort_recovery_active && s_abort_recovery) {
         s_abort_recovery_active = false;
         siglongjmp(*s_abort_recovery, 99);

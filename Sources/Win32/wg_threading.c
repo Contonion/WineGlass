@@ -24,17 +24,27 @@ void wg_sched_destroy(WGThreadScheduler *sched) {
     free(sched);
 }
 
+// Full x86-64 context. The old version saved only 8 GPRs as 32-bit with no flags
+// — fine for 32-bit apps, but for a 64-bit guest it dropped r8-r15, the high
+// dwords, and EFLAGS, so any switch mid-computation corrupted the resumed thread
+// (e.g. a lost r12 / stale ZF crashed a string-scan loop). Save/restore all 16
+// GPRs (64-bit), rip, flags, and both segment bases.
 static void save_regs(WGThreadRegs *regs, void *blink) {
-    for (int i = 0; i < 8; i++)
-        regs->gpr[i] = (uint32_t)wg_blink_get_reg(blink, i);
-    regs->rip = (uint32_t)wg_blink_get_rip(blink);
+    for (int i = 0; i < 16; i++)
+        regs->gpr[i] = wg_blink_get_reg(blink, i);
+    regs->rip     = wg_blink_get_rip(blink);
+    regs->flags   = wg_blink_get_flags(blink);
+    regs->fs_base = wg_blink_get_fs_base(blink);
+    regs->gs_base = wg_blink_get_gs_base(blink);
 }
 
 static void restore_regs(const WGThreadRegs *regs, void *blink) {
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
         wg_blink_set_reg(blink, i, regs->gpr[i]);
     wg_blink_set_rip(blink, regs->rip);
+    wg_blink_set_flags(blink, regs->flags);
     wg_blink_set_fs_base(blink, regs->fs_base);
+    wg_blink_set_gs_base(blink, regs->gs_base);
 }
 
 uint32_t wg_sched_create_thread(WGThreadScheduler *sched, void *blink,
@@ -153,6 +163,17 @@ bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink) {
             }
             return true;
         }
+    }
+    return false;
+}
+
+// True if some thread OTHER than the current one is READY to run. Used by the
+// cooperative preemptive time-slice so we don't do a wasteful self-switch when
+// the current thread is the only runnable one.
+bool wg_sched_other_ready(WGThreadScheduler *sched) {
+    for (int i = 0; i < WG_MAX_THREADS; i++) {
+        if (i != sched->current && sched->threads[i].state == WG_THREAD_READY)
+            return true;
     }
     return false;
 }

@@ -43,6 +43,7 @@ bool     wg_files_read(uint32_t handle, void *buf, uint32_t bytes, uint32_t *byt
 bool     wg_files_write(uint32_t handle, const void *buf, uint32_t bytes, uint32_t *bytes_written);
 uint32_t wg_files_get_size(uint32_t handle);
 uint32_t wg_files_set_pointer(uint32_t handle, int32_t distance, uint32_t method);
+uint64_t wg_files_set_pointer_64(uint32_t handle, int64_t offset, uint32_t method);
 bool     wg_files_close(uint32_t handle);
 
 void wg_files_prepopulate_nsis_data(const char *exe_path, const char *tmp_path);

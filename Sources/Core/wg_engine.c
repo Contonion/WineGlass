@@ -24,6 +24,7 @@ __attribute__((weak)) int wg_native_download(const char *url, const char *dest_p
 #include "wg_winsock.h"
 #include "wg_winhttp.h"
 #include "wg_schannel.h"
+#include "wg_d3d11.h"
 #include "wg_threading.h"
 #include "wg_sync.h"
 #include <pthread.h>
@@ -31,9 +32,11 @@ __attribute__((weak)) int wg_native_download(const char *url, const char *dest_p
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fnmatch.h>
 #include <time.h>
 #include <ctype.h>
 #include <TargetConditionals.h>
@@ -110,17 +113,178 @@ static void wg_thunk_lock_init(void) {
     pthread_mutexattr_destroy(&a);
     s_thunk_lock_inited = true;
 }
-static inline void wg_thunk_lock(void)   { if (s_use_real_threads) pthread_mutex_lock(&s_thunk_lock); }
-static inline void wg_thunk_unlock(void) { if (s_use_real_threads) pthread_mutex_unlock(&s_thunk_lock); }
-// Release the thunk lock around a blocking wait, then re-acquire. Returns the
-// recursion count released so it can be restored (recursive mutex).
-static inline void wg_thunk_block_begin(void) { if (s_use_real_threads) pthread_mutex_unlock(&s_thunk_lock); }
-static inline void wg_thunk_block_end(void)   { if (s_use_real_threads) pthread_mutex_lock(&s_thunk_lock); }
+// Fair (FIFO ticket) recursive GIL — WG_FAIR_GIL=1. The default pthread mutex is
+// unfair: a worker polling its work-event (WG_WAITCAP) can repeatedly re-grab the
+// GIL ahead of a just-resumed config thread, STARVING it so it never signals the
+// driver -> the thread-startup handshake deadlocks. A ticket lock hands the GIL out
+// in request order, so every thread (incl. the resumed config thread) runs. Recursion
+// is tracked because a handler can re-enter; block points hold it exactly once.
+static pthread_mutex_t s_fair_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_fair_c = PTHREAD_COND_INITIALIZER;
+static unsigned long   s_fair_next = 0, s_fair_serving = 0;
+static pthread_t       s_fair_owner; static int s_fair_owned = 0, s_fair_rec = 0;
+static signed char     s_fair_on = -1;
+static inline int wg_fair(void) { if (s_fair_on < 0) s_fair_on = getenv("WG_FAIR_GIL") ? 1 : 0; return s_fair_on; }
+static void fair_lock(void) {
+    pthread_mutex_lock(&s_fair_m);
+    if (s_fair_owned && pthread_equal(s_fair_owner, pthread_self())) { s_fair_rec++; pthread_mutex_unlock(&s_fair_m); return; }
+    unsigned long my = s_fair_next++;
+    while (s_fair_serving != my) pthread_cond_wait(&s_fair_c, &s_fair_m);
+    s_fair_owner = pthread_self(); s_fair_owned = 1; s_fair_rec = 1;
+    pthread_mutex_unlock(&s_fair_m);
+}
+static void fair_unlock(void) {
+    pthread_mutex_lock(&s_fair_m);
+    if (--s_fair_rec <= 0) { s_fair_rec = 0; s_fair_owned = 0; s_fair_serving++; pthread_cond_broadcast(&s_fair_c); }
+    pthread_mutex_unlock(&s_fair_m);
+}
 
 // The calling pthread's guest thread id (real-threads mode). Main engine thread
 // keeps 1; each worker sets its own in wg_worker_thread_entry. Used by
-// GetCurrentThreadId and as the caller_tid for wg_sync mutex ownership.
+// GetCurrentThreadId, as the caller_tid for wg_sync mutex ownership, and by the
+// directed GIL below.
 static _Thread_local uint32_t s_cur_guest_tid = 1;
+
+// ---- DIRECTED-HANDOFF GIL (WG_DIRECTED_GIL, default ON) ---------------------
+// The real fix for UE4's producer-consumer lost-wakeup chain. A plain/fair GIL
+// releases to whichever thread the OS schedules next -> nondeterministic, so a
+// handshake occasionally drops a wake and the whole task-graph parks. Instead,
+// when a thread BLOCKS on a wait (WFSO on event E), we hand the GIL to the thread
+// that will SIGNAL E -- the "producer", learned from SetEvent history. That makes
+// the handshake deterministic and Windows-ordered: the producer runs next, sets
+// the event, and the waiter wakes. Recursion tracked (handlers re-enter; block
+// points hold it exactly once). Fallback: if the preferred thread doesn't take the
+// GIL (it's itself blocked), waiters drop the preference after a few ms so no
+// deadlock. WG_NO_DIRECTED_GIL disables.
+static pthread_mutex_t s_dir_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_dir_c = PTHREAD_COND_INITIALIZER;
+static pthread_t s_dir_owner; static int s_dir_owned = 0, s_dir_rec = 0;
+static uint32_t s_dir_prefer = 0;     // guest tid to hand the GIL to next (0 = free)
+static int      s_dir_stall  = 0;     // consecutive acquire-timeouts blocked by prefer
+static signed char s_dir_on = -1;
+// Which guest tids are currently BLOCKED in a wait (between block_begin/end).
+// Each thread writes only its own slot (no lock); reads are a racy hint. Used so
+// we only hand the GIL to a producer that can actually run (not one parked itself).
+#define WG_MAX_TID 0x1100
+static volatile uint8_t s_tid_blocked[WG_MAX_TID];
+static inline int wg_directed(void) {
+    if (s_dir_on < 0) s_dir_on = getenv("WG_NO_DIRECTED_GIL") ? 0 : 1;
+    return s_dir_on;
+}
+static void dir_lock(void) {
+    pthread_mutex_lock(&s_dir_m);
+    if (s_dir_owned && pthread_equal(s_dir_owner, pthread_self())) { s_dir_rec++; pthread_mutex_unlock(&s_dir_m); return; }
+    uint32_t me = s_cur_guest_tid;
+    for (;;) {
+        if (!s_dir_owned && (s_dir_prefer == 0 || s_dir_prefer == me)) break;
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000 * 1000;   // 1ms
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        int rc = pthread_cond_timedwait(&s_dir_c, &s_dir_m, &ts);
+        if (rc == ETIMEDOUT && !s_dir_owned && s_dir_prefer != 0 && s_dir_prefer != me) {
+            // Preferred thread isn't taking the GIL (blocked itself) -> don't
+            // deadlock: drop the preference after one timeout so we can proceed.
+            s_dir_prefer = 0; s_dir_stall = 0;
+        }
+    }
+    s_dir_owner = pthread_self(); s_dir_owned = 1; s_dir_rec = 1;
+    if (s_dir_prefer == me) { s_dir_prefer = 0; s_dir_stall = 0; }   // consumed
+    pthread_mutex_unlock(&s_dir_m);
+}
+static void dir_unlock(void) {
+    pthread_mutex_lock(&s_dir_m);
+    if (--s_dir_rec <= 0) { s_dir_rec = 0; s_dir_owned = 0; pthread_cond_broadcast(&s_dir_c); }
+    pthread_mutex_unlock(&s_dir_m);
+}
+// Hand the GIL to `tid` next (called right before a thread blocks on a wait whose
+// signaler is `tid`). No-op if tid is unknown/self.
+static void wg_dir_set_prefer(uint32_t tid) {
+    if (!s_use_real_threads || !wg_directed() || tid == 0 || tid == s_cur_guest_tid) return;
+    // Only hand off to a producer that can actually run — if it's parked in its
+    // own wait, preferring it just stalls everyone until the fallback fires.
+    if (tid < WG_MAX_TID && s_tid_blocked[tid]) return;
+    pthread_mutex_lock(&s_dir_m);
+    s_dir_prefer = tid; s_dir_stall = 0;
+    pthread_cond_broadcast(&s_dir_c);
+    pthread_mutex_unlock(&s_dir_m);
+}
+// wait-handle -> the tid that last SetEvent'd it (the producer). Accessed only
+// from thunk handlers, which run under the GIL, so no extra lock is needed.
+#define WG_MAX_PROD 16384
+static struct { uint32_t h; uint32_t tid; } s_prod[WG_MAX_PROD];
+static int s_prod_n = 0;
+static void wg_producer_set(uint32_t h, uint32_t tid) {
+    if (!h || !tid) return;
+    for (int i = 0; i < s_prod_n; i++) if (s_prod[i].h == h) { s_prod[i].tid = tid; return; }
+    if (s_prod_n < WG_MAX_PROD) { s_prod[s_prod_n].h = h; s_prod[s_prod_n].tid = tid; s_prod_n++; }
+}
+static uint32_t wg_producer_get(uint32_t h) {
+    for (int i = 0; i < s_prod_n; i++) if (s_prod[i].h == h) return s_prod[i].tid;
+    return 0;
+}
+
+static inline void wg_thunk_lock(void)   { if (!s_use_real_threads) return; if (wg_directed()) dir_lock();   else if (wg_fair()) fair_lock();   else pthread_mutex_lock(&s_thunk_lock); }
+static inline void wg_thunk_unlock(void) { if (!s_use_real_threads) return; if (wg_directed()) dir_unlock(); else if (wg_fair()) fair_unlock(); else pthread_mutex_unlock(&s_thunk_lock); }
+// Release the thunk lock around a blocking wait, then re-acquire (a new ticket).
+// In directed mode, mark this thread BLOCKED across the wait so the handoff logic
+// won't prefer it (it can't take the GIL until its wait returns).
+static inline void wg_thunk_block_begin(void) {
+    if (!s_use_real_threads) return;
+    if (wg_directed()) { uint32_t t = s_cur_guest_tid; if (t < WG_MAX_TID) s_tid_blocked[t] = 1; dir_unlock(); }
+    else if (wg_fair()) fair_unlock(); else pthread_mutex_unlock(&s_thunk_lock);
+}
+static inline void wg_thunk_block_end(void) {
+    if (!s_use_real_threads) return;
+    if (wg_directed()) { dir_lock(); uint32_t t = s_cur_guest_tid; if (t < WG_MAX_TID) s_tid_blocked[t] = 0; }
+    else if (wg_fair()) fair_lock(); else pthread_mutex_lock(&s_thunk_lock);
+}
+
+// CREATE_SUSPENDED gates for real threads. UE4's thread pool creates workers
+// SUSPENDED, fills in their per-thread context, then ResumeThread()s them. If we
+// run the pthread immediately it reads an uninitialized context and jumps to
+// garbage (the ~21-thread startup crash). A suspended worker parks on its gate
+// (keyed by thread handle) until ResumeThread signals it.
+#define WG_MAX_RESUME_GATES 64
+static struct { uint32_t handle; pthread_mutex_t m; pthread_cond_t c; bool resumed; bool used; }
+    s_resume_gates[WG_MAX_RESUME_GATES];
+static pthread_mutex_t s_resume_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static void wg_resume_gate_create(uint32_t handle) {
+    pthread_mutex_lock(&s_resume_table_lock);
+    for (int i = 0; i < WG_MAX_RESUME_GATES; i++)
+        if (!s_resume_gates[i].used) {
+            s_resume_gates[i].used = true; s_resume_gates[i].handle = handle;
+            s_resume_gates[i].resumed = false;
+            pthread_mutex_init(&s_resume_gates[i].m, NULL);
+            pthread_cond_init(&s_resume_gates[i].c, NULL);
+            break;
+        }
+    pthread_mutex_unlock(&s_resume_table_lock);
+}
+static void wg_resume_gate_wait(uint32_t handle) {
+    int idx = -1;
+    pthread_mutex_lock(&s_resume_table_lock);
+    for (int i = 0; i < WG_MAX_RESUME_GATES; i++)
+        if (s_resume_gates[i].used && s_resume_gates[i].handle == handle) { idx = i; break; }
+    pthread_mutex_unlock(&s_resume_table_lock);
+    if (idx < 0) return;
+    pthread_mutex_lock(&s_resume_gates[idx].m);
+    while (!s_resume_gates[idx].resumed)
+        pthread_cond_wait(&s_resume_gates[idx].c, &s_resume_gates[idx].m);
+    pthread_mutex_unlock(&s_resume_gates[idx].m);
+}
+static bool wg_resume_gate_signal(uint32_t handle) {
+    int idx = -1;
+    pthread_mutex_lock(&s_resume_table_lock);
+    for (int i = 0; i < WG_MAX_RESUME_GATES; i++)
+        if (s_resume_gates[i].used && s_resume_gates[i].handle == handle) { idx = i; break; }
+    pthread_mutex_unlock(&s_resume_table_lock);
+    if (idx < 0) return false;
+    pthread_mutex_lock(&s_resume_gates[idx].m);
+    s_resume_gates[idx].resumed = true;
+    pthread_cond_signal(&s_resume_gates[idx].c);
+    pthread_mutex_unlock(&s_resume_gates[idx].m);
+    return true;
+}
 
 // Per-real-thread slot index into the s_tls_slots/s_fls_slots shadow arrays.
 // The cooperative scheduler used scheduler->current as the index; under real
@@ -164,15 +328,27 @@ static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
 // allocator + many structures in critical sections, so real mutual exclusion is
 // required once guest threads run concurrently. Accessed only from thunk
 // handlers (under s_thunk_lock), so the map itself needs no extra lock.
-#define WG_MAX_CS 1024
+#define WG_MAX_CS 16384
+#define WG_CS_HASH (WG_MAX_CS * 2)   // power of 2; open-addressing load factor 0.5
 static struct { uint32_t cs_ptr; uint32_t mtx; } s_cs_map[WG_MAX_CS];
 static int s_cs_count = 0;
+// Hash index cs_ptr -> (s_cs_map index + 1); 0 = empty. Turns the per-lock-op
+// lookup from O(N) linear scan into O(1) — critical once the game does millions
+// of SRW-lock/critical-section ops during shader processing (was O(N^2) overall,
+// slowing the tick rate to a crawl).
+static int s_cs_hash[WG_CS_HASH];
 static uint32_t wg_cs_mutex_for(uint32_t cs_ptr) {
-    for (int i = 0; i < s_cs_count; i++) if (s_cs_map[i].cs_ptr == cs_ptr) return s_cs_map[i].mtx;
+    uint32_t h = (cs_ptr * 2654435761u) & (WG_CS_HASH - 1);
+    while (s_cs_hash[h]) {
+        int idx = s_cs_hash[h] - 1;
+        if (s_cs_map[idx].cs_ptr == cs_ptr) return s_cs_map[idx].mtx;
+        h = (h + 1) & (WG_CS_HASH - 1);
+    }
     if (s_cs_count < WG_MAX_CS) {
         uint32_t m = wg_sync_create_mutex(false, 0);
         s_cs_map[s_cs_count].cs_ptr = cs_ptr;
         s_cs_map[s_cs_count].mtx = m;
+        s_cs_hash[h] = s_cs_count + 1;
         s_cs_count++;
         return m;
     }
@@ -191,6 +367,118 @@ static uint32_t wg_cv_handle_for(uint32_t cv_ptr) {
         return h;
     }
     return 0;
+}
+
+// -- SRW locks: PROPER reader/writer semantics ------------------------------
+// SRW locks were backed by wg_cs_mutex_for(), i.e. an EXCLUSIVE mutex, so
+// AcquireSRWLockShared serialized readers that Windows runs concurrently. UE4's
+// FRWLock read paths take a shared lock and then block waiting on another thread
+// that ALSO needs the same lock shared -> on Windows both proceed; here the 2nd
+// reader blocked on the 1st's exclusive mutex -> deadlock (two threads stuck in
+// the config driver 0x14AA). This is a real reader/writer lock keyed by the
+// guest SRW pointer: many shared holders OR one exclusive holder.
+#define WG_MAX_SRW 8192
+typedef struct { uint32_t ptr; int readers; uint32_t writer_tid; int writer_rec; } WGSrw;
+static WGSrw s_srw[WG_MAX_SRW];
+static int s_srw_count = 0;
+static int s_srw_hash[WG_MAX_SRW * 2];   // ptr -> (index+1); 0 = empty
+static pthread_mutex_t s_srw_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_srw_cond = PTHREAD_COND_INITIALIZER;
+static int s_srw_log = -1;
+// Caller MUST hold s_srw_lock.
+static WGSrw *wg_srw_for(uint32_t p) {
+    uint32_t h = (p * 2654435761u) & (WG_MAX_SRW * 2 - 1);
+    while (s_srw_hash[h]) {
+        int idx = s_srw_hash[h] - 1;
+        if (s_srw[idx].ptr == p) return &s_srw[idx];
+        h = (h + 1) & (WG_MAX_SRW * 2 - 1);
+    }
+    if (s_srw_count < WG_MAX_SRW) {
+        WGSrw *s = &s_srw[s_srw_count];
+        s->ptr = p; s->readers = 0; s->writer_tid = 0; s->writer_rec = 0;
+        s_srw_hash[h] = s_srw_count + 1; s_srw_count++;
+        return s;
+    }
+    return NULL;
+}
+static void wg_srw_acquire_shared(uint32_t p, uint32_t tid) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    if (!s || s->writer_tid == 0 || s->writer_tid == tid) {   // uncontended
+        if (s) s->readers++;
+        pthread_mutex_unlock(&s_srw_lock);
+        return;
+    }
+    pthread_mutex_unlock(&s_srw_lock);
+    if (s_srw_log > 0) WG_LOGI("SRW", "shared acquire CONTENDED ptr=%08x tid=%u", p, tid);
+    wg_thunk_block_begin();                                    // release GIL while blocked
+    pthread_mutex_lock(&s_srw_lock);
+    s = wg_srw_for(p);
+    while (s && s->writer_tid != 0 && s->writer_tid != tid)
+        pthread_cond_wait(&s_srw_cond, &s_srw_lock);
+    if (s) s->readers++;
+    pthread_mutex_unlock(&s_srw_lock);
+    wg_thunk_block_end();
+}
+static void wg_srw_release_shared(uint32_t p) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    if (s && s->readers > 0) s->readers--;
+    pthread_cond_broadcast(&s_srw_cond);
+    pthread_mutex_unlock(&s_srw_lock);
+}
+static void wg_srw_acquire_exclusive(uint32_t p, uint32_t tid) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    if (s && s->writer_tid == tid) { s->writer_rec++; pthread_mutex_unlock(&s_srw_lock); return; }
+    if (!s || (s->readers == 0 && s->writer_tid == 0)) {       // uncontended
+        if (s) { s->writer_tid = tid; s->writer_rec = 1; }
+        pthread_mutex_unlock(&s_srw_lock);
+        return;
+    }
+    pthread_mutex_unlock(&s_srw_lock);
+    if (s_srw_log > 0) WG_LOGI("SRW", "excl acquire CONTENDED ptr=%08x tid=%u r=%d w=%u", p, tid, s->readers, s->writer_tid);
+    wg_thunk_block_begin();
+    pthread_mutex_lock(&s_srw_lock);
+    s = wg_srw_for(p);
+    int waited_ms = 0;
+    while (s && (s->readers > 0 || (s->writer_tid != 0 && s->writer_tid != tid))) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200 * 1000 * 1000;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if (pthread_cond_timedwait(&s_srw_cond, &s_srw_lock, &ts) == ETIMEDOUT) {
+            waited_ms += 200;
+            if (waited_ms == 2000)   // stuck -> almost certainly a leaked reader/writer
+                fprintf(stderr, "[SRW-STUCK] tid=%u EXCL on ptr=%08x 2s: readers=%d writer=%u\n",
+                        tid, p, s->readers, s->writer_tid);
+        }
+    }
+    if (s) { s->writer_tid = tid; s->writer_rec = 1; }
+    pthread_mutex_unlock(&s_srw_lock);
+    wg_thunk_block_end();
+}
+static void wg_srw_release_exclusive(uint32_t p, uint32_t tid) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    if (s && s->writer_tid == tid && --s->writer_rec <= 0) { s->writer_tid = 0; s->writer_rec = 0; }
+    pthread_cond_broadcast(&s_srw_cond);
+    pthread_mutex_unlock(&s_srw_lock);
+}
+static int wg_srw_try_shared(uint32_t p, uint32_t tid) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    int ok = (!s || s->writer_tid == 0 || s->writer_tid == tid);
+    if (ok && s) s->readers++;
+    pthread_mutex_unlock(&s_srw_lock);
+    return ok ? 1 : 0;
+}
+static int wg_srw_try_exclusive(uint32_t p, uint32_t tid) {
+    pthread_mutex_lock(&s_srw_lock);
+    WGSrw *s = wg_srw_for(p);
+    int ok = (!s || (s->readers == 0 && (s->writer_tid == 0 || s->writer_tid == tid)));
+    if (ok && s) { s->writer_tid = tid; s->writer_rec++; }
+    pthread_mutex_unlock(&s_srw_lock);
+    return ok ? 1 : 0;
 }
 
 // Recursively delete a directory and its contents (used to give NSIS a fresh
@@ -414,6 +702,39 @@ typedef enum {
 } WGBackend;
 
 static uint32_t s_last_error = 0;
+
+// Deadlock probe: bumped on every thunk; a watchdog thread dumps live waits when
+// this stops advancing (WG_DEADLOCK_DUMP=<seconds>, e.g. 15).
+static volatile unsigned long long s_thunk_progress = 0;
+
+// Sync-op ring buffer (WG_SYNCTRACE=1): record the last N CreateEvent/SetEvent/
+// ResetEvent/Wait ops so the deadlock watchdog can print the exact handshake
+// sequence that led to the collapse (which thread signalled/waited on which
+// handle, and the guest caller). Lock-free-ish ring (racy index is fine for a
+// diagnostic). Dumped by wg_dump_synctrace() from the watchdog.
+#define WG_SYNCTRACE_N 384
+static struct { const char *op; uint32_t tid, h; uint64_t caller; } s_synctrace[WG_SYNCTRACE_N];
+static volatile unsigned int s_synctrace_i = 0;
+static signed char s_synctrace_on = -1;
+static inline void wg_synctrace(const char *op, uint32_t tid, uint32_t h, uint64_t caller) {
+    if (s_synctrace_on < 0) s_synctrace_on = getenv("WG_SYNCTRACE") ? 1 : 0;
+    if (!s_synctrace_on) return;
+    unsigned int i = __atomic_fetch_add(&s_synctrace_i, 1, __ATOMIC_RELAXED) % WG_SYNCTRACE_N;
+    s_synctrace[i].op = op; s_synctrace[i].tid = tid; s_synctrace[i].h = h; s_synctrace[i].caller = caller;
+}
+void wg_dump_synctrace(void) {
+    if (s_synctrace_on <= 0) return;
+    unsigned int end = s_synctrace_i, n = end < WG_SYNCTRACE_N ? end : WG_SYNCTRACE_N;
+    fprintf(stderr, "=== last %u sync ops (chronological) ===\n", n);
+    for (unsigned int k = 0; k < n; k++) {
+        unsigned int i = (end - n + k) % WG_SYNCTRACE_N;
+        if (!s_synctrace[i].op) continue;
+        fprintf(stderr, "  tid=0x%-5X %-10s h=0x%-6X caller=0x%llX\n",
+                s_synctrace[i].tid, s_synctrace[i].op, s_synctrace[i].h,
+                (unsigned long long)s_synctrace[i].caller);
+    }
+    fprintf(stderr, "=== end sync ops ===\n");
+}
 
 // Ring buffer of recent Win32 API calls for crash diagnostics
 #define WG_CALL_RING_SIZE 256
@@ -682,7 +1003,7 @@ WGEngine *wg_engine_create(void) {
     WGEngine *e = calloc(1, sizeof(WGEngine));
     if (!e) return NULL;
     e->state = WG_ENGINE_IDLE;
-    e->instructions_per_tick = 100000;
+    e->instructions_per_tick = getenv("WG_IPT") ? atoi(getenv("WG_IPT")) : 100000;
     e->backend = WG_BACKEND_BLINK;
     e->winsock = wg_winsock_create();
     e->winhttp = wg_winhttp_create();
@@ -711,6 +1032,7 @@ void wg_engine_destroy(WGEngine *engine) {
 // When the engine detects RIP landed on a thunk after a step, it
 // calls the Win32 stub handler before resuming.
 //
+
 // Layout at each thunk address (8 bytes apart):
 //   [thunk+0] HLT   (0xF4) — stops execution
 // The engine sees the halt, checks if RIP is in the thunk range,
@@ -743,6 +1065,43 @@ static void map_thunks_to_blink(WGEngine *engine) {
     engine->thunks_mapped = true;
     WG_LOGI(TAG, "Win32 API thunks mapped at 0x%llX (%d stubs)",
             (unsigned long long)thunk_base, engine->dll_mapper->count);
+}
+
+// Map the x64 CRT-init trampoline at `addr`. The _initterm/_initterm_e thunks
+// jump here with RCX=first, RDX=last and the caller's return address still on
+// the stack; this guest code CALLs every non-null function pointer in
+// [RCX,RDX) and RETs to the caller. (A no-op stub instead leaves every static
+// C++ constructor unrun — a UE4 game then derefs null singletons everywhere.)
+// Must be mapped AFTER the PE sections load, or .text overwrites it.
+static void map_initterm_tramp(WGEngine *engine, uint32_t addr) {
+    static const uint8_t tramp[] = {
+        0x53,                               // push rbx
+        0x56,                               // push rsi
+        0x48, 0x89, 0xCB,                   // mov  rbx, rcx
+        0x48, 0x89, 0xD6,                   // mov  rsi, rdx
+        /* loop: */
+        0x48, 0x39, 0xF3,                   // cmp  rbx, rsi
+        0x73, 0x18,                         // jae  done
+        0x48, 0x8B, 0x03,                   // mov  rax, [rbx]
+        0x48, 0x85, 0xC0,                   // test rax, rax
+        0x74, 0x0A,                         // jz   next
+        0x48, 0x83, 0xEC, 0x28,             // sub  rsp, 0x28 (shadow+align)
+        0xFF, 0xD0,                         // call rax
+        0x48, 0x83, 0xC4, 0x28,             // add  rsp, 0x28
+        /* next: */
+        0x48, 0x83, 0xC3, 0x08,             // add  rbx, 8
+        0xEB, 0xE3,                         // jmp  loop
+        /* done: */
+        0x31, 0xC0,                         // xor  eax, eax
+        0x5E,                               // pop  rsi
+        0x5B,                               // pop  rbx
+        0xC3,                               // ret
+    };
+    uint8_t page[0x1000];
+    memset(page, 0xF4, sizeof(page));       // HLT-fill the rest
+    memcpy(page, tramp, sizeof(tramp));
+    wg_blink_load_code(engine->blink, addr, page, sizeof(page), 0);
+    WG_LOGI(TAG, "x64 _initterm trampoline mapped at 0x%X", addr);
 }
 
 // ============================================================
@@ -1192,10 +1551,16 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (size == 0) size = 1;
     if ((size & 0x80000000u) || size > 512u * 1024 * 1024) return 0;
     uint32_t alloc = (size + 0xFFF) & ~0xFFFu;
-    // Never let the bump heap grow into the thread-stack region (0x60000000).
-    // Steam buffers hundreds of MB of packages here; running into the stacks
-    // corrupts thread return addresses and crashes. Fail cleanly instead.
-    if (s_heap_ptr + alloc > 0x5F000000u || s_heap_ptr + alloc < s_heap_ptr) return 0;
+    // Region 1 is 0x20000000..0x5F000000 (below the DLL/stack region at 0x60000000).
+    // When it fills, jump to REGION 2 at 0xA0000000..0xF0000000 — the 2.5-4GB slice
+    // is free (stacks/DLLs stay under ~0x80000000, main stack at 0x7FFF0000, image
+    // at 0x140000000). This ~1.5GB extra keeps a full UE4 asset load from OOM-ing at
+    // the old 1GB cap (the 23M-thunk endpoint) WITHOUT going 64-bit (which the 32-bit
+    // arg-reading handlers would truncate). All addresses stay in uint32_t.
+    if (s_heap_ptr + alloc > 0x5F000000u && s_heap_ptr < 0xA0000000u)
+        s_heap_ptr = 0xA0000000u;                       // hop to region 2
+    uint32_t hi = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
+    if (s_heap_ptr + alloc > hi || s_heap_ptr + alloc < s_heap_ptr) return 0;
     uint32_t addr = s_heap_ptr;
     uint8_t *zeros = calloc(1, alloc);
     if (!zeros) return 0;
@@ -1205,6 +1570,53 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     s_heap_ptr = (s_heap_ptr + 0xFFF) & ~0xFFFu;
     track_alloc(addr, size);
     return addr;
+}
+
+// Like wg_guest_alloc but the returned base is aligned to `align` (power of 2).
+// VirtualAlloc must return memory aligned to the OS allocation granularity
+// (64KB on Windows): UE4's FMallocBinned2 masks pointers by that granularity to
+// find pool headers, so a merely page-aligned base makes it read canaries from
+// the wrong offset and (falsely) detect heap corruption.
+static uint32_t wg_guest_alloc_aligned(WGEngine *engine, uint32_t size, uint32_t align) {
+    if (align > 0x1000u) {
+        uint32_t aligned = (s_heap_ptr + (align - 1)) & ~(align - 1);
+        if (aligned >= s_heap_ptr) s_heap_ptr = aligned;   // skip forward to alignment
+    }
+    return wg_guest_alloc(engine, size);
+}
+
+// 64-bit guest heap for VirtualAlloc (the game's FMallocBinned2 pools). The 32-bit
+// bump heap caps at ~1GB (0x5F000000), well under what a full UE4 asset load needs
+// -> VirtualAlloc returns 0 -> FMalloc OOM -> the game fatals/exits (the 23M-thunk
+// endpoint). blink is a 64-bit VM (wg_blink_load_code takes a u64 addr), and the
+// runtime uses nothing above 0x140000000, so hand VirtualAlloc pools out of a huge
+// 64-bit region far above everything. The game is 64-bit, so it uses these fine.
+static uint64_t s_heap64_ptr = 0x200000000ULL;  // 8GB base (above the 0x140000000 imagebase), grows to <24GB
+// Reserve address space only (NO backing map) — a MEM_RESERVE, so a multi-GB
+// reservation costs nothing until pages are committed.
+static uint64_t wg_guest_reserve64(uint64_t size, uint64_t align) {
+    if (size == 0) size = 1;
+    if (align < 0x1000ULL) align = 0x1000ULL;
+    s_heap64_ptr = (s_heap64_ptr + (align - 1)) & ~(align - 1);
+    uint64_t addr = s_heap64_ptr;
+    uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
+    s_heap64_ptr += alloc;
+    s_heap64_ptr = (s_heap64_ptr + 0xFFFULL) & ~0xFFFULL;
+    return addr;
+}
+// Commit: back [addr,addr+size) with real zeroed pages in blink (<=4MB chunks).
+static bool wg_guest_map64(WGEngine *engine, uint64_t addr, uint64_t size) {
+    uint64_t alloc = (size + 0xFFFULL) & ~0xFFFULL;
+    uint64_t off = 0;
+    while (off < alloc) {
+        uint64_t chunk = alloc - off; if (chunk > 0x400000ULL) chunk = 0x400000ULL;
+        uint8_t *zeros = calloc(1, (size_t)chunk);
+        if (!zeros) return false;
+        wg_blink_load_code(engine->blink, addr + off, zeros, (uint32_t)chunk, 0);
+        free(zeros);
+        off += chunk;
+    }
+    return true;
 }
 
 // ===== nsDialogs plugin emulation =======================================
@@ -1420,6 +1832,150 @@ static uint32_t s_com_shelllink = 0, s_com_persistfile = 0;
 // Real path of a program the guest asked to launch (the Steam bootstrapper);
 // the app chain-loads it after the current program exits.
 static char s_pending_exec[1024] = {0};
+
+// Count of recovered null indirect calls on the main thread (see the halt
+// handler). Reset per PE load. Lets a run that keeps hitting uninitialized
+// function pointers keep going instead of dying on the first one.
+static uint64_t s_null_call_recover = 0;
+// Spin-guard: a tight loop that keeps calling the same null pointer would
+// recover forever (and hang the app on iOS). Track the last recovered return
+// address; if the same site recovers too many times in a row, stop recovering
+// and let the fault surface so the run terminates instead of spinning.
+static uint64_t s_recover_last_addr = 0;
+static uint32_t s_recover_streak    = 0;
+static uint64_t s_recover_total     = 0;
+#define WG_RECOVER_SPIN_LIMIT  20000
+#define WG_RECOVER_TOTAL_LIMIT 2000000   // global cap so a MULTI-address fatal-
+                                         // handler loop can't spin forever (on
+                                         // device it would hang the app).
+// Returns false if this recovery would exceed the per-site streak OR the global
+// total (caller should NOT recover, letting the fault surface). Updates state.
+static bool wg_recover_ok(uint64_t ret_addr) {
+    if (++s_recover_total > WG_RECOVER_TOTAL_LIMIT) return false;
+    if (ret_addr == s_recover_last_addr) {
+        if (++s_recover_streak > WG_RECOVER_SPIN_LIMIT) return false;
+    } else {
+        s_recover_last_addr = ret_addr;
+        s_recover_streak = 1;
+    }
+    return true;
+}
+
+// Fixed guest scratch pages. Legacy low addresses work for 32-bit / small PEs,
+// but a rebased 64-bit image (e.g. Visage: 0x400000..~0x3EB5000, 62MB) spans
+// right over them, so the scratch maps would clobber the game's own .text.
+// For such images these are relocated to a region ABOVE the image at load time
+// (see wg_place_scratch). 0 base = legacy layout.
+static uint32_t s_scratch_base = 0;
+static uint32_t s_cmdline_page = 0x00A00000u;   // GetCommandLineW/A page
+static char     s_cmdline_extra[128] = {0};     // switches appended to the guest cmdline
+static uint32_t s_tramp_addr   = 0x00C30000u;   // x64 _initterm trampoline
+static uint32_t s_gai_base     = 0x00B00000u;   // getaddrinfo result scratch (1MB)
+
+// Collapse "." and ".." segments in a Windows path, in place (ASCII —
+// PathCanonicalize semantics, enough for the launcher-built exe paths).
+// The result never grows, so the caller's buffer always fits.
+static void wg_path_canon_a(char *p) {
+    char tmp[1040];
+    strncpy(tmp, p, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    bool lead = (tmp[0] == '\\' || tmp[0] == '/');
+    char *segs[64];
+    int ns = 0;
+    char *save = NULL;
+    for (char *t = strtok_r(tmp, "\\/", &save); t; t = strtok_r(NULL, "\\/", &save)) {
+        if (strcmp(t, ".") == 0) continue;
+        if (strcmp(t, "..") == 0) {
+            // pop the previous segment, but never the drive ("C:")
+            if (ns > 0 && !(ns == 1 && segs[0][strlen(segs[0]) - 1] == ':')) ns--;
+            continue;
+        }
+        if (ns < 64) segs[ns++] = t;
+    }
+    char out[1040];
+    int oi = 0;
+    if (lead) out[oi++] = '\\';
+    for (int s = 0; s < ns; s++) {
+        int len = (int)strlen(segs[s]);
+        if (oi + len + 2 >= (int)sizeof(out)) break;
+        if (s) out[oi++] = '\\';
+        memcpy(out + oi, segs[s], len);
+        oi += len;
+    }
+    out[oi] = 0;
+    if (oi == 2 && out[1] == ':') { out[2] = '\\'; out[3] = 0; }  // bare drive
+    strcpy(p, out);
+}
+
+// FindResource: walk the main image's mapped .rsrc directory in guest memory —
+// type dir, then name dir, then first language entry. Handles integer IDs
+// (MAKEINTRESOURCE) and string names. Returns the guest VA of the
+// IMAGE_RESOURCE_DATA_ENTRY (serves as the HRSRC), or 0 if not found.
+// UE4's bootstrap launcher reads its game-exe path from RCDATA #201 this way.
+static uint32_t wg_find_resource(WGEngine *engine, uint32_t name_arg,
+                                 uint32_t type_arg, bool wide) {
+    if (!engine->pe_image) return 0;
+    uint32_t rsrc_rva = 0;
+    for (int i = 0; i < engine->pe_image->num_sections; i++) {
+        if (strcmp(engine->pe_image->sections[i].name, ".rsrc") == 0) {
+            rsrc_rva = engine->pe_image->sections[i].virtual_address;
+            break;
+        }
+    }
+    if (!rsrc_rva) return 0;
+    uint32_t base = (uint32_t)engine->pe_image->image_base + rsrc_rva;
+
+    uint32_t dir = base;                       // current directory table VA
+    uint32_t want[2] = { type_arg, name_arg }; // level 0: type, 1: name
+    for (int level = 0; level < 3; level++) {
+        uint16_t counts[2] = {0, 0};           // named, id
+        wg_blink_read_mem(engine->blink, dir + 12, counts, 4);
+        int total = counts[0] + counts[1];
+        if (total <= 0 || total > 4096) return 0;
+        uint32_t found = 0;
+        for (int i = 0; i < total; i++) {
+            uint32_t ent[2] = {0, 0};          // Name, OffsetToData
+            wg_blink_read_mem(engine->blink, dir + 16 + (uint32_t)i * 8, ent, 8);
+            bool match = false;
+            if (level == 2) {
+                match = true;                  // take the first language
+            } else if (want[level] <= 0xFFFF) {
+                match = !(ent[0] & 0x80000000u) && (ent[0] & 0xFFFF) == want[level];
+            } else if (ent[0] & 0x80000000u) {
+                // string-named entry vs guest string (case-insensitive)
+                uint32_t nvo = base + (ent[0] & 0x7FFFFFFFu);
+                uint16_t ln = 0;
+                wg_blink_read_mem(engine->blink, nvo, &ln, 2);
+                if (ln > 63) ln = 63;
+                uint16_t rname[64] = {0}, gname[64] = {0};
+                wg_blink_read_mem(engine->blink, nvo + 2, rname, (uint32_t)ln * 2);
+                if (wide) {
+                    wg_blink_read_mem(engine->blink, want[level], gname, 126);
+                } else {
+                    char an[64] = {0};
+                    wg_blink_read_mem(engine->blink, want[level], an, 63);
+                    for (int k = 0; k < 63 && an[k]; k++) gname[k] = (uint8_t)an[k];
+                }
+                match = true;
+                for (int k = 0; k <= ln; k++) {
+                    uint16_t a = (k < ln) ? rname[k] : 0, b = gname[k];
+                    if (a >= 'a' && a <= 'z') a -= 32;
+                    if (b >= 'a' && b <= 'z') b -= 32;
+                    if (a != b) { match = false; break; }
+                }
+            }
+            if (match) { found = ent[1]; break; }
+        }
+        if (!found) return 0;
+        if (found & 0x80000000u) {
+            if (level == 2) return 0;          // deeper than type/name/lang
+            dir = base + (found & 0x7FFFFFFFu);
+        } else {
+            return base + found;               // IMAGE_RESOURCE_DATA_ENTRY VA
+        }
+    }
+    return 0;
+}
 
 static void wg_build_fake_com(WGEngine *engine) {
     WGDllMapper *m = engine->dll_mapper;
@@ -1651,6 +2207,24 @@ static uint8_t  s_sslw_orig = 0, s_sndchk_orig = 0;
 static bool     s_sslw_armed = false;
 static int      s_sslw_count = 0, s_sndchk_count = 0;
 
+// WineGlass: WG_DETERM makes all entropy/time sources return fixed values, so
+// the interpreter-vs-JIT differential trace isn't confounded by non-determinism
+// (the MSVC security cookie mixes GetSystemTimeAsFileTime/PID/random — those
+// legitimately differ every run and would mask a real JIT miscompile).
+static int wg_determ(void) { static signed char d = -1; if (d < 0) d = getenv("WG_DETERM") ? 1 : 0; return d; }
+
+// Reported logical-processor count. Default 1 (steers Steam away from IOCP), but
+// UE4/games key their task-graph threading on this — with 1 core they build a
+// degenerate task graph and the main thread deadlocks waiting for work it can't
+// schedule. WG_NCPU=<n> reports n cores so the worker pool gets created.
+static int wg_ncpu(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("WG_NCPU"); n = e ? atoi(e) : 1;
+                 if (n < 1) n = 1; if (n > 64) n = 64; }
+    return n;
+}
+static uint64_t wg_cpumask(void) { int n = wg_ncpu(); return (n >= 64) ? ~0ull : ((1ull << n) - 1); }
+
 // Fill a guest buffer with cryptographic random bytes (any size). Used by all
 // the Windows entropy APIs (RtlGenRandom/BCryptGenRandom/ProcessPrng) so TLS
 // (BoringSSL) can build its ClientHello random.
@@ -1660,7 +2234,7 @@ static void wg_fill_random(void *blink, uint32_t guest_addr, uint32_t len) {
     uint32_t done = 0;
     while (done < len) {
         uint32_t n = (len - done) < sizeof(chunk) ? (len - done) : (uint32_t)sizeof(chunk);
-        arc4random_buf(chunk, n);
+        if (wg_determ()) memset(chunk, 0x41, n); else arc4random_buf(chunk, n);
         wg_blink_write_mem(blink, guest_addr + done, chunk, n);
         done += n;
     }
@@ -1685,10 +2259,636 @@ static void wg_dump_threads(WGEngine *engine, const char *why) {
     }
 }
 
+// ===== C runtime translation ==========================================
+// The MSVC CRT the game imports (vcruntime140 / MSVCP140 / api-ms-win-crt-*)
+// is otherwise auto-stubbed to return 0, which silently breaks string/memory/
+// math the game relies on during static init. Implement the common functions
+// natively against guest memory. Dispatched by name (independent of which
+// forwarder DLL the game imported them from). Cdecl / caller-clean, so the
+// generic thunk epilogue's RSP handling is correct for x64.
+
+// Read a NUL-terminated narrow string from guest memory into buf (bounded).
+static void wg_read_cstr(WGEngine *e, uint32_t addr, char *buf, int cap) {
+    if (!addr || cap <= 0) { if (cap > 0) buf[0] = 0; return; }
+    int i = 0;
+    while (i < cap - 1) {
+        int n = (cap - 1 - i) < 256 ? (cap - 1 - i) : 256;
+        char chunk[256];
+        wg_blink_read_mem(e->blink, addr + (uint32_t)i, chunk, n);
+        for (int j = 0; j < n; j++) {
+            buf[i + j] = chunk[j];
+            if (!chunk[j]) return;
+        }
+        i += n;
+    }
+    buf[cap - 1] = 0;
+}
+// Read a NUL-terminated wide (UTF-16) string into a uint16_t buf (bounded, chars).
+static void wg_read_wstr(WGEngine *e, uint32_t addr, uint16_t *buf, int cap) {
+    if (!addr || cap <= 0) { if (cap > 0) buf[0] = 0; return; }
+    int i = 0;
+    while (i < cap - 1) {
+        int n = (cap - 1 - i) < 128 ? (cap - 1 - i) : 128;
+        uint16_t chunk[128];
+        wg_blink_read_mem(e->blink, addr + (uint32_t)i * 2, chunk, n * 2);
+        for (int j = 0; j < n; j++) {
+            buf[i + j] = chunk[j];
+            if (!chunk[j]) return;
+        }
+        i += n;
+    }
+    buf[cap - 1] = 0;
+}
+
+// A small persistent guest scratch int (for _errno / __p__commode / __p__fmode
+// style functions that must return a writable pointer). Allocated once.
+static uint32_t s_crt_errno = 0, s_crt_commode = 0, s_crt_fmode = 0;
+static uint32_t wg_crt_global(WGEngine *e, uint32_t *slot) {
+    if (!*slot) *slot = wg_guest_alloc(e, 4);
+    return *slot;
+}
+
+// Read the next 8-byte vararg from a guest va_list, advancing the pointer.
+static uint64_t wg_va_next(WGEngine *e, uint32_t *va) {
+    uint64_t v = 0; wg_blink_read_mem(e->blink, *va, &v, 8); *va += 8; return v;
+}
+
+// Implement the MSVC v*printf core against guest memory. `wide` selects the
+// wchar_t vs char output buffer. Reads the format + varargs from guest memory,
+// formats via the host, writes the result (bounded by `count`), and returns the
+// number of characters written. Returning 0 forever (the old auto-stub) put
+// UE4's logging into an infinite format-retry loop that overflowed the stack —
+// this makes formatting actually work.
+static int wg_guest_vsprintf(WGEngine *e, bool wide, uint32_t buf, uint32_t count,
+                             uint32_t fmt_addr, uint32_t va) {
+    uint32_t va0 = va;
+    char fmt[2048];
+    if (wide) { uint16_t wf[2048]; wg_read_wstr(e, fmt_addr, wf, 2048);
+                int i=0; for (; wf[i] && i<2047; i++) fmt[i] = wf[i]<128 ? (char)wf[i] : '?'; fmt[i]=0; }
+    else      { wg_read_cstr(e, fmt_addr, fmt, sizeof fmt); }
+
+    char out[8192]; int oi = 0;
+    for (int i = 0; fmt[i] && oi < (int)sizeof(out)-1; i++) {
+        if (fmt[i] != '%') { out[oi++] = fmt[i]; continue; }
+        i++;
+        if (fmt[i] == '%') { out[oi++]='%'; continue; }
+        char spec[40]; int si = 0; spec[si++]='%';
+        while (fmt[i] && strchr("-+ 0#", fmt[i]) && si<32) spec[si++]=fmt[i++];       // flags
+        while (isdigit((unsigned char)fmt[i]) && si<32) spec[si++]=fmt[i++];          // width
+        if (fmt[i]=='*') { i++; int w=(int)(uint32_t)wg_va_next(e,&va); si+=snprintf(spec+si,32-si,"%d",w); }
+        if (fmt[i]=='.') { spec[si++]=fmt[i++]; while (isdigit((unsigned char)fmt[i])&&si<32) spec[si++]=fmt[i++];
+            if (fmt[i]=='*'){ i++; int pr=(int)(uint32_t)wg_va_next(e,&va); si+=snprintf(spec+si,32-si,"%d",pr); } }
+        int len64=0, narrow_mod=0, wide_mod=0;                                        // length modifiers
+        while (fmt[i] && strchr("hljztLwI", fmt[i])) {
+            if (fmt[i]=='l' && fmt[i+1]=='l') { len64=1; i++; }
+            else if (fmt[i]=='l' || fmt[i]=='w') wide_mod=1;
+            else if (fmt[i]=='j' || fmt[i]=='z' || fmt[i]=='t') len64=1;
+            else if (fmt[i]=='h') narrow_mod=1;
+            else if (fmt[i]=='I' && fmt[i+1]=='6' && fmt[i+2]=='4') { len64=1; i+=2; }
+            i++;
+        }
+        char c = fmt[i]; char tmp[600];
+        switch (c) {
+            case 'd': case 'i': {
+                long long v = len64 ? (long long)wg_va_next(e,&va) : (int)(int32_t)(uint32_t)wg_va_next(e,&va);
+                spec[si++]='l'; spec[si++]='l'; spec[si++]=c; spec[si]=0;
+                snprintf(tmp,sizeof tmp,spec,v); oi += snprintf(out+oi,sizeof(out)-oi,"%s",tmp); break; }
+            case 'u': case 'x': case 'X': case 'o': {
+                unsigned long long v = len64 ? wg_va_next(e,&va) : (uint32_t)wg_va_next(e,&va);
+                spec[si++]='l'; spec[si++]='l'; spec[si++]=c; spec[si]=0;
+                snprintf(tmp,sizeof tmp,spec,v); oi += snprintf(out+oi,sizeof(out)-oi,"%s",tmp); break; }
+            case 'p': { unsigned long long v = wg_va_next(e,&va);
+                oi += snprintf(out+oi,sizeof(out)-oi,"0x%llX",v); break; }
+            case 'c': case 'C': { unsigned v=(unsigned)wg_va_next(e,&va); if(oi<(int)sizeof(out)-1) out[oi++]=(char)(v&0xFF); break; }
+            case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': case 'a': case 'A': {
+                uint64_t bits = wg_va_next(e,&va); double dv; memcpy(&dv,&bits,8);
+                spec[si++]=c; spec[si]=0; snprintf(tmp,sizeof tmp,spec,dv);
+                oi += snprintf(out+oi,sizeof(out)-oi,"%s",tmp); break; }
+            case 's': case 'S': {
+                uint32_t p = (uint32_t)wg_va_next(e,&va);
+                // Which width is the ARG? In wide printf %s is wide (unless h);
+                // in narrow printf %s is narrow (unless l). %S is the opposite.
+                int argwide = wide ? !narrow_mod : wide_mod;
+                if (c=='S') argwide = !argwide;
+                if (argwide) { uint16_t ws[2048]; wg_read_wstr(e,p,ws,2048);
+                    for (int k=0; ws[k] && oi<(int)sizeof(out)-1; k++) out[oi++] = ws[k]<128?(char)ws[k]:'?'; }
+                else { char s[2048]; wg_read_cstr(e,p,s,sizeof s); oi += snprintf(out+oi,sizeof(out)-oi,"%s",s); }
+                break; }
+            default: if(oi<(int)sizeof(out)-1) out[oi++]='%'; if(c&&oi<(int)sizeof(out)-1) out[oi++]=c; break;
+        }
+        if (oi > (int)sizeof(out)-1) oi = (int)sizeof(out)-1;
+    }
+    out[oi] = 0;
+    { static int dbg = 0; if (getenv("WG_FMT") && dbg < 400) { WG_LOGI(TAG, "fmt: %s", out); dbg++; } }
+    // When the guest formats the FMallocBinned2 "unrecognized block" fatal, dump
+    // the guest call stack (walk RSP for .text return addrs) so we can find the
+    // FMemory::Realloc caller and what pointer it rejected.
+    if (getenv("WG_FMT") && strstr(out, "unrecognized block")) {
+        static int shown = 0;
+        if (shown++ < 2) {
+            uint32_t sp = (uint32_t)wg_blink_get_reg(e->blink, 4);
+            char chain[512]; int ci = 0, found = 0;
+            uint32_t lo = e->pe_image ? (uint32_t)e->pe_image->image_base + 0x1000 : 0x401000;
+            uint32_t hi = e->pe_image ? (uint32_t)e->pe_image->image_base + 0x2358000 : 0x2758000;
+            uint32_t prev = 0;
+            for (int w = 0; w < 3000 && found < 30; w++) {
+                uint32_t v = 0; wg_blink_read_mem(e->blink, sp + (uint32_t)w * 8, &v, 4);
+                // .text return addresses; skip dup runs (string data)
+                if (v >= lo && v < hi && v != prev) {
+                    ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v); found++; prev = v;
+                }
+            }
+            uint64_t s[6] = {0};
+            for (int k = 0; k < 6; k++) wg_blink_read_mem(e->blink, va0 + k*8, &s[k], 8);
+            WG_LOGW(TAG, "REALLOC-FATAL args@va0: %llX %llX %llX %llX %llX %llX | callers: %s",
+                    (unsigned long long)s[0],(unsigned long long)s[1],(unsigned long long)s[2],
+                    (unsigned long long)s[3],(unsigned long long)s[4],(unsigned long long)s[5], chain);
+        }
+    }
+    if (buf && count) {
+        int n = oi; if ((uint32_t)n >= count) n = (int)count - 1; if (n < 0) n = 0;
+        if (wide) { uint16_t *wb = malloc((size_t)(n+1)*2);
+            if (wb) { for (int k=0;k<n;k++) wb[k]=(uint8_t)out[k]; wb[n]=0; wg_blink_write_mem(e->blink,buf,wb,(uint32_t)(n+1)*2); free(wb); } }
+        else { wg_blink_write_mem(e->blink, buf, out, (uint32_t)n+1); }
+    }
+    return oi;
+}
+
+// Try to handle `fn` as a CRT function. Returns true (and sets *ret) if handled.
+// Does NOT claim memcpy/memset/memmove/malloc/calloc/free/realloc/_initterm —
+// those have dedicated handlers elsewhere in the dispatch.
+static bool wg_try_crt(WGEngine *engine, const char *fn, uint32_t *args, uint64_t *ret) {
+    #define A0 args[0]
+    #define A1 args[1]
+    #define A2 args[2]
+    #define A3 args[3]
+
+    // ---- ctype (int in / int out; no guest memory) ----
+    if (!strcmp(fn,"isalpha")) { *ret = isalpha((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isdigit")) { *ret = isdigit((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isalnum")) { *ret = isalnum((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isspace")) { *ret = isspace((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isupper")) { *ret = isupper((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"islower")) { *ret = islower((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isxdigit")){ *ret = isxdigit((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isprint")) { *ret = isprint((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"isgraph")) { *ret = isgraph((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"ispunct")) { *ret = ispunct((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"iscntrl")) { *ret = iscntrl((int)A0)?1:0; return true; }
+    if (!strcmp(fn,"tolower")) { *ret = (uint32_t)tolower((int)A0); return true; }
+    if (!strcmp(fn,"toupper")) { *ret = (uint32_t)toupper((int)A0); return true; }
+    if (!strcmp(fn,"iswalpha")){ *ret = isalpha((int)(A0&0x7f))?1:0; return true; }
+    if (!strcmp(fn,"iswdigit")){ *ret = ((A0>='0')&&(A0<='9'))?1:0; return true; }
+    if (!strcmp(fn,"iswalnum")){ *ret = isalnum((int)(A0&0x7f))?1:0; return true; }
+    if (!strcmp(fn,"iswspace")){ *ret = (A0==' '||A0=='\t'||A0=='\n'||A0=='\r'||A0==0xA0)?1:0; return true; }
+    if (!strcmp(fn,"iswupper")){ *ret = isupper((int)(A0&0x7f))?1:0; return true; }
+    if (!strcmp(fn,"iswlower")){ *ret = islower((int)(A0&0x7f))?1:0; return true; }
+    if (!strcmp(fn,"iswxdigit")){*ret = isxdigit((int)(A0&0x7f))?1:0; return true; }
+    if (!strcmp(fn,"towlower")){ *ret = (A0<128)?(uint32_t)tolower((int)A0):A0; return true; }
+    if (!strcmp(fn,"towupper")){ *ret = (A0<128)?(uint32_t)toupper((int)A0):A0; return true; }
+
+    // ---- memory ----
+    if (!strcmp(fn,"memcmp")) {
+        uint32_t n = A2; if (n > 64u*1024*1024) n = 64u*1024*1024;
+        uint8_t *a = malloc(n?n:1), *b = malloc(n?n:1); int r = 0;
+        if (a && b) { wg_blink_read_mem(engine->blink,A0,a,n); wg_blink_read_mem(engine->blink,A1,b,n); r = memcmp(a,b,n); }
+        free(a); free(b); *ret = (uint32_t)(int32_t)r; return true;
+    }
+    if (!strcmp(fn,"memchr")) {
+        uint32_t n = A2; if (n > 64u*1024*1024) n = 64u*1024*1024;
+        uint8_t *a = malloc(n?n:1); uint32_t found = 0;
+        if (a) { wg_blink_read_mem(engine->blink,A0,a,n);
+                 uint8_t *p = memchr(a,(int)A1,n); if (p) found = A0 + (uint32_t)(p-a); }
+        free(a); *ret = found; return true;
+    }
+
+    // ---- narrow string ----
+    if (!strcmp(fn,"strlen")) { char s[4096]; wg_read_cstr(engine,A0,s,sizeof s); *ret = (uint32_t)strlen(s); return true; }
+    if (!strcmp(fn,"strnlen")){ char s[4096]; wg_read_cstr(engine,A0,s,sizeof s); size_t l=strlen(s); if(l>A1)l=A1; *ret=(uint32_t)l; return true; }
+    if (!strcmp(fn,"strcmp")) { char a[4096],b[4096]; wg_read_cstr(engine,A0,a,sizeof a); wg_read_cstr(engine,A1,b,sizeof b); *ret=(uint32_t)(int32_t)strcmp(a,b); return true; }
+    if (!strcmp(fn,"strncmp")){ char a[4096],b[4096]; wg_read_cstr(engine,A0,a,sizeof a); wg_read_cstr(engine,A1,b,sizeof b); *ret=(uint32_t)(int32_t)strncmp(a,b,A2); return true; }
+    if (!strcmp(fn,"_stricmp")||!strcmp(fn,"stricmp")){ char a[4096],b[4096]; wg_read_cstr(engine,A0,a,sizeof a); wg_read_cstr(engine,A1,b,sizeof b); *ret=(uint32_t)(int32_t)strcasecmp(a,b); return true; }
+    if (!strcmp(fn,"_strnicmp")||!strcmp(fn,"strnicmp")){ char a[4096],b[4096]; wg_read_cstr(engine,A0,a,sizeof a); wg_read_cstr(engine,A1,b,sizeof b); *ret=(uint32_t)(int32_t)strncasecmp(a,b,A2); return true; }
+    if (!strcmp(fn,"strcpy")) { char s[4096]; wg_read_cstr(engine,A1,s,sizeof s); wg_blink_write_mem(engine->blink,A0,s,(uint32_t)strlen(s)+1); *ret=A0; return true; }
+    if (!strcmp(fn,"strncpy")){ char s[4096]; wg_read_cstr(engine,A1,s,sizeof s); uint32_t n=A2; char *o=calloc(1,n?n:1); if(o){ size_t l=strlen(s); memcpy(o,s,l<n?l:n); wg_blink_write_mem(engine->blink,A0,o,n); free(o);} *ret=A0; return true; }
+    if (!strcmp(fn,"strcat")) { char d[8192],s[4096]; wg_read_cstr(engine,A0,d,sizeof d); wg_read_cstr(engine,A1,s,sizeof s); size_t dl=strlen(d),sl=strlen(s); if(dl+sl<sizeof d){ memcpy(d+dl,s,sl+1); wg_blink_write_mem(engine->blink,A0,d,(uint32_t)(dl+sl+1)); } *ret=A0; return true; }
+    if (!strcmp(fn,"strchr")) { char s[4096]; wg_read_cstr(engine,A0,s,sizeof s); char *p=strchr(s,(int)A1); *ret = p? A0+(uint32_t)(p-s):0; return true; }
+    if (!strcmp(fn,"strrchr")){ char s[4096]; wg_read_cstr(engine,A0,s,sizeof s); char *p=strrchr(s,(int)A1); *ret = p? A0+(uint32_t)(p-s):0; return true; }
+    if (!strcmp(fn,"strstr")) { char h[8192],n[1024]; wg_read_cstr(engine,A0,h,sizeof h); wg_read_cstr(engine,A1,n,sizeof n); char *p=strstr(h,n); *ret = p? A0+(uint32_t)(p-h):0; return true; }
+    if (!strcmp(fn,"strspn")) { char s[4096],a[256]; wg_read_cstr(engine,A0,s,sizeof s); wg_read_cstr(engine,A1,a,sizeof a); *ret=(uint32_t)strspn(s,a); return true; }
+    if (!strcmp(fn,"strcspn")){ char s[4096],a[256]; wg_read_cstr(engine,A0,s,sizeof s); wg_read_cstr(engine,A1,a,sizeof a); *ret=(uint32_t)strcspn(s,a); return true; }
+    if (!strcmp(fn,"strpbrk")){ char s[4096],a[256]; wg_read_cstr(engine,A0,s,sizeof s); wg_read_cstr(engine,A1,a,sizeof a); char *p=strpbrk(s,a); *ret=p?A0+(uint32_t)(p-s):0; return true; }
+    if (!strcmp(fn,"_strdup")){ char s[4096]; wg_read_cstr(engine,A0,s,sizeof s); uint32_t l=(uint32_t)strlen(s)+1; uint32_t g=wg_guest_alloc(engine,l); if(g) wg_blink_write_mem(engine->blink,g,s,l); *ret=g; return true; }
+
+    // ---- wide string ----
+    if (!strcmp(fn,"wcslen")) { uint16_t s[4096]; wg_read_wstr(engine,A0,s,4096); int l=0; while(s[l])l++; *ret=(uint32_t)l; return true; }
+    if (!strcmp(fn,"wcscmp")) { uint16_t a[4096],b[4096]; wg_read_wstr(engine,A0,a,4096); wg_read_wstr(engine,A1,b,4096); int i=0; while(a[i]&&a[i]==b[i])i++; *ret=(uint32_t)(int32_t)((int)a[i]-(int)b[i]); return true; }
+    if (!strcmp(fn,"wcsncmp")){ uint16_t a[4096],b[4096]; wg_read_wstr(engine,A0,a,4096); wg_read_wstr(engine,A1,b,4096); int i=0,r=0; while((uint32_t)i<A2){ if(a[i]!=b[i]){r=(int)a[i]-(int)b[i];break;} if(!a[i])break; i++; } *ret=(uint32_t)(int32_t)r; return true; }
+    if (!strcmp(fn,"_wcsicmp")||!strcmp(fn,"_wcsnicmp")) {
+        uint16_t a[4096],b[4096]; wg_read_wstr(engine,A0,a,4096); wg_read_wstr(engine,A1,b,4096);
+        uint32_t lim = (!strcmp(fn,"_wcsnicmp"))?A2:0xFFFFFFFF; int i=0,r=0;
+        while((uint32_t)i<lim){ int ca=a[i],cb=b[i]; if(ca<128)ca=tolower(ca); if(cb<128)cb=tolower(cb); if(ca!=cb){r=ca-cb;break;} if(!a[i])break; i++; }
+        *ret=(uint32_t)(int32_t)r; return true;
+    }
+    if (!strcmp(fn,"wcschr")) { uint16_t s[4096]; wg_read_wstr(engine,A0,s,4096); int i=0; for(;;i++){ if(s[i]==(uint16_t)A1){ *ret=A0+(uint32_t)i*2; return true; } if(!s[i])break; } *ret=0; return true; }
+    if (!strcmp(fn,"wcsrchr")){ uint16_t s[4096]; wg_read_wstr(engine,A0,s,4096); int last=-1,i=0; for(;;i++){ if(s[i]==(uint16_t)A1)last=i; if(!s[i])break; } *ret=last>=0?A0+(uint32_t)last*2:0; return true; }
+    if (!strcmp(fn,"wcscpy")) { uint16_t s[4096]; wg_read_wstr(engine,A1,s,4096); int l=0; while(s[l])l++; wg_blink_write_mem(engine->blink,A0,s,(uint32_t)(l+1)*2); *ret=A0; return true; }
+    if (!strcmp(fn,"wcsncpy")){ uint16_t s[4096]; wg_read_wstr(engine,A1,s,4096); uint32_t n=A2; uint16_t *o=calloc(n?n:1,2); if(o){ int l=0; while(s[l])l++; for(uint32_t i=0;i<n;i++)o[i]=((uint32_t)i<(uint32_t)l)?s[i]:0; wg_blink_write_mem(engine->blink,A0,o,n*2); free(o);} *ret=A0; return true; }
+
+    // ---- MSVC C++ RTTI (x64) ----
+    // Auto-stubbed, these returned garbage, so the game's typeid/dynamic_cast
+    // type checks were wrong and it called virtual methods on mis-typed objects
+    // (null-vtable crash). Implement against the guest's compiler RTTI data.
+    // x64 layout: [obj]=vtable; [vtable-8]=CompleteObjectLocator (COL, absolute).
+    //   COL: +0x0C pTypeDescriptor(RVA), +0x10 pClassDescriptor(RVA), +0x14 pSelf(RVA).
+    //   TypeDescriptor(=type_info): +0x10 decorated name (".?AV...").
+    if (!strcmp(fn,"__RTtypeid")) {  // type_info* __RTtypeid(void* obj)
+        uint32_t obj = A0, vtable = 0, col = 0, td_rva = 0;
+        uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+        wg_blink_read_mem(engine->blink, obj, &vtable, 4);
+        if (vtable) wg_blink_read_mem(engine->blink, vtable - 8, &col, 4);
+        if (col)    wg_blink_read_mem(engine->blink, col + 0x0C, &td_rva, 4);
+        *ret = td_rva ? (base + td_rva) : 0;
+        return true;
+    }
+    if (!strcmp(fn,"__std_type_info_compare")) {  // int(type_info* a, type_info* b): 0 if same
+        uint32_t a = A0, b = A1;
+        if (a == b || !a || !b) { *ret = (a == b) ? 0 : 1; return true; }
+        char na[600] = {0}, nb[600] = {0};
+        wg_read_cstr(engine, a + 0x10, na, sizeof na);
+        wg_read_cstr(engine, b + 0x10, nb, sizeof nb);
+        *ret = (uint32_t)(int32_t)strcmp(na, nb);
+        return true;
+    }
+    if (!strcmp(fn,"__std_type_info_name")) {  // const char* name(type_info*, __type_info_node*)
+        // Return the decorated name (at +0x10, skip the leading '.'). UE4 uses it
+        // for hashing/compare; a stable per-type string is what matters.
+        *ret = A0 ? A0 + 0x11 : 0;
+        return true;
+    }
+    if (!strcmp(fn,"__RTDynamicCast")) {
+        // void* __RTDynamicCast(void* obj, int vfDelta, TypeDescriptor* srcType,
+        //                       TypeDescriptor* dstType, int isReference)
+        // Walk obj's class-hierarchy base-class array for dstType; return the
+        // this-adjusted pointer, or null if not in the hierarchy.
+        uint32_t obj = A0, dstType = A3;
+        uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
+        if (!obj || !dstType) { *ret = 0; return true; }
+        uint32_t vtable = 0, col = 0, off = 0, chd_rva = 0;
+        wg_blink_read_mem(engine->blink, obj, &vtable, 4);
+        if (!vtable) { *ret = 0; return true; }
+        wg_blink_read_mem(engine->blink, vtable - 8, &col, 4);
+        if (!col) { *ret = 0; return true; }
+        wg_blink_read_mem(engine->blink, col + 0x04, &off, 4);      // vtable offset in object
+        wg_blink_read_mem(engine->blink, col + 0x10, &chd_rva, 4);  // ClassHierarchyDescriptor RVA
+        uint32_t complete = obj - off;                              // complete-object base
+        uint32_t chd = base + chd_rva, numbc = 0, bca_rva = 0;
+        wg_blink_read_mem(engine->blink, chd + 0x08, &numbc, 4);
+        wg_blink_read_mem(engine->blink, chd + 0x0C, &bca_rva, 4);
+        uint32_t bca = base + bca_rva;
+        if (numbc > 4096) numbc = 4096;
+        *ret = 0;
+        for (uint32_t k = 0; k < numbc; k++) {
+            uint32_t bcd_rva = 0; wg_blink_read_mem(engine->blink, bca + k * 4, &bcd_rva, 4);
+            uint32_t bcd = base + bcd_rva, td_rva = 0;
+            wg_blink_read_mem(engine->blink, bcd + 0x00, &td_rva, 4);
+            if (base + td_rva != dstType) continue;
+            int32_t mdisp = 0, pdisp = 0, vdisp = 0;   // PMD at bcd+0x08
+            wg_blink_read_mem(engine->blink, bcd + 0x08, &mdisp, 4);
+            wg_blink_read_mem(engine->blink, bcd + 0x0C, &pdisp, 4);
+            wg_blink_read_mem(engine->blink, bcd + 0x10, &vdisp, 4);
+            uint32_t p = complete;
+            if (pdisp >= 0) {   // virtual base: vbtable indirection
+                uint32_t vbtable = 0, voff = 0;
+                wg_blink_read_mem(engine->blink, complete + (uint32_t)pdisp, &vbtable, 4);
+                wg_blink_read_mem(engine->blink, vbtable + (uint32_t)vdisp, &voff, 4);
+                p = complete + (uint32_t)pdisp + voff;
+            }
+            *ret = p + (uint32_t)mdisp;
+            break;
+        }
+        return true;
+    }
+
+    // ---- conversion ----
+    if (!strcmp(fn,"atoi")||!strcmp(fn,"_wtoi")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint32_t)(int32_t)atoi(s); return true; }
+    if (!strcmp(fn,"atol")) { char s[64]; wg_read_cstr(engine,A0,s,sizeof s); *ret=(uint32_t)(int32_t)atol(s); return true; }
+    if (!strcmp(fn,"strtol")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; long v=strtol(s,&end,(int)A2); if(A1)wg_blink_write_mem(engine->blink,A1,(uint32_t[]){A0+(uint32_t)(end-s)},4); *ret=(uint32_t)v; return true; }
+    if (!strcmp(fn,"strtoul")) { char s[128]; wg_read_cstr(engine,A0,s,sizeof s); char *end; unsigned long v=strtoul(s,&end,(int)A2); if(A1)wg_blink_write_mem(engine->blink,A1,(uint32_t[]){A0+(uint32_t)(end-s)},4); *ret=(uint32_t)v; return true; }
+
+    // ---- heap extras (base malloc/calloc/free/realloc handled elsewhere) ----
+    if (!strcmp(fn,"_aligned_malloc")) { uint32_t g=wg_guest_alloc(engine,A0); *ret=g; return true; } // page-aligned already
+    if (!strcmp(fn,"_aligned_free"))   { *ret=0; return true; }                    // bump heap: no-op
+    if (!strcmp(fn,"_msize"))          { *ret=A0?0x1000:0; return true; }           // rounded page size (best effort)
+    if (!strcmp(fn,"_set_new_mode"))   { *ret=0; return true; }
+    if (!strcmp(fn,"_callnewh"))       { *ret=0; return true; }
+    if (!strcmp(fn,"_get_heap_handle")){ *ret=0x00D00000; return true; }
+
+    // ---- CRT startup / onexit (return "success"; we don't run atexit at teardown) ----
+    if (!strcmp(fn,"_configure_narrow_argv")) { *ret=0; return true; }
+    if (!strcmp(fn,"_configure_wide_argv"))   { *ret=0; return true; }
+    if (!strcmp(fn,"_initialize_narrow_environment")) { *ret=0; return true; }
+    if (!strcmp(fn,"_initialize_wide_environment"))   { *ret=0; return true; }
+    if (!strcmp(fn,"_initialize_onexit_table")) { *ret=0; return true; }
+    if (!strcmp(fn,"_register_onexit_function")) { *ret=0; return true; }
+    if (!strcmp(fn,"_crt_atexit")||!strcmp(fn,"atexit")||!strcmp(fn,"_onexit")) { *ret=0; return true; }
+    if (!strcmp(fn,"_register_thread_local_exe_atexit_callback")) { *ret=0; return true; }
+    if (!strcmp(fn,"_set_app_type")||!strcmp(fn,"__setusermatherr")) { *ret=0; return true; }
+    if (!strcmp(fn,"_set_fmode")||!strcmp(fn,"_configthreadlocale")) { *ret=0; return true; }
+    if (!strcmp(fn,"_seh_filter_exe")||!strcmp(fn,"_seh_filter_dll")) { *ret=0; return true; } // EXCEPTION_CONTINUE_SEARCH
+    if (!strcmp(fn,"_set_invalid_parameter_handler")||
+        !strcmp(fn,"_set_thread_local_invalid_parameter_handler")) { *ret=0; return true; }
+    if (!strcmp(fn,"_invalid_parameter_noinfo")) { *ret=0; return true; }
+    if (!strcmp(fn,"_get_narrow_winmain_command_line")) { *ret = s_cmdline_page + 0x800; return true; }
+    if (!strcmp(fn,"_get_wide_winmain_command_line"))   { *ret = s_cmdline_page; return true; }
+
+    // ---- formatted output (v*printf family) ----
+    // 6-arg: (options, buffer, count, format, locale, va_list)
+    if (!strcmp(fn,"__stdio_common_vswprintf")||!strcmp(fn,"__stdio_common_vswprintf_s")) {
+        *ret = (uint32_t)(int32_t)wg_guest_vsprintf(engine,true,A1,A2,A3,args[5]); return true; }
+    if (!strcmp(fn,"__stdio_common_vsprintf")||!strcmp(fn,"__stdio_common_vsprintf_s")) {
+        *ret = (uint32_t)(int32_t)wg_guest_vsprintf(engine,false,A1,A2,A3,args[5]); return true; }
+    // 7-arg _s with an extra max_count: (options, buffer, count, max, format, locale, va_list)
+    if (!strcmp(fn,"__stdio_common_vsnwprintf_s")) {
+        *ret = (uint32_t)(int32_t)wg_guest_vsprintf(engine,true,A1,A2,args[4],args[6]); return true; }
+    if (!strcmp(fn,"__stdio_common_vsnprintf_s")) {
+        *ret = (uint32_t)(int32_t)wg_guest_vsprintf(engine,false,A1,A2,args[4],args[6]); return true; }
+
+    // ---- pointer-returning CRT globals (must be a writable guest address) ----
+    if (!strcmp(fn,"_errno"))      { *ret = wg_crt_global(engine,&s_crt_errno);   return true; }
+    if (!strcmp(fn,"__p__commode")){ *ret = wg_crt_global(engine,&s_crt_commode); return true; }
+    if (!strcmp(fn,"__p__fmode"))  { *ret = wg_crt_global(engine,&s_crt_fmode);   return true; }
+
+    #undef A0
+    #undef A1
+    #undef A2
+    #undef A3
+    return false;
+}
+
+// ===== Directory enumeration (FindFirstFile/FindNextFile/FindClose) ==========
+// The old stub returned INVALID_HANDLE for FindFirstFile, so the guest could
+// never discover files — UE4 found none of its pakchunk*.pak content and quit.
+// Snapshot the matching leaf names at FindFirst time and iterate.
+#define WG_FIND_BASE   0xF1000000u
+#define WG_MAX_FINDS   64
+typedef struct {
+    bool  in_use;
+    char  dir[1024];   // real host directory
+    char **names;      // matched leaf names
+    int   count, pos;
+} WGFindState;
+static WGFindState s_finds[WG_MAX_FINDS];
+
+// Fill a WIN32_FIND_DATAW (0x250 bytes) for `name` in real dir `dir`.
+static void wg_write_find_data(WGEngine *engine, uint32_t data_addr,
+                               const char *dir, const char *name) {
+    if (!data_addr) return;
+    uint8_t fd[0x250]; memset(fd, 0, sizeof(fd));
+    char full[2048]; snprintf(full, sizeof(full), "%s/%s", dir, name);
+    uint32_t attrs = 0x80;           // FILE_ATTRIBUTE_NORMAL
+    uint64_t size = 0;
+    struct stat st;
+    if (stat(full, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) attrs = 0x10;   // FILE_ATTRIBUTE_DIRECTORY
+        else size = (uint64_t)st.st_size;
+    }
+    memcpy(fd + 0x00, &attrs, 4);
+    uint32_t hi = (uint32_t)(size >> 32), lo = (uint32_t)size;
+    memcpy(fd + 0x1C, &hi, 4);
+    memcpy(fd + 0x20, &lo, 4);
+    for (int i = 0; name[i] && i < 259; i++) {   // cFileName[260] wide at +0x2C
+        uint16_t w = (uint8_t)name[i];
+        memcpy(fd + 0x2C + i * 2, &w, 2);
+    }
+    wg_blink_write_mem(engine->blink, data_addr, fd, sizeof(fd));
+}
+
+// Native startup-movie playback (WGMetalBackend.m; weak no-op stub on headless).
+extern void wg_gpu_play_movie(const char *dir);
+
+// FindFirstFile: map the guest pattern, glob the directory, snapshot matches.
+// Returns the guest search handle (WG_FIND_BASE+idx) or INVALID_HANDLE_VALUE.
+static uint64_t wg_findfile_first(WGEngine *engine, uint32_t pattern_addr,
+                                  uint32_t data_addr) {
+    uint16_t wpat[600] = {0}; char apat[600] = {0};
+    if (pattern_addr) {
+        wg_blink_read_mem(engine->blink, pattern_addr, wpat, sizeof(wpat) - 2);
+        for (int i = 0; i < 599 && wpat[i]; i++) apat[i] = wpat[i] < 128 ? (char)wpat[i] : '_';
+    }
+    char mapbuf[1024]; strncpy(mapbuf, apat, sizeof(mapbuf) - 1); mapbuf[sizeof(mapbuf)-1] = 0;
+    const char *real = wg_files_map_path(pattern_addr, engine->blink, mapbuf, sizeof(mapbuf));
+    if (!real) return (engine->pe_image && engine->pe_image->is_64bit) ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFu;
+
+    // WG_SKIP_MOVIES: report ZERO startup movies so UE4's FDefaultGameMoviePlayer
+    // has nothing to play and skips straight to the game (the first D3D-rendered
+    // frame / menu). Visage's logo movies need Media Foundation video decode which
+    // we don't implement, so the movie player otherwise busy-waits forever on a
+    // movie frame that never arrives, gating the first Present. Case-insensitive
+    // match on ".../Content/Movies" in the mapped path.
+    // WG_NATIVE_MOVIE: additionally decode+present the game's logo movies natively
+    // (VideoToolbox) — so you SEE the game's intro while the guest grinds through
+    // the (hours-long) UObject drain that gates its own first Present.
+    { static signed char skipmov = -1, natmov = -1;
+      if (skipmov < 0) skipmov = getenv("WG_SKIP_MOVIES") ? 1 : 0;
+      if (natmov  < 0) natmov  = getenv("WG_NATIVE_MOVIE") ? 1 : 0;
+      if (skipmov || natmov) {
+        const char *p = real; int hit = 0;
+        for (const char *q = p; *q; q++) {
+            if ((q[0]=='M'||q[0]=='m') && strncasecmp(q, "Movies", 6) == 0) { hit = 1; break; }
+        }
+        if (hit) {
+            if (natmov) {
+                // Extract the movies directory (real minus the trailing glob).
+                char mdir[1024]; strncpy(mdir, real, sizeof(mdir)-1); mdir[sizeof(mdir)-1]=0;
+                char *sl = strrchr(mdir, '/'); if (sl) *sl = 0;
+                WG_LOGW(TAG, "WG_NATIVE_MOVIE: playing game logos natively from '%s'", mdir);
+                wg_gpu_play_movie(mdir);
+            }
+            WG_LOGW(TAG, "movie enum: reporting no files in '%s' (guest skips its MF path)", real);
+            s_last_error = 2; // ERROR_FILE_NOT_FOUND
+            return (engine->pe_image && engine->pe_image->is_64bit) ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFu;
+        }
+      }
+    }
+
+    // Split into directory + glob (last separator).
+    char rdir[1024]; const char *glob = "*";
+    strncpy(rdir, real, sizeof(rdir) - 1); rdir[sizeof(rdir)-1] = 0;
+    char *slash = strrchr(rdir, '/');
+    if (slash) { *slash = 0; glob = slash + 1; }
+    if (!glob[0]) glob = "*";
+
+    DIR *d = opendir(rdir);
+    if (!d) { s_last_error = 3; // ERROR_PATH_NOT_FOUND
+              return (engine->pe_image && engine->pe_image->is_64bit) ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFu; }
+
+    int slot = -1;
+    for (int i = 0; i < WG_MAX_FINDS; i++) if (!s_finds[i].in_use) { slot = i; break; }
+    if (slot < 0) { closedir(d); return (engine->pe_image && engine->pe_image->is_64bit) ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFu; }
+
+    WGFindState *fs = &s_finds[slot];
+    memset(fs, 0, sizeof(*fs));
+    strncpy(fs->dir, rdir, sizeof(fs->dir) - 1);
+    int cap = 16; fs->names = malloc(sizeof(char*) * cap);
+    struct dirent *e;
+    while ((e = readdir(d)) && fs->names) {
+        if (fnmatch(glob, e->d_name, FNM_CASEFOLD) != 0) continue;
+        if (fs->count >= cap) { cap *= 2; char **n = realloc(fs->names, sizeof(char*) * cap);
+                                if (!n) break; fs->names = n; }
+        fs->names[fs->count++] = strdup(e->d_name);
+    }
+    closedir(d);
+    if (fs->count == 0) { free(fs->names); fs->names = NULL;
+        s_last_error = 2; // ERROR_FILE_NOT_FOUND
+        return (engine->pe_image && engine->pe_image->is_64bit) ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFu; }
+    fs->in_use = true;
+    fs->pos = 1;
+    wg_write_find_data(engine, data_addr, fs->dir, fs->names[0]);
+    WG_LOGI(TAG, "FindFirstFile('%s') in %s -> %d matches (first '%s')",
+            glob, fs->dir, fs->count, fs->names[0]);
+    return WG_FIND_BASE + (uint32_t)slot;
+}
+
+static uint32_t wg_findfile_next(WGEngine *engine, uint32_t handle, uint32_t data_addr) {
+    if (handle < WG_FIND_BASE || handle >= WG_FIND_BASE + WG_MAX_FINDS) return 0;
+    WGFindState *fs = &s_finds[handle - WG_FIND_BASE];
+    if (!fs->in_use || fs->pos >= fs->count) { s_last_error = 18; return 0; } // ERROR_NO_MORE_FILES
+    wg_write_find_data(engine, data_addr, fs->dir, fs->names[fs->pos]);
+    fs->pos++;
+    return 1;
+}
+
+static void wg_findfile_close(uint32_t handle) {
+    if (handle < WG_FIND_BASE || handle >= WG_FIND_BASE + WG_MAX_FINDS) return;
+    WGFindState *fs = &s_finds[handle - WG_FIND_BASE];
+    if (!fs->in_use) return;
+    for (int i = 0; i < fs->count; i++) free(fs->names[i]);
+    free(fs->names);
+    memset(fs, 0, sizeof(*fs));
+}
+
+// General address-trace: HLT breakpoints that log register state when hit, then
+// restore/step/re-arm. Gated by WG_TRACE. Used to trace where a value (e.g.
+// GuardedMain's return code) originates.
+#define WG_MAX_TRACE 24
+static struct { uint32_t addr; uint8_t orig; bool armed; const char *label; } s_trace[WG_MAX_TRACE];
+static int s_trace_count = 0;
+static void wg_trace_add(uint32_t addr, const char *label) {
+    if (s_trace_count < WG_MAX_TRACE) { s_trace[s_trace_count].addr = addr;
+        s_trace[s_trace_count].label = label; s_trace[s_trace_count].armed = false; s_trace_count++; }
+}
+
+// ── WaitOnAddress / WakeByAddress (Win8+ futex) ──────────────────────────────
+// UE4's task-graph "parking lot" (FEventCount / low-level thread coordination)
+// is built on these. They were R1S/RS stubs: WaitOnAddress returned immediately
+// (never blocking) and WakeByAddress did nothing, so worker dispatch never
+// coordinated -> the boot deadlock. Real impl: block while the AddressSize bytes
+// at Address still equal those at CompareAddress, until a WakeByAddress broadcast
+// (or timeout). One global lock+cond with broadcast-and-recheck is correct — a
+// spurious wake just re-reads guest memory. Guest memory is read WITHOUT the GIL
+// (released via wg_thunk_block_begin by the caller), same as wg_sync waits.
+static pthread_mutex_t s_woa_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_woa_cond = PTHREAD_COND_INITIALIZER;
+static int wg_wait_on_address(WGEngine *e, uint32_t addr, uint32_t cmp,
+                              uint32_t size, uint32_t ms) {
+    if (size == 0 || size > 8) size = (size > 8) ? 8 : 1;
+    uint8_t want[8] = {0}, cur[8] = {0};
+    wg_blink_read_mem(e->blink, cmp, want, size);
+    bool timed = (ms != 0xFFFFFFFFu);
+    uint64_t deadline = 0;
+    if (timed) { struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
+        deadline = (uint64_t)n.tv_sec * 1000 + n.tv_nsec / 1000000 + ms; }
+    pthread_mutex_lock(&s_woa_lock);
+    int rv;
+    for (;;) {
+        wg_blink_read_mem(e->blink, addr, cur, size);
+        if (memcmp(cur, want, size) != 0) { rv = 1; break; }   // value changed
+        // Bounded wait: woken early by WakeByAddress, else re-poll every 1ms so a
+        // value change WITHOUT a wake (UE4 does this) is still caught — avoids the
+        // indefinite hang while staying off the 100%-spin the old stub caused.
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&s_woa_cond, &s_woa_lock, &ts);
+        if (timed) { struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
+            uint64_t now = (uint64_t)n.tv_sec * 1000 + n.tv_nsec / 1000000;
+            if (now >= deadline) {
+                wg_blink_read_mem(e->blink, addr, cur, size);
+                rv = (memcmp(cur, want, size) != 0) ? 1 : 0;   // FALSE(0) => ERROR_TIMEOUT
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_woa_lock);
+    return rv;
+}
+static void wg_wake_by_address(void) {
+    pthread_mutex_lock(&s_woa_lock);
+    pthread_cond_broadcast(&s_woa_cond);   // all waiters re-check their own address
+    pthread_mutex_unlock(&s_woa_lock);
+}
+
+// WG_WAITCAP=<ms>: cap FINITE wait/sleep timeouts to <ms>. UE4 workers park on
+// WaitForSingleObject(work_event, 500ms) and coordination advances one poll at a
+// time, so 500ms granularity makes boot crawl (~2 min/phase). Capping to e.g.
+// 20ms makes the polls ~25x faster -> coordination proceeds far quicker (and can
+// break a poll-based stall). INFINITE (0xFFFFFFFF) and 0 are left untouched.
+static uint32_t wg_cap_timeout(uint32_t ms) {
+    static int32_t s_cap = -2, s_cap_inf = -2;
+    if (s_cap == -2) { const char *e = getenv("WG_WAITCAP"); s_cap = e ? atoi(e) : -1; }
+    if (s_cap_inf == -2) { const char *e = getenv("WG_WAITCAP_INF"); s_cap_inf = e ? atoi(e) : 0; }
+    if (s_cap <= 0) return ms;                       // disabled
+    if (ms == 0) return ms;                          // poll-now untouched
+    // Cap only WORKER threads (tid != 1). The MAIN thread (tid 1) runs config-parse
+    // whose finite waits are timing-sensitive — capping them broke boot. Workers
+    // just poll their task queues, so a shorter poll only speeds task pickup.
+    if (s_cur_guest_tid == 1) return ms;
+    if (ms == 0xFFFFFFFFu) {
+        // Worker INFINITE wait -> turn into a poll ONLY if WG_WAITCAP_INF is set.
+        // Breaks a "clean" deadlock where a worker parks forever on an event that
+        // is never SetEvent'd but whose task IS enqueued (worker re-checks its queue
+        // each poll). Off by default (changing INF semantics is risky).
+        return s_cap_inf ? (uint32_t)s_cap_inf : ms;
+    }
+    return (ms > (uint32_t)s_cap) ? (uint32_t)s_cap : ms;
+}
+
 // Check if RIP is in the thunk range and handle the Win32 API call.
 // Returns true if a thunk was handled.
 static bool handle_blink_thunk(WGEngine *engine) {
     uint64_t rip = wg_blink_get_rip(engine->blink);
+    s_thunk_progress++;   // deadlock-watchdog progress heartbeat
+
+    for (int i = 0; i < s_trace_count; i++) {
+        if (!s_trace[i].armed || rip != s_trace[i].addr) continue;
+        uint64_t trcx = wg_blink_get_reg(engine->blink, 1);
+        uint32_t tvt = 0; wg_blink_read_mem(engine->blink, (uint32_t)trcx, &tvt, 4);  // [RCX] vtable
+        WG_LOGW(TAG, "TRACE %s @0x%llX: RAX=0x%llX RCX=0x%llX [RCX]=0x%X RDX=0x%llX R8=0x%llX RSP=0x%llX",
+                s_trace[i].label, (unsigned long long)rip,
+                (unsigned long long)wg_blink_get_reg(engine->blink, 0),
+                (unsigned long long)trcx, tvt,
+                (unsigned long long)wg_blink_get_reg(engine->blink, 2),
+                (unsigned long long)wg_blink_get_reg(engine->blink, 8),
+                (unsigned long long)wg_blink_get_reg(engine->blink, 4));
+        s_trace[i].armed = false;  // one-shot: disarm after first hit (avoid spin spam)
+        // Walk the stack for .text return addresses (rough caller chain).
+        if (getenv("WG_TRACE_STACK")) {
+            uint32_t sp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+            char chain[400]; int ci = 0, found = 0;
+            uint32_t lo = engine->pe_image ? (uint32_t)engine->pe_image->image_base + 0x1000 : 0x401000;
+            uint32_t hi = engine->pe_image ? (uint32_t)engine->pe_image->image_base + 0x2358000 : 0x2758000;
+            for (int w = 0; w < 200 && found < 12; w++) {
+                uint32_t v = 0; wg_blink_read_mem(engine->blink, sp + (uint32_t)w * 8, &v, 4);
+                if (v >= lo && v < hi) { ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v); found++; }
+            }
+            WG_LOGW(TAG, "  callers: %s", chain);
+        }
+        wg_blink_write_mem(engine->blink, rip, &s_trace[i].orig, 1);
+        wg_blink_set_rip(engine->blink, (uint32_t)rip);
+        wg_blink_step(engine->blink);
+        if (s_trace[i].armed) { uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, rip, &hlt, 1); }
+        return true;
+    }
 
     // Real-threads: handle the FUNCTIONAL cipher-list max_ver trap here (not just
     // in the main tick) because the ClientHello is built on whichever thread runs
@@ -1712,6 +2912,46 @@ static bool handle_blink_thunk(WGEngine *engine) {
         wg_blink_step(engine->blink);
         uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_watch_addr, &hlt, 1);
         return true;
+    }
+
+    // [facwatch] WG_FACWATCH=1: trap the Visage boot-blocking +0x38 factory call
+    // (guest 0xe18b46 = `movq (%rcx),%rax`, just before `call [rax+0x38]` which
+    // fills [rsp+0x48] and returns NULL). Logs prevobj + its vtable + the +0x38
+    // method address so the null-returning factory can be identified/disassembled.
+    {
+        static uint32_t s_fw_addr = 0xe18b46;
+        static uint8_t  s_fw_orig = 0;
+        static bool     s_fw_armed = false;
+        static signed char s_fw_on = -1;
+        if (s_fw_on < 0) s_fw_on = getenv("WG_FACWATCH") ? 1 : 0;
+        if (s_fw_on && !s_fw_armed) {
+            // Wait until the shipping exe's real code (`48 8b 01` = movq (%rcx),%rax)
+            // is loaded at 0xe18b46 — arming during the launcher phase reads 0x00 and
+            // the HLT gets overwritten when the image loads.
+            uint8_t op[3] = {0};
+            if (wg_blink_read_mem(engine->blink, s_fw_addr, op, 3) &&
+                op[0] == 0x48 && op[1] == 0x8b && op[2] == 0x01) {
+                s_fw_orig = op[0];
+                uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_fw_addr, &hlt, 1);
+                s_fw_armed = true;
+                WG_LOGW(TAG, "[facwatch] armed @0x%X", s_fw_addr);
+            }
+        }
+        if (s_fw_armed && rip == s_fw_addr) {
+            uint32_t rcxo = (uint32_t)wg_blink_get_reg(engine->blink, 1); // prevobj
+            uint64_t vt = 0, m38 = 0;
+            wg_blink_read_mem(engine->blink, rcxo, &vt, 8);
+            if (vt) wg_blink_read_mem(engine->blink, (uint32_t)vt + 0x38, &m38, 8);
+            static int _fw = 0;
+            if (_fw++ < 12)
+                WG_LOGW(TAG, "[facwatch] tid=0x%X prevobj=0x%X vtable=0x%llx [+0x38]=0x%llx",
+                        s_cur_guest_tid, rcxo, (unsigned long long)vt, (unsigned long long)m38);
+            wg_blink_write_mem(engine->blink, s_fw_addr, &s_fw_orig, 1);
+            wg_blink_set_rip(engine->blink, s_fw_addr);
+            wg_blink_step(engine->blink);
+            uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_fw_addr, &hlt, 1);
+            return true;
+        }
     }
 
     // Real-threads: cap the SSL_CTX max_proto_version at SSL_CTX_set_cipher_list
@@ -1741,6 +2981,28 @@ static bool handle_blink_thunk(WGEngine *engine) {
         wg_blink_set_rip(engine->blink, s_cloop_addr);
         wg_blink_step(engine->blink);
         uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_cloop_addr, &hlt, 1);
+        return true;
+    }
+
+    // D3D11/DXGI COM vtable method call (a separate thunk region). x64
+    // caller-clean: the callee pops only the return address. this=RCX.
+    if (wg_d3d11_is_thunk(rip)) {
+        uint64_t rsp = wg_blink_get_reg(engine->blink, 4);
+        uint64_t ret_addr = 0;
+        wg_blink_read_mem(engine->blink, rsp, &ret_addr, 8);
+        uint32_t cargs[16] = {0};
+        cargs[0] = (uint32_t)wg_blink_get_reg(engine->blink, 1); // RCX (this)
+        cargs[1] = (uint32_t)wg_blink_get_reg(engine->blink, 2); // RDX
+        cargs[2] = (uint32_t)wg_blink_get_reg(engine->blink, 8); // R8
+        cargs[3] = (uint32_t)wg_blink_get_reg(engine->blink, 9); // R9
+        uint64_t stackargs[12] = {0};
+        wg_blink_read_mem(engine->blink, rsp + 8 + 32, stackargs, sizeof(stackargs));
+        for (int i = 0; i < 12; i++) cargs[4 + i] = (uint32_t)stackargs[i];
+        uint64_t cret = 0;
+        wg_d3d11_dispatch(engine, rip, cargs, &cret);
+        wg_blink_set_reg(engine->blink, 4, rsp + 8);     // pop return addr
+        wg_blink_set_rip(engine->blink, (uint32_t)ret_addr);
+        wg_blink_set_reg(engine->blink, 0, cret);         // RAX
         return true;
     }
 
@@ -1836,6 +3098,18 @@ static bool handle_blink_thunk(WGEngine *engine) {
         }
     }
 
+    if (entry && getenv("WG_WORKERLOG")) {
+        // Diagnostic: log EVERY thunk from a worker thread (tid != 1), bypassing
+        // the quiet-list, so we can see what a parked worker is actually calling.
+        uint32_t _wtid = engine->scheduler ? wg_sched_current_tid(engine->scheduler) : 0;
+        if (_wtid != 0 && _wtid != 1) {
+            static int _wn = 0;
+            if (_wn++ < 200)
+                WG_LOGW(TAG, "[worker tid=0x%X] %s (rip=0x%llX)",
+                        _wtid, entry->func_name, (unsigned long long)rip);
+        }
+    }
+
     if (entry) {
         // Suppress noisy repetitive calls
         static const char *quiet_funcs[] = {
@@ -1868,6 +3142,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
         for (int i = 0; quiet_funcs[i]; i++) {
             if (strcmp(entry->func_name, quiet_funcs[i]) == 0) { quiet = true; break; }
         }
+        // Also quiet the high-frequency CRT mem/str helpers — they dominate the
+        // trace and drown out real progress (only matters for the log, not dispatch).
+        if (!quiet && getenv("WG_QUIET_CRT")) {
+            const char *f2 = entry->func_name;
+            if (strncmp(f2,"mem",3)==0 || strncmp(f2,"wcs",3)==0 ||
+                strncmp(f2,"str",3)==0 || strncmp(f2,"_wcs",4)==0) quiet = true;
+        }
         if (!quiet) {
             uint32_t cur_tid = s_use_real_threads ? s_cur_guest_tid
                                                   : wg_sched_current_tid(engine->scheduler);
@@ -1879,6 +3160,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_blink_read_mem(engine->blink, peek_rsp + 4,  &a0, 4);
                 wg_blink_read_mem(engine->blink, peek_rsp + 8,  &a1, 4);
                 wg_blink_read_mem(engine->blink, peek_rsp + 12, &a2, 4);
+            } else if (!peek_32) {
+                a0 = (uint32_t)wg_blink_get_reg(engine->blink, 1);  // RCX
+                a1 = (uint32_t)wg_blink_get_reg(engine->blink, 2);  // RDX
+                a2 = (uint32_t)wg_blink_get_reg(engine->blink, 8);  // R8
             }
             WG_LOGI(TAG, "[tid=%X] Win32: %s!%s(0x%X,0x%X,0x%X)",
                     cur_tid, entry->dll_name, entry->func_name, a0, a1, a2);
@@ -1903,9 +3188,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
     // For 32-bit cdecl/stdcall, arguments are on the stack after the return address.
     // Read up to 16 args (CreateFontW has 14 params; reading a few extra words
     // past a shorter call's args is harmless — we only use the indices we need).
+    // For 64-bit (Microsoft x64): RCX, RDX, R8, R9, then stack args after the
+    // return address + 32-byte shadow space. Truncating to 32 bits is safe:
+    // 64-bit images are rebased below 4GB and stack/heap/thunks all sit there.
     uint32_t args[16] = {0};
     if (is_32bit) {
         wg_blink_read_mem(engine->blink, rsp + 4, args, sizeof(args));
+    } else {
+        args[0] = (uint32_t)wg_blink_get_reg(engine->blink, 1);  // RCX
+        args[1] = (uint32_t)wg_blink_get_reg(engine->blink, 2);  // RDX
+        args[2] = (uint32_t)wg_blink_get_reg(engine->blink, 8);  // R8
+        args[3] = (uint32_t)wg_blink_get_reg(engine->blink, 9);  // R9
+        uint64_t stack_args[12] = {0};
+        wg_blink_read_mem(engine->blink, rsp + 8 + 32, stack_args, sizeof(stack_args));
+        for (int i = 0; i < 12; i++) args[4 + i] = (uint32_t)stack_args[i];
     }
 
     // Default return value: the registered stub's intent (R1S->1, etc.). The
@@ -1918,8 +3214,48 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (entry) {
         const char *fn = entry->func_name;
 
+        // [VIEWER heartbeat] every N registered-thunk calls, print a liveness/phase
+        // line to stderr (visible at WG_LOG_LEVEL=E). The guest caller addr reveals
+        // the phase (0x9xxxxx config-init, 0xA/0xBxxxxx shader/UObject grind). Lets a
+        // long full-speed grind be observed without the disk-I/O throttle of INFO logs.
+        {
+            static unsigned long long s_hb_calls = 0; static unsigned long s_hb_every = 0;
+            if (!s_hb_every) { const char *e = getenv("WG_HB");
+                s_hb_every = (e && strtoul(e,0,0)) ? strtoul(e,0,0) : 2000000UL; }
+            if ((++s_hb_calls % s_hb_every) == 0)
+                fprintf(stderr, "[HB] %llu thunk-calls  caller=0x%llx  last=%s\n",
+                        s_hb_calls, (unsigned long long)ret_addr, fn ? fn : "?");
+        }
+
+        // [objfill DIAG] WG_OBJDIAG=1: name imported calls whose return address is in
+        // a watched code range — used to identify the imports feeding a corrupt/NULL
+        // out-param object (e.g. CoCreateInstance for WMI, EnterCriticalSection for the
+        // Visage config-parse factory). Off by default.
+        static signed char s_objdiag = -1;
+        if (s_objdiag < 0) s_objdiag = getenv("WG_OBJDIAG") ? 1 : 0;
+        if (s_objdiag && !is_32bit &&
+            ((ret_addr >= 0x9f3c00 && ret_addr <= 0x9f4a00) ||
+             (ret_addr >= 0x90fb00 && ret_addr <= 0x90fc00) ||
+             (ret_addr >= 0x519900 && ret_addr <= 0x519f00))) {
+            static int s_objfill_diag = 0;
+            if (s_objfill_diag++ < 120)
+                WG_LOGW(TAG, "[objfill] ret=0x%llx %s!%s rcx=0x%x rdx=0x%x r8=0x%x r9=0x%x arg5=0x%x",
+                        (unsigned long long)ret_addr, entry->dll_name ? entry->dll_name : "?",
+                        fn, args[0], args[1], args[2], args[3], args[4]);
+        }
+
         if (entry->dll_name && strcasecmp(entry->dll_name, "nsDialogs.dll") == 0) {
             ret_val = handle_nsdialogs(engine, fn, args);
+        } else if (wg_try_crt(engine, fn, args, &ret_val)) {
+            // Handled as a C runtime function (string/memory/ctype/heap/startup).
+        } else if (strcmp(fn, "CreateDXGIFactory") == 0 ||
+                   strcmp(fn, "CreateDXGIFactory1") == 0 ||
+                   strcmp(fn, "CreateDXGIFactory2") == 0) {
+            ret_val = wg_d3d11_CreateDXGIFactory(engine, args, fn[16] != 0);
+        } else if (strcmp(fn, "D3D11CreateDevice") == 0) {
+            ret_val = wg_d3d11_D3D11CreateDevice(engine, args, false);
+        } else if (strcmp(fn, "D3D11CreateDeviceAndSwapChain") == 0) {
+            ret_val = wg_d3d11_D3D11CreateDevice(engine, args, true);
         } else if (strcmp(fn, "CreateWindowExW") == 0) {
             // stdcall CreateWindowExW(exStyle, className, windowName, style,
             //                         x, y, w, h, parent, menu, instance, param)
@@ -2299,7 +3635,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // CRT exit functions. Auto-stubs merely RETURN, so the CRT teardown
             // runs off the end into garbage (RIP=0xffff crash). Halt the VM like
             // ExitProcess so a normal console app terminates cleanly.
-            WG_LOGI(TAG, "%s(%u) -> halt", fn, args[0]);
+            WG_LOGW(TAG, "%s(%u) -> halt (called from 0x%llX)", fn, args[0],
+                    (unsigned long long)ret_addr);
             wg_blink_set_rip(engine->blink, 0);
             return true;
         } else if (strcmp(fn, "ExitProcess") == 0) {
@@ -2583,42 +3920,120 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // on CPU count (Steam's BUseIOCP) use the synchronous socket path we
             // support. Must be a real handler — auto-stub (num_args=0) on this
             // 1-arg stdcall would corrupt the guest stack for the next call.
-            if (args[0]) {
+            bool si64 = (engine->pe_image && engine->pe_image->is_64bit);
+            if (args[0] && si64) {
+                // x64 SYSTEM_INFO (48 bytes, 8-byte pointer fields). The 32-bit
+                // layout put lpMaximumApplicationAddress in the wrong place, so
+                // UE4's FMallocBinned2 read a garbage 64-bit max address and
+                // sized a multi-GB pool reservation off it. A modest max keeps
+                // the reservation inside our sub-4GB guest.
+                uint8_t si[48] = {0};
+                uint32_t v32; uint64_t v64;
+                uint16_t arch = 9; memcpy(si + 0, &arch, 2);   // PROCESSOR_ARCHITECTURE_AMD64
+                v32 = 4096;        memcpy(si + 4,  &v32, 4);   // dwPageSize
+                v64 = 0x00010000;  memcpy(si + 8,  &v64, 8);   // lpMinimumApplicationAddress
+                v64 = 0xF0000000ULL; memcpy(si + 16, &v64, 8);  // lpMaximumApplicationAddress (~3.75GB — covers the expanded 32-bit heap region 2 at 0xA0000000..0xF0000000 so FMallocBinned2 accepts those pool pointers; stays in uint32_t so no handler truncation)
+                v64 = wg_cpumask(); memcpy(si + 24, &v64, 8);  // dwActiveProcessorMask
+                v32 = wg_ncpu();   memcpy(si + 32, &v32, 4);   // dwNumberOfProcessors
+                v32 = 8664;        memcpy(si + 36, &v32, 4);   // dwProcessorType
+                v32 = 0x00010000;  memcpy(si + 40, &v32, 4);   // dwAllocationGranularity
+                uint16_t w16 = 6;  memcpy(si + 44, &w16, 2);   // wProcessorLevel
+                wg_blink_write_mem(engine->blink, args[0], si, 48);
+            } else if (args[0]) {
                 uint8_t si[36] = {0};
                 uint32_t v32;
                 v32 = 4096;       memcpy(si + 4,  &v32, 4); // dwPageSize
                 v32 = 0x00010000; memcpy(si + 8,  &v32, 4); // lpMinimumApplicationAddress
                 v32 = 0x7FFE0000; memcpy(si + 12, &v32, 4); // lpMaximumApplicationAddress
-                v32 = 1;          memcpy(si + 16, &v32, 4); // dwActiveProcessorMask
-                v32 = 1;          memcpy(si + 20, &v32, 4); // dwNumberOfProcessors
+                v32 = (uint32_t)wg_cpumask(); memcpy(si + 16, &v32, 4); // dwActiveProcessorMask
+                v32 = wg_ncpu();  memcpy(si + 20, &v32, 4); // dwNumberOfProcessors
                 v32 = 586;        memcpy(si + 24, &v32, 4); // dwProcessorType (PROCESSOR_INTEL_PENTIUM)
                 v32 = 0x00010000; memcpy(si + 28, &v32, 4); // dwAllocationGranularity
                 uint16_t w16 = 6; memcpy(si + 32, &w16, 2); // wProcessorLevel
                 wg_blink_write_mem(engine->blink, args[0], si, 36);
             }
-            WG_LOGI(TAG, "%s -> 1 processor", fn);
+            WG_LOGI(TAG, "%s -> %d processor(s)", fn, wg_ncpu());
             ret_val = 0;
+        } else if (strcmp(fn, "GetLogicalProcessorInformation") == 0) {
+            // GetLogicalProcessorInformation(Buffer, ReturnedLength). UE4 counts
+            // RelationProcessorCore records here to size its task-graph worker pool
+            // — with 0/1 it builds a degenerate graph and the main thread deadlocks.
+            // Report wg_ncpu() cores (each a 32-byte SYSTEM_LOGICAL_PROCESSOR_INFORMATION
+            // on x64: ProcessorMask u64, Relationship u32=0 (RelationProcessorCore),
+            // pad u32, union u64x2). Two-call size probe: FALSE + ERROR_INSUFFICIENT_BUFFER
+            // when the buffer is too small.
+            int n = wg_ncpu();
+            uint32_t need = (uint32_t)n * 32;
+            uint32_t plen = args[1], have = 0;
+            if (plen) wg_blink_read_mem(engine->blink, plen, &have, 4);
+            if (!args[0] || have < need) {
+                if (plen) wg_blink_write_mem(engine->blink, plen, &need, 4);
+                s_last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                ret_val = 0;        // FALSE
+            } else {
+                for (int i = 0; i < n; i++) {
+                    uint8_t rec[32] = {0};
+                    uint64_t mask = 1ull << i;
+                    memcpy(rec + 0, &mask, 8);   // ProcessorMask = this core
+                    // rec[8..11] Relationship = 0 (RelationProcessorCore); rest 0
+                    wg_blink_write_mem(engine->blink, args[0] + (uint32_t)(i * 32), rec, 32);
+                }
+                if (plen) wg_blink_write_mem(engine->blink, plen, &need, 4);
+                ret_val = 1;        // TRUE
+            }
+            WG_LOGI(TAG, "GetLogicalProcessorInformation -> %d cores (need=%u have=%u)", n, need, have);
+        } else if (strcmp(fn, "GlobalMemoryStatusEx") == 0) {
+            // MEMORYSTATUSEX (DWORDLONG fields, same layout on 32/64-bit). Report
+            // a modest, sane machine — otherwise the buffer keeps its garbage
+            // stack contents and UE4 sizes its allocator pools off nonsense.
+            if (args[0]) {
+                uint32_t v32; uint64_t v64;
+                v32 = 30;          wg_blink_write_mem(engine->blink, args[0] + 0x04, &v32, 4); // dwMemoryLoad
+                v64 = 0x80000000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x08, &v64, 8); // ullTotalPhys (2GB)
+                v64 = 0x40000000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x10, &v64, 8); // ullAvailPhys (1GB)
+                v64 = 0x80000000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x18, &v64, 8); // ullTotalPageFile
+                v64 = 0x40000000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x20, &v64, 8); // ullAvailPageFile
+                v64 = 0x7FFF0000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x28, &v64, 8); // ullTotalVirtual
+                v64 = 0x40000000ULL; wg_blink_write_mem(engine->blink, args[0] + 0x30, &v64, 8); // ullAvailVirtual
+                v64 = 0;             wg_blink_write_mem(engine->blink, args[0] + 0x38, &v64, 8); // ullAvailExtendedVirtual
+            }
+            ret_val = 1;
         } else if (strcmp(fn, "GetCommandLineW") == 0 ||
                    strcmp(fn, "GetCommandLineA") == 0) {
-            // Map a page at 0xA00000 on first call (W at +0, A at +0x100)
+            // Map the cmdline page on first call (W at +0, A at +0x800). The
+            // page address (s_cmdline_page) is relocated above the image for
+            // large 64-bit PEs so it doesn't clobber the game's .text.
+            // The A slot must sit past the longest W line: a quoted install
+            // path (…\Visage\Binaries\Win64\Visage-Win64-Shipping.exe) is
+            // 200+ bytes as UTF-16, which overran the old +0x100 A slot and
+            // left the W string unterminated.
             if (!s_cmdpage_mapped) {
                 const char *winpath = wg_files_exe_win_path();
+                // Extra switches appended to the guest command line. -ansimalloc
+                // forces UE4 to use FMallocAnsi (plain malloc/free, which we back)
+                // instead of FMallocBinned2, whose pool-canary bookkeeping assumes
+                // exact Windows VirtualAlloc reserve/commit semantics we can't
+                // fully reproduce (it otherwise fails "Corruption Canary" on boot).
+                const char *extra = s_cmdline_extra[0] ? s_cmdline_extra : "";
                 uint8_t page[0x1000];
                 memset(page, 0, sizeof(page));
                 // Wide command line at offset 0
                 uint16_t *wcmd = (uint16_t *)page;
                 wcmd[0] = '"';
                 int i = 0;
-                for (; winpath[i] && i < 250; i++)
+                for (; winpath[i] && i < 500; i++)
                     wcmd[i + 1] = (uint8_t)winpath[i];
-                wcmd[i + 1] = '"'; wcmd[i + 2] = 0;
-                // ANSI command line at offset 0x100
-                char *acmd = (char *)(page + 0x100);
-                snprintf(acmd, 256, "\"%s\"", winpath);
-                wg_blink_load_code(engine->blink, 0xA00000, page, 0x1000, 0);
+                wcmd[i + 1] = '"';
+                int w = i + 2;
+                for (int k = 0; extra[k] && w < 1000; k++) wcmd[w++] = (uint8_t)extra[k];
+                wcmd[w] = 0;
+                // ANSI command line at offset 0x800
+                char *acmd = (char *)(page + 0x800);
+                snprintf(acmd, 0x7FF, "\"%s\"%s", winpath, extra);
+                wg_blink_load_code(engine->blink, s_cmdline_page, page, 0x1000, 0);
                 s_cmdpage_mapped = true;
             }
-            ret_val = (fn[14] == 'W') ? 0xA00000 : 0xA00100;
+            ret_val = (fn[14] == 'W') ? s_cmdline_page : s_cmdline_page + 0x800;
         } else if (strcmp(fn, "CommandLineToArgvW") == 0) {
             // CommandLineToArgvW(lpCmdLine=args[0], pNumArgs=args[1])
             // Read the wide command line from guest memory
@@ -2628,18 +4043,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Count wchars
             int len = 0;
             while (len < 511 && cmdw[len]) len++;
-            // Allocate guest memory: argv[0] pointer (4 bytes) + string data
+            // Allocate guest memory: argv[0] pointer + string data. The
+            // pointer slot must be guest-pointer-sized — a 64-bit guest reads
+            // argv[0] as 8 bytes, so a 4-byte slot leaks string chars into the
+            // pointer's high half.
+            uint32_t psz = (engine->pe_image && engine->pe_image->is_64bit) ? 8 : 4;
             uint32_t base = s_heap_ptr;
-            uint32_t str_off = base + 4; // argv[0] string right after pointer
+            uint32_t str_off = base + psz; // argv[0] string right after pointer
             uint32_t str_bytes = (len + 1) * 2;
-            uint32_t total = 4 + str_bytes;
+            uint32_t total = psz + str_bytes;
             total = (total + 0xFFF) & ~0xFFFu;
             uint8_t *buf = calloc(1, total);
             if (buf) {
-                // argv[0] = pointer to the string
-                uint32_t str_addr = str_off;
-                memcpy(buf, &str_addr, 4);
-                memcpy(buf + 4, cmdw, str_bytes);
+                // argv[0] = pointer to the string (high half stays zero)
+                uint64_t str_addr = str_off;
+                memcpy(buf, &str_addr, psz);
+                memcpy(buf + psz, cmdw, str_bytes);
                 wg_blink_load_code(engine->blink, base, buf, total, 0);
                 free(buf);
                 s_heap_ptr += total;
@@ -2692,6 +4111,109 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (args[1] && args[0] >= (uint32_t)n)
                 wg_blink_write_mem(engine->blink, args[1], tmp, n * 2);
             ret_val = (args[0] >= (uint32_t)n) ? (uint32_t)(n - 1) : (uint32_t)n;
+        } else if (strcmp(fn, "PathRemoveFileSpecW") == 0) {
+            // SHLWAPI PathRemoveFileSpecW(pszPath) — strip the trailing file
+            // component in place. The UE4 launcher applies this to its
+            // GetModuleFileNameW result to find the game directory.
+            uint16_t w[520] = {0};
+            if (args[0]) wg_blink_read_mem(engine->blink, args[0], w, sizeof(w) - 2);
+            int len = 0; while (len < 519 && w[len]) len++;
+            int cut = -1;
+            for (int i = len - 1; i >= 0; i--)
+                if (w[i] == '\\' || w[i] == '/') { cut = i; break; }
+            ret_val = 0;
+            if (cut >= 0) {
+                if (cut == 2 && w[1] == ':') cut = 3;   // keep the "C:\" root
+                uint16_t nul = 0;
+                wg_blink_write_mem(engine->blink, args[0] + (uint32_t)cut * 2, &nul, 2);
+                ret_val = (cut < len) ? 1 : 0;
+            }
+        } else if (strcmp(fn, "PathCombineW") == 0 ||
+                   strcmp(fn, "PathCanonicalizeW") == 0) {
+            // SHLWAPI PathCombineW(dest, dir, file) -> dest, and
+            // PathCanonicalizeW(dest, src) -> BOOL. Both must actually write the
+            // combined/canonicalized path — the launcher builds the shipping-exe
+            // path with them.
+            bool is_combine = (strcmp(fn, "PathCombineW") == 0);
+            char dir[520] = {0}, file[520] = {0}, out[1040];
+            uint32_t src1 = args[1], src2 = is_combine ? args[2] : 0;
+            if (src1) {
+                uint16_t w[520] = {0};
+                wg_blink_read_mem(engine->blink, src1, w, sizeof(w) - 2);
+                for (int i = 0; i < 519 && w[i]; i++)
+                    dir[i] = w[i] < 128 ? (char)w[i] : '?';
+            }
+            if (src2) {
+                uint16_t w[520] = {0};
+                wg_blink_read_mem(engine->blink, src2, w, sizeof(w) - 2);
+                for (int i = 0; i < 519 && w[i]; i++)
+                    file[i] = w[i] < 128 ? (char)w[i] : '?';
+            }
+            if (!is_combine) {
+                snprintf(out, sizeof(out), "%s", dir);          // canonicalize src
+            } else if (file[0] && (file[1] == ':' || file[0] == '\\')) {
+                snprintf(out, sizeof(out), "%s", file);         // file is absolute
+            } else if (dir[0]) {
+                size_t dl = strlen(dir);
+                snprintf(out, sizeof(out), "%s%s%s", dir,
+                         (dir[dl - 1] == '\\' || dir[dl - 1] == '/') ? "" : "\\",
+                         file);
+            } else {
+                snprintf(out, sizeof(out), "%s", file);
+            }
+            wg_path_canon_a(out);
+            if (args[0]) {
+                uint16_t wout[520] = {0};
+                int n = 0;
+                for (; n < 519 && out[n]; n++) wout[n] = (uint8_t)out[n];
+                wout[n] = 0;
+                wg_blink_write_mem(engine->blink, args[0], wout, (n + 1) * 2);
+                WG_LOGI(TAG, "%s -> '%s'", fn, out);
+            }
+            ret_val = is_combine ? args[0] : 1;
+        } else if (!is_32bit && (strcmp(fn, "_initterm") == 0 ||
+                                 strcmp(fn, "_initterm_e") == 0)) {
+            // Run the CRT initializer array for real: jump to the guest
+            // trampoline with RCX/RDX and the return address untouched — its
+            // RET lands back in the caller. (See map_thunks_to_blink.)
+            // Set WG_SKIP_INITTERM=1 to skip constructors (return 0) — useful
+            // when a constructor mis-executes under blink and aborts startup.
+            uint64_t it_first = wg_blink_get_reg(engine->blink, 1);
+            uint64_t it_last  = wg_blink_get_reg(engine->blink, 2);
+            static int skip_initterm = -1;
+            if (skip_initterm < 0) {
+                const char *e = getenv("WG_SKIP_INITTERM");
+                skip_initterm = (e && e[0] == '1') ? 1 : 0;
+            }
+            WG_LOGI(TAG, "%s: %s %llu initializers (0x%llX..0x%llX)",
+                    fn, skip_initterm ? "SKIPPING" : "running",
+                    (unsigned long long)((it_last - it_first) / 8),
+                    (unsigned long long)it_first, (unsigned long long)it_last);
+            if (!skip_initterm) {
+                wg_blink_set_rip(engine->blink, s_tramp_addr);
+                wg_call_ring_push(fn, 0);
+                return true;
+            }
+            ret_val = 0; // _initterm is void / _initterm_e returns 0 on success
+        } else if (strcmp(fn, "FindResourceW") == 0 ||
+                   strcmp(fn, "FindResourceA") == 0) {
+            // FindResource(hModule, lpName, lpType) -> HRSRC (the guest VA of
+            // the IMAGE_RESOURCE_DATA_ENTRY in the mapped .rsrc).
+            ret_val = wg_find_resource(engine, args[1], args[2],
+                                       fn[12] == 'W');
+            WG_LOGI(TAG, "%s(name=0x%X, type=0x%X) -> 0x%llX",
+                    fn, args[1], args[2], (unsigned long long)ret_val);
+        } else if (strcmp(fn, "LoadResource") == 0) {
+            // The data entry's first field is the RVA of the resource bytes.
+            uint32_t drva = 0;
+            if (args[1]) wg_blink_read_mem(engine->blink, args[1], &drva, 4);
+            ret_val = drva ? (uint32_t)engine->pe_image->image_base + drva : 0;
+        } else if (strcmp(fn, "LockResource") == 0) {
+            ret_val = args[0];   // HGLOBAL from LoadResource IS the data VA
+        } else if (strcmp(fn, "SizeofResource") == 0) {
+            uint32_t rsz = 0;
+            if (args[1]) wg_blink_read_mem(engine->blink, args[1] + 4, &rsz, 4);
+            ret_val = rsz;
         } else if (strcmp(fn, "SetCurrentDirectoryW") == 0 ||
                    strcmp(fn, "SetCurrentDirectoryA") == 0) {
             // Track the current dir so relative file writes (NSIS SetOutPath +
@@ -3278,13 +4800,22 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 0;
         } else if (strcmp(fn, "GetModuleHandleExW") == 0 ||
                    strcmp(fn, "GetModuleHandleExA") == 0) {
-            // GetModuleHandleEx(dwFlags, lpModuleName, phModule)
-            // Write a module handle to *phModule
+            // GetModuleHandleEx(dwFlags, lpModuleName, phModule).
+            // dwFlags bit 0x4 = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: then
+            // lpModuleName is a CODE ADDRESS, not a name. UE4 uses this on one of
+            // its own functions to find its module, then GetModuleFileNameW on the
+            // result to derive the game directory — so an address inside the main
+            // image MUST map to the image base (returning the fake 0xBFFF0000
+            // handle made GetModuleFileNameW yield C:\Windows\System32 and the
+            // game hunted for its .uproject/Content there).
             uint32_t base = engine->pe_image ? (uint32_t)engine->pe_image->image_base : 0x400000;
-            if (args[2]) {
-                uint32_t handle = (args[1] == 0) ? base : 0xBFFF0000u;
-                wg_blink_write_mem(engine->blink, args[2], &handle, 4);
-            }
+            uint32_t img_end = base + (engine->pe_image ? engine->pe_image->size_of_image : 0x100000);
+            uint32_t flags = args[0];
+            uint32_t handle;
+            if (args[1] == 0)                handle = base;                 // NULL name = main module
+            else if ((flags & 0x4) && args[1] >= base && args[1] < img_end) handle = base; // addr in main image
+            else                             handle = 0xBFFF0000u;          // other module
+            if (args[2]) wg_blink_write_mem(engine->blink, args[2], &handle, 4);
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "SystemFunction036") == 0) {
             // RtlGenRandom(pvBuffer=args[0], cbBuffer=args[1]) -> BOOLEAN.
@@ -3658,11 +5189,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // small packages worked, then it blew up on the large ones). Back it
             // with real, mapped, zeroed guest heap. A commit at an address we
             // already reserved+mapped just returns that address.
+            // 64-bit guest: args[] is truncated to 32-bit, so read the FULL 64-bit
+            // RCX(addr)/RDX(size) — the game's FMallocBinned2 pools live in the
+            // 64-bit heap (>4GB) once the 1GB 32-bit heap is used up.
             uint32_t va_addr = args[0], va_size = args[1];
-            if (va_addr != 0) {
+            if (va_size == 0) {
+                ret_val = 0;                     // Windows: size 0 -> ERROR_INVALID_PARAMETER
+                s_last_error = 87;
+            } else if (va_addr != 0) {
                 ret_val = va_addr;               // commit into an already-mapped reservation
             } else {
-                ret_val = wg_guest_alloc(engine, va_size);
+                // Fresh reservation: align to the OS allocation granularity (64KB).
+                // FMallocBinned2 depends on this alignment for its pool math. The
+                // 32-bit heap now spans two regions (~2.5GB) — see wg_guest_alloc.
+                ret_val = wg_guest_alloc_aligned(engine, va_size, 0x10000);
             }
             WG_LOGI(TAG, "VirtualAlloc(addr=0x%X, size=%u, type=0x%X) -> 0x%llX",
                     args[0], va_size, args[2], (unsigned long long)ret_val);
@@ -3694,11 +5234,16 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // memset(dest=args[0], c=args[1], n=args[2]) -> returns dest (cdecl)
             uint32_t dst = args[0], n = args[2];
             if (dst && n && n <= 64u * 1024 * 1024) {
-                uint8_t *tmp = malloc(n);
-                if (tmp) {
-                    memset(tmp, (int)args[1], n);
-                    wg_blink_write_mem(engine->blink, dst, tmp, n);
-                    free(tmp);
+                // Fast direct in-guest fill (no malloc/bounce) — ~2x the memcpy/memset
+                // grind rate. Now DEFAULT ON: the old deadlock it exposed is fixed by
+                // the adaptive spin-yield, so the throughput win is free. Falls back to
+                // the malloc bounce on an unmapped page. WG_NO_FASTMEM disables.
+                static signed char s_fastmem = -1;
+                if (s_fastmem < 0) s_fastmem = getenv("WG_NO_FASTMEM") ? 0 : 1;
+                if (!s_fastmem || !wg_blink_mem_set(engine->blink, dst, (int)args[1], n)) {
+                    uint8_t *tmp = malloc(n);
+                    if (tmp) { memset(tmp, (int)args[1], n);
+                        wg_blink_write_mem(engine->blink, dst, tmp, n); free(tmp); }
                 }
             }
             ret_val = dst;
@@ -3706,11 +5251,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // mem(c)py(dest=args[0], src=args[1], n=args[2]) -> returns dest
             uint32_t dst = args[0], src = args[1], n = args[2];
             if (dst && src && n && n <= 64u * 1024 * 1024) {
-                uint8_t *tmp = malloc(n);
-                if (tmp) {
-                    wg_blink_read_mem(engine->blink, src, tmp, n);
-                    wg_blink_write_mem(engine->blink, dst, tmp, n);
-                    free(tmp);
+                // Fast direct guest->guest copy (no malloc) — default ON (see memset).
+                static signed char s_fastmem = -1;
+                if (s_fastmem < 0) s_fastmem = getenv("WG_NO_FASTMEM") ? 0 : 1;
+                if (!s_fastmem || !wg_blink_mem_copy(engine->blink, dst, src, n)) {
+                    uint8_t *tmp = malloc(n);
+                    if (tmp) { wg_blink_read_mem(engine->blink, src, tmp, n);
+                        wg_blink_write_mem(engine->blink, dst, tmp, n); free(tmp); }
                 }
             }
             ret_val = dst;
@@ -3722,7 +5269,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 uint32_t r = m ? wg_sync_wait_single(m, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
                 ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
             } else {
-                if (m) {
+                // Lock atomicity fix: try to acquire WITHOUT releasing the GIL; only
+                // release (letting other guest threads run) if the CS is CONTENDED.
+                // Releasing the GIL for an UNCONTENDED acquire lets another thread run
+                // while this thread is mid-way through a lock-protected update, so a
+                // lock-free reader observes half-updated data -> the config-init race
+                // that crashes full JIT under real-threads (NCPU>=2). Uncontended
+                // acquire is instant, so blocking-begin/end was pure race window.
+                if (m && wg_sync_wait_single(m, 0, s_cur_guest_tid) != WG_WAIT_OBJECT_0) {
                     wg_thunk_block_begin();
                     wg_sync_wait_single(m, WG_SYNC_INFINITE, s_cur_guest_tid);
                     wg_thunk_block_end();
@@ -3745,6 +5299,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // CreateEvent(lpSecurityAttributes, bManualReset, bInitialState, lpName)
             if (s_use_real_threads) {
                 ret_val = wg_sync_create_event(args[1] != 0, args[2] != 0);
+                wg_synctrace(args[1] ? "CreateEvtM" : "CreateEvtA", s_cur_guest_tid, (uint32_t)ret_val, ret_addr);
             } else {
             uint32_t handle = 0;
             if (s_event_next < WG_MAX_EVENTS) {
@@ -3759,7 +5314,27 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
         } else if (strcmp(fn, "SetEvent") == 0) {
             uint32_t h = args[0];
-            if (s_use_real_threads) { ret_val = wg_sync_set_event(h) ? 1 : 0; }
+            wg_synctrace("SetEvent", s_cur_guest_tid, h, ret_addr);
+            wg_producer_set(h, s_cur_guest_tid);   // learn: this tid signals h (directed GIL)
+            if (getenv("WG_WAITLOG")) {   // log each distinct SetEvent handle — deadlock diag
+                static uint32_t s_eh[64]; static int s_en = 0;
+                int seen=0; for(int i=0;i<s_en;i++) if(s_eh[i]==h){seen=1;break;}
+                if(!seen && s_en<64){ s_eh[s_en++]=h;
+                    WG_LOGW(TAG,"[waitlog tid=0x%X] SetEvent(h=0x%X) caller=0x%llX",
+                            s_cur_guest_tid, h, (unsigned long long)ret_addr); }
+            }
+            if (s_use_real_threads) {
+                ret_val = wg_sync_set_event(h) ? 1 : 0;
+                // Mimic Windows: SetEvent can immediately switch to the woken
+                // thread. Under the GIL the signaler otherwise keeps running and
+                // can consume its OWN signal (UE4 does Trigger(E) then Wait(E)) or
+                // race the intended waiter before it's scheduled -> lost wakeup ->
+                // the config-parse thread-coordination deadlock. Release the GIL so
+                // the just-woken waiter runs before this thread continues.
+                static signed char s_sey = -1;
+                if (s_sey < 0) s_sey = getenv("WG_SETEVENT_YIELD") ? 1 : 0;
+                if (s_sey) { wg_thunk_block_begin(); sched_yield(); wg_thunk_block_end(); }
+            }
             else {
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 s_event_signalled[h - WG_EVENT_BASE] = true;
@@ -3769,6 +5344,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
         } else if (strcmp(fn, "ResetEvent") == 0) {
             uint32_t h = args[0];
+            wg_synctrace("ResetEvent", s_cur_guest_tid, h, ret_addr);
             if (s_use_real_threads) { ret_val = wg_sync_reset_event(h) ? 1 : 0; }
             else {
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
@@ -3892,13 +5468,42 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
             ret_val = 0; // void return
+        } else if (strcmp(fn, "WaitOnAddress") == 0 && s_use_real_threads) {
+            // WaitOnAddress(Address, CompareAddress, AddressSize, dwMilliseconds).
+            // Block while *Address == *CompareAddress; TRUE when it changes (woken),
+            // FALSE(0)+ERROR_TIMEOUT on timeout. UE4's parking lot depends on this.
+            uint32_t r = wg_wait_on_address(engine, args[0], args[1], args[2], args[3]);
+            if (!r) s_last_error = 1460; // ERROR_TIMEOUT
+            ret_val = r;
+        } else if ((strcmp(fn, "WakeByAddressSingle") == 0 ||
+                    strcmp(fn, "WakeByAddressAll") == 0) && s_use_real_threads) {
+            // Wake waiters on Address (broadcast-and-recheck covers single & all).
+            wg_wake_by_address();
+            ret_val = 0; // void
         } else if (strcmp(fn, "WaitForSingleObject") == 0 && s_use_real_threads) {
             // Real-threads: block THIS pthread on the wg_sync object. Release the
             // thunk lock around the block so other threads' SetEvent thunks run.
             uint32_t h = args[0], timeout = args[1];
+            if (timeout == 0xFFFFFFFFu) wg_synctrace("WFSO-INF", s_cur_guest_tid, h, ret_addr); // skip finite polls (flood)
+            if (getenv("WG_WAITLOG")) {   // log each distinct (tid,handle,INF) wait — deadlock diag
+                static uint32_t s_wh[64], s_wt[64]; static int s_wn = 0;
+                int seen=0; for(int i=0;i<s_wn;i++) if(s_wh[i]==h && s_wt[i]==s_cur_guest_tid){seen=1;break;}
+                if(!seen && s_wn<64){ s_wh[s_wn]=h; s_wt[s_wn]=s_cur_guest_tid; s_wn++;
+                    WG_LOGW(TAG,"[waitlog tid=0x%X] WFSO(h=0x%X timeout=0x%X) caller=0x%llX",
+                            s_cur_guest_tid, h, timeout, (unsigned long long)ret_addr); }
+            }
             if (wg_sync_is_known(h)) {
+                // Directed handoff + directed kick: hand the GIL to h's signaler and,
+                // if that producer is parked on its own wake-event, wake it NOW so the
+                // dependency chain cascades forward instead of resolving one 2ms poll
+                // at a time (the deep blocked-wait churn). Only for real INFINITE
+                // waits (the ones that actually block / deadlock). WG_NO_DIRKICK off.
+                uint32_t prod = wg_producer_get(h);
+                wg_dir_set_prefer(prod);
+                if (prod && timeout == 0xFFFFFFFFu && s_use_real_threads && !getenv("WG_NO_DIRKICK"))
+                    wg_sync_kick_tid(prod);
                 wg_thunk_block_begin();
-                uint32_t wr = wg_sync_wait_single(h, timeout, s_cur_guest_tid);
+                uint32_t wr = wg_sync_wait_single(h, wg_cap_timeout(timeout), s_cur_guest_tid);
                 wg_thunk_block_end();
                 ret_val = wr;   // WAIT_OBJECT_0(0) / WAIT_TIMEOUT(0x102) / WAIT_FAILED
             } else {
@@ -3908,13 +5513,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (timeout == 0xFFFFFFFFu) { ret_val = 0; }
                 else {
                     uint32_t ms = timeout > 50 ? 50 : timeout;
-                    wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                    wg_thunk_block_begin(); usleep(wg_cap_timeout(ms) * 1000); wg_thunk_block_end();
                     ret_val = 258;
                 }
             }
         } else if (strcmp(fn, "WaitForSingleObject") == 0) {
             uint32_t h = args[0];
             uint32_t timeout = args[1];
+            if (getenv("WG_WAITLOG")) {
+                uint32_t _t = engine->scheduler ? wg_sched_current_tid(engine->scheduler) : 0;
+                static uint32_t s_sh[8], s_st[8]; static int s_sn = 0;
+                int _seen = 0; for (int _i=0;_i<s_sn;_i++) if (s_sh[_i]==h && s_st[_i]==_t) {_seen=1;break;}
+                if (!_seen && s_sn < 8) {   // one line per distinct (tid,handle)
+                    s_sh[s_sn]=h; s_st[s_sn]=_t; s_sn++;
+                    WG_LOGW(TAG, "[waitlog tid=0x%X] WaitForSingleObject(h=0x%X, timeout=0x%X) caller=0x%llX",
+                            _t, h, timeout, (unsigned long long)ret_addr);
+                }
+            }
             // Check if the handle is already signalled
             bool signalled = false;
             if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
@@ -3994,14 +5609,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             bool all_known = ncount > 0;
             for (uint32_t i = 0; i < ncount; i++) if (!wg_sync_is_known(handles[i])) { all_known = false; break; }
             if (all_known) {
+                // Prefer the signaler of the first handle with a known producer
+                // (wait_all needs all, but nudging one producer forward unblocks it).
+                for (uint32_t i = 0; i < ncount; i++) { uint32_t p = wg_producer_get(handles[i]); if (p) { wg_dir_set_prefer(p); break; } }
                 wg_thunk_block_begin();
-                uint32_t wr = wg_sync_wait_multiple(handles, (int)ncount, wait_all, timeout, s_cur_guest_tid);
+                uint32_t wr = wg_sync_wait_multiple(handles, (int)ncount, wait_all, wg_cap_timeout(timeout), s_cur_guest_tid);
                 wg_thunk_block_end();
                 ret_val = wr;
             } else {
                 uint32_t ms = timeout > 50 ? 50 : timeout;
                 if (timeout == 0xFFFFFFFFu) ms = 50;
-                wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                wg_thunk_block_begin(); usleep(wg_cap_timeout(ms) * 1000); wg_thunk_block_end();
                 ret_val = 258;
             }
         } else if (strcmp(fn, "WaitForMultipleObjects") == 0 ||
@@ -4190,12 +5808,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t h = args[0], timeout = args[1];
             if (wg_sync_is_known(h)) {
                 wg_thunk_block_begin();
-                ret_val = wg_sync_wait_single(h, timeout, s_cur_guest_tid);
+                ret_val = wg_sync_wait_single(h, wg_cap_timeout(timeout), s_cur_guest_tid);
                 wg_thunk_block_end();
             } else if (timeout == 0xFFFFFFFFu) { ret_val = 0; }
             else {
                 uint32_t ms = timeout > 50 ? 50 : timeout;
-                wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end();
+                wg_thunk_block_begin(); usleep(wg_cap_timeout(ms) * 1000); wg_thunk_block_end();
                 ret_val = 258;
             }
         } else if (strcmp(fn, "WaitForSingleObjectEx") == 0) {
@@ -4223,26 +5841,103 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (sw) return true;
                 ret_val = (timeout == 0xFFFFFFFFu) ? 0 : 258;
             }
-        } else if (s_use_real_threads &&
-                   (strcmp(fn, "AcquireSRWLockExclusive") == 0 ||
-                    strcmp(fn, "AcquireSRWLockShared") == 0)) {
-            uint32_t m = wg_cs_mutex_for(args[0]);   // SRW lock ptr -> shared mutex
-            if (m) { wg_thunk_block_begin(); wg_sync_wait_single(m, WG_SYNC_INFINITE, s_cur_guest_tid); wg_thunk_block_end(); }
+        } else if (s_use_real_threads && strcmp(fn, "AcquireSRWLockShared") == 0) {
+            if (s_srw_log < 0) { const char *e = getenv("WG_SRW_LOG"); s_srw_log = e ? atoi(e) : 0; }
+            wg_srw_acquire_shared(args[0], s_cur_guest_tid);
             ret_val = 0;
-        } else if (s_use_real_threads &&
-                   (strcmp(fn, "ReleaseSRWLockExclusive") == 0 ||
-                    strcmp(fn, "ReleaseSRWLockShared") == 0)) {
-            uint32_t m = wg_cs_mutex_for(args[0]);
-            if (m) wg_sync_release_mutex(m, s_cur_guest_tid);
+        } else if (s_use_real_threads && strcmp(fn, "AcquireSRWLockExclusive") == 0) {
+            if (s_srw_log < 0) { const char *e = getenv("WG_SRW_LOG"); s_srw_log = e ? atoi(e) : 0; }
+            wg_srw_acquire_exclusive(args[0], s_cur_guest_tid);
             ret_val = 0;
-        } else if (s_use_real_threads &&
-                   (strcmp(fn, "TryAcquireSRWLockExclusive") == 0 ||
-                    strcmp(fn, "TryAcquireSRWLockShared") == 0)) {
-            uint32_t m = wg_cs_mutex_for(args[0]);
-            uint32_t r = m ? wg_sync_wait_single(m, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
-            ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
+        } else if (s_use_real_threads && strcmp(fn, "ReleaseSRWLockShared") == 0) {
+            wg_srw_release_shared(args[0]);
+            ret_val = 0;
+        } else if (s_use_real_threads && strcmp(fn, "ReleaseSRWLockExclusive") == 0) {
+            wg_srw_release_exclusive(args[0], s_cur_guest_tid);
+            ret_val = 0;
+        } else if (s_use_real_threads && strcmp(fn, "TryAcquireSRWLockShared") == 0) {
+            ret_val = wg_srw_try_shared(args[0], s_cur_guest_tid);
+        } else if (s_use_real_threads && strcmp(fn, "TryAcquireSRWLockExclusive") == 0) {
+            ret_val = wg_srw_try_exclusive(args[0], s_cur_guest_tid);
         } else if (s_use_real_threads && strcmp(fn, "InitializeSRWLock") == 0) {
-            ret_val = 0;   // wg_sync mutex lazily created on first Acquire
+            ret_val = 0;   // RW-lock state lazily created on first Acquire
+        } else if (s_use_real_threads && (strcmp(fn, "_Mtx_lock") == 0 ||
+                   strcmp(fn, "mtx_lock") == 0)) {
+            // MSVC C++ std::mutex / C11 mtx_lock — real lock (was a no-op auto-stub,
+            // so std::mutex-protected data raced across GIL-release blocking points ->
+            // the FMallocBinned2/vtable UAF corruption under real-threads+JIT).
+            uint32_t mtx = wg_cs_mutex_for(args[0]);
+            if (mtx && wg_sync_wait_single(mtx, 0, s_cur_guest_tid) != WG_WAIT_OBJECT_0) { wg_thunk_block_begin(); wg_sync_wait_single(mtx, WG_SYNC_INFINITE, s_cur_guest_tid); wg_thunk_block_end(); }
+            ret_val = 0;   // _Thrd_success
+        } else if (s_use_real_threads && (strcmp(fn, "_Mtx_unlock") == 0 ||
+                   strcmp(fn, "mtx_unlock") == 0)) {
+            uint32_t mtx = wg_cs_mutex_for(args[0]);
+            if (mtx) wg_sync_release_mutex(mtx, s_cur_guest_tid);
+            ret_val = 0;
+        } else if (s_use_real_threads && (strcmp(fn, "_Mtx_trylock") == 0 ||
+                   strcmp(fn, "mtx_trylock") == 0)) {
+            uint32_t mtx = wg_cs_mutex_for(args[0]);
+            uint32_t r = mtx ? wg_sync_wait_single(mtx, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
+            ret_val = (r == WG_WAIT_OBJECT_0) ? 0 : 3;   // _Thrd_success / _Thrd_busy
+        } else if (s_use_real_threads && (strcmp(fn, "_Mtx_init") == 0 ||
+                   strcmp(fn, "_Mtx_destroy") == 0 || strcmp(fn, "mtx_init") == 0 ||
+                   strcmp(fn, "mtx_destroy") == 0)) {
+            ret_val = 0;   // wg_sync mutex lazily created on first _Mtx_lock
+        } else if (s_use_real_threads && strcmp(fn, "_Cnd_wait") == 0) {
+            // std::condition_variable::wait(unique_lock&) -> _Cnd_wait(cnd, mtx).
+            // Atomically release the mutex, block on the CV, re-acquire on wake.
+            // Was a no-op auto-stub: the consumer NEVER waited for the producer's
+            // _Cnd_signal, so it used shared state before construction -> the
+            // garbage-vtable UAF the JIT's speed exposed (interp dodged by timing).
+            uint32_t cvh = wg_cv_handle_for(args[0]);
+            uint32_t csm = wg_cs_mutex_for(args[1]);   // same _Mtx_t the unique_lock holds
+            wg_thunk_block_begin();
+            wg_sync_cv_sleep(cvh, csm, WG_SYNC_INFINITE, s_cur_guest_tid);
+            wg_thunk_block_end();
+            ret_val = 0;   // _Thrd_success
+        } else if (s_use_real_threads && strcmp(fn, "_Cnd_timedwait") == 0) {
+            // _Cnd_timedwait(cnd, mtx, const xtime* xt). xt is an ABSOLUTE deadline
+            // {int64 sec; long nsec}. Convert to a relative ms, clamp so a stale
+            // deadline can't hang, then wait.
+            uint32_t cvh = wg_cv_handle_for(args[0]);
+            uint32_t csm = wg_cs_mutex_for(args[1]);
+            uint32_t ms = WG_SYNC_INFINITE;
+            if (args[2]) {
+                struct { int64_t sec; int32_t nsec; } xt = {0, 0};
+                wg_blink_read_mem(engine->blink, args[2], &xt, 12);
+                struct timeval now; gettimeofday(&now, NULL);
+                int64_t target_ms = xt.sec * 1000 + xt.nsec / 1000000;
+                int64_t now_ms = (int64_t)now.tv_sec * 1000 + now.tv_usec / 1000;
+                int64_t delta = target_ms - now_ms;
+                if (delta < 0) delta = 0;
+                if (delta > 60000) delta = 60000;
+                ms = (uint32_t)delta;
+            }
+            wg_thunk_block_begin();
+            uint32_t r = wg_sync_cv_sleep(cvh, csm, wg_cap_timeout(ms), s_cur_guest_tid);
+            wg_thunk_block_end();
+            ret_val = (r == WG_WAIT_OBJECT_0) ? 0 : 3;   // _Thrd_success / _Thrd_timedout
+        } else if (s_use_real_threads && strcmp(fn, "_Cnd_signal") == 0) {
+            wg_sync_cv_wake(wg_cv_handle_for(args[0]), false);
+            ret_val = 0;
+        } else if (s_use_real_threads && strcmp(fn, "_Cnd_broadcast") == 0) {
+            wg_sync_cv_wake(wg_cv_handle_for(args[0]), true);
+            ret_val = 0;
+        } else if (s_use_real_threads && strcmp(fn, "_Cnd_init") == 0) {
+            // int _Cnd_init(_Cnd_t* cnd) — give *cnd a stable, unique key (itself) so
+            // later _Cnd_wait/_Cnd_signal(*cnd) map to one consistent wg_sync CV. The
+            // guest only ever passes _Cnd_t back to _Cnd_* (all our handlers), so it
+            // may be any opaque stable value.
+            if (args[0]) { uint64_t key = args[0]; wg_blink_write_mem(engine->blink, args[0], &key, 8); }
+            ret_val = 0;
+        } else if (s_use_real_threads && (strcmp(fn, "_Cnd_init_in_situ") == 0 ||
+                   strcmp(fn, "_Cnd_destroy_in_situ") == 0 || strcmp(fn, "_Cnd_destroy") == 0)) {
+            ret_val = 0;   // CV lazily created on first _Cnd_wait/_Cnd_signal
+        } else if (strcmp(fn, "_Thrd_yield") == 0) {
+            if (s_use_real_threads) sched_yield();
+            ret_val = 0;
+        } else if (strcmp(fn, "_Thrd_id") == 0) {
+            ret_val = s_cur_guest_tid;   // std::this_thread::get_id() identity
         } else if (strcmp(fn, "InitializeConditionVariable") == 0) {
             if (s_use_real_threads) { wg_cv_handle_for(args[0]); ret_val = 0; }
             else {
@@ -4272,7 +5967,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t csm = wg_cs_mutex_for(args[1]);   // CS or SRW pointer -> its mutex
             uint32_t ms  = args[2];
             wg_thunk_block_begin();
-            uint32_t r = wg_sync_cv_sleep(cvh, csm, ms, s_cur_guest_tid);
+            uint32_t r = wg_sync_cv_sleep(cvh, csm, wg_cap_timeout(ms), s_cur_guest_tid);
             wg_thunk_block_end();
             ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
         } else if (strcmp(fn, "SleepConditionVariableCS") == 0 ||
@@ -4328,11 +6023,38 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
         } else if (strcmp(fn, "ResumeThread") == 0) {
             uint32_t h = args[0];
+            wg_synctrace("ResumeThr", s_cur_guest_tid, h, ret_addr);
             WGThread *wt = wg_sched_find(engine->scheduler, h);
             if (wt && wt->state == WG_THREAD_SUSPENDED) {
                 wt->state = WG_THREAD_READY;
                 WG_LOGI(TAG, "ResumeThread: h=0x%X id=0x%X now READY", h, wt->id);
                 ret_val = 1; // previous suspend count
+            } else if (s_use_real_threads && wg_resume_gate_signal(h)) {
+                WG_LOGI(TAG, "ResumeThread: h=0x%X real thread released", h);
+                ret_val = 1;
+                // Let the just-resumed worker RUN before the resumer continues.
+                // UE4's FRunnableThreadWin setup reads the worker-CONSTRUCTED
+                // FRunnable vtable ([rdi+0x20], guest 0x9eb16a) IMMEDIATELY after
+                // ResumeThread. Under the GIL the resumer keeps the lock and reads
+                // it BEFORE the worker constructs it (guest 0x9eb4bf) -> it reads
+                // the stale {thread-id, handle} pair as a vtable (0x0000710900001029)
+                // -> the type-confusion bad call the JIT can't recover from. Windows'
+                // preemptive scheduler lets the worker construct first; emulate that
+                // by releasing the GIL here so the worker makes progress before we
+                // return into the read. Default ON for real threads (correctness);
+                // WG_NO_RESUME_YIELD disables.
+                if (!getenv("WG_NO_RESUME_YIELD")) {
+                    // Light touch: just enough GIL-release for the worker to run
+                    // its FRunnable constructor; too long disrupts the pool
+                    // handshake (over-delayed workers -> a producer-consumer stall
+                    // at 0x815879). One yield + a short sleep, tunable via WG_RY_US.
+                    static int ry_us = -1;
+                    if (ry_us < 0) { const char *e = getenv("WG_RY_US"); ry_us = e ? atoi(e) : 200; }
+                    wg_thunk_block_begin();
+                    sched_yield();
+                    if (ry_us > 0) usleep((useconds_t)ry_us);
+                    wg_thunk_block_end();
+                }
             } else {
                 ret_val = (uint32_t)-1; // error if not found
             }
@@ -4399,6 +6121,30 @@ static bool handle_blink_thunk(WGEngine *engine) {
                         s_pending_exec[sizeof(s_pending_exec)-1] = 0;
                         WG_LOGI(TAG, "Steam bootstrapper launch queued: %s", s_pending_exec);
                     }
+                } else if (engine->pe_image && engine->pe_image->is_64bit &&
+                           strstr(low, ".exe")) {
+                    // 64-bit guests (e.g. the Visage/UE4 launcher) spawn their
+                    // real game binary. Queue any child .exe that exists in the
+                    // bottle for chain-loading once the launcher exits.
+                    char win[512]; int wi = 0; const char *p = cl;
+                    if (*p == '"') p++;
+                    while (*p && *p != '"' && wi < 511) {
+                        win[wi++] = *p;
+                        if (wi >= 4 && strncasecmp(win + wi - 4, ".exe", 4) == 0) break;
+                        p++;
+                    }
+                    win[wi] = 0;
+                    char mapbuf[512];
+                    strncpy(mapbuf, win, sizeof(mapbuf) - 1); mapbuf[sizeof(mapbuf)-1] = 0;
+                    const char *real = wg_files_map_path(0, engine->blink, mapbuf, sizeof(mapbuf));
+                    struct stat cst;
+                    if (real && stat(real, &cst) == 0) {
+                        strncpy(s_pending_exec, real, sizeof(s_pending_exec) - 1);
+                        s_pending_exec[sizeof(s_pending_exec)-1] = 0;
+                        WG_LOGI(TAG, "Child exe launch queued: %s", s_pending_exec);
+                    } else {
+                        WG_LOGW(TAG, "CreateProcessW: child exe not found: '%s'", win);
+                    }
                 }
             }
         } else if (strcmp(fn, "CreatePipe") == 0) {
@@ -4455,14 +6201,32 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             ret_val = 0; // S_OK
         } else if (strcmp(fn, "CoCreateInstance") == 0) {
-            // CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv=args[4]).
-            // Hand back our minimal fake IShellLink so NSIS CreateShortcut runs
-            // its Set*/Save sequence and succeeds (shortcuts are no-ops on iOS,
-            // but this avoids the "Error creating shortcut" log and any null
-            // deref from a half-failed COM path).
-            wg_build_fake_com(engine);
-            if (args[4]) wg_blink_write_mem(engine->blink, args[4], &s_com_shelllink, 4);
-            ret_val = s_com_shelllink ? 0 : 0x80004002; // S_OK if built
+            // CoCreateInstance(rclsid=args[0], pUnkOuter, dwClsContext, riid, ppv=args[4]).
+            // NSIS CreateShortcut wants IShellLink {00021401-0000-0000-C000-...46};
+            // hand back our minimal fake for THAT CLSID only. For any OTHER CLSID
+            // (e.g. Visage's WMI/WbemLocator hardware probe: CoInit -> CoCreateInstance
+            // -> vtbl call -> SysAllocString), we must NOT hand back the IShellLink
+            // stand-in — the caller invokes a WMI method at vtbl+0x30 that lands in
+            // garbage and jumps into the heap (the real-threads+JIT crash). Fail
+            // cleanly instead: REGDB_E_CLASSNOTREG + NULL *ppv, so the caller's
+            // standard `if (FAILED(hr) || !obj) skip;` guard skips the vtable call.
+            // Also write the FULL pointer width (was a 4-byte write into a 64-bit
+            // ppv slot, leaving garbage high bits).
+            static const uint8_t kCLSID_ShellLink[16] = {
+                0x01,0x14,0x02,0x00, 0x00,0x00, 0x00,0x00,
+                0xC0,0x00,0x00,0x00, 0x00,0x00,0x00,0x46 };
+            uint8_t clsid[16] = {0};
+            if (args[0]) wg_blink_read_mem(engine->blink, args[0], clsid, 16);
+            if (memcmp(clsid, kCLSID_ShellLink, 16) == 0) {
+                wg_build_fake_com(engine);
+                uint64_t p = s_com_shelllink;
+                if (args[4]) wg_blink_write_mem(engine->blink, args[4], &p, ptr_size);
+                ret_val = s_com_shelllink ? 0 : 0x80040154;
+            } else {
+                uint64_t zero = 0;
+                if (args[4]) wg_blink_write_mem(engine->blink, args[4], &zero, ptr_size);
+                ret_val = 0x80040154; // REGDB_E_CLASSNOTREG (negative HRESULT)
+            }
             s_last_error = 0;
         } else if (strcmp(fn, "__comQI") == 0) {
             // IShellLink/IPersistFile::QueryInterface(this, riid, ppv) — hand
@@ -4545,23 +6309,48 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
                 ret_val = 0; // no messages
             }
+        } else if (strcmp(fn, "QueryPerformanceCounter") == 0) {
+            // Was an R1S stub: returned TRUE but left *lpPerformanceCount STALE, so the
+            // game read garbage timing. Write a REAL monotonic counter. This also lets
+            // guest timing be well-defined for the real-threads coordination that was
+            // reading garbage QPC deltas.
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t counter = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+            // WG_QPC_SCALE=<n>: run the guest's performance clock n× real time. Any
+            // time-based loading gate (frame pacing / timed wait) then completes n×
+            // faster, cutting the boot-to-Present grind. Anchored to a fixed base so
+            // the scaled counter is monotonic and doesn't overflow.
+            static int s_qpc_scale = -1; static uint64_t s_qpc_base = 0;
+            if (s_qpc_scale < 0) { const char *e = getenv("WG_QPC_SCALE"); s_qpc_scale = e ? atoi(e) : 1; s_qpc_base = counter; }
+            if (s_qpc_scale > 1) counter = s_qpc_base + (counter - s_qpc_base) * (uint64_t)s_qpc_scale;
+            if (args[0]) wg_blink_write_mem(engine->blink, args[0], &counter, 8);
+            ret_val = 1;
+        } else if (strcmp(fn, "QueryPerformanceFrequency") == 0) {
+            uint64_t freq = 1000000000ULL;  // 1 GHz (ns units) to match the counter above
+            if (args[0]) wg_blink_write_mem(engine->blink, args[0], &freq, 8);
+            ret_val = 1;
         } else if (strcmp(fn, "GetTickCount") == 0) {
             // Seed from a real clock so it varies across launches — NSIS
             // derives its temp-dir names from this, and a fixed seed makes
             // every run collide on the same stale directory.
             static uint32_t s_tick = 0;
-            if (s_tick == 0) s_tick = (uint32_t)(time(NULL) * 1000u) | 1u;
+            if (s_tick == 0) s_tick = wg_determ() ? 0x100001u : ((uint32_t)(time(NULL) * 1000u) | 1u);
             ret_val = s_tick;
             s_tick += 16;
         } else if (strcmp(fn, "GetSystemTimeAsFileTime") == 0 ||
                    strcmp(fn, "GetSystemTimePreciseAsFileTime") == 0) {
             if (args[0]) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                // Convert Unix time to FILETIME (100ns ticks since 1601-01-01).
-                uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL
-                            + (uint64_t)ts.tv_nsec / 100ULL
-                            + 116444736000000000ULL;
+                uint64_t ft;
+                if (wg_determ()) {
+                    ft = 0x01D8000000000000ULL;   // fixed FILETIME for deterministic runs
+                } else {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    // Convert Unix time to FILETIME (100ns ticks since 1601-01-01).
+                    ft = (uint64_t)ts.tv_sec * 10000000ULL
+                       + (uint64_t)ts.tv_nsec / 100ULL
+                       + 116444736000000000ULL;
+                }
                 wg_blink_write_mem(engine->blink, args[0], &ft, 8);
             }
             ret_val = 0;
@@ -4601,7 +6390,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Real-threads: a real sleep on this pthread (release the thunk lock).
             uint32_t ms = args[0];
             if (ms == 0xFFFFFFFFu) ms = 100;   // INFINITE sleep -> cap so we stay responsive
-            if (ms > 0) { wg_thunk_block_begin(); usleep(ms * 1000); wg_thunk_block_end(); }
+            if (ms > 0) { wg_thunk_block_begin(); usleep(wg_cap_timeout(ms) * 1000); wg_thunk_block_end(); }
             ret_val = 0;
         } else if (strcmp(fn, "Sleep") == 0 || strcmp(fn, "SleepEx") == 0) {
             if (args[0] > 0) {
@@ -4929,7 +6718,10 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (s_use_real_threads && wg_sync_is_known(args[0])) wg_sync_close(args[0]);
             wg_files_close(args[0]);
             ret_val = 1;
-        } else if (strcmp(fn, "GlobalUnlock") == 0 || strcmp(fn, "FindClose") == 0) {
+        } else if (strcmp(fn, "FindClose") == 0) {
+            wg_findfile_close(args[0]);
+            ret_val = 1;
+        } else if (strcmp(fn, "GlobalUnlock") == 0) {
             ret_val = 1;
         } else if (strcmp(fn, "CreateFileW") == 0) {
             // CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecAttr,
@@ -4953,7 +6745,17 @@ static bool handle_blink_thunk(WGEngine *engine) {
             } else {
                 ret_val = 0xFFFFFFFF;
             }
-            WG_LOGI(TAG, "CreateFileW('%s') -> 0x%X", apath, (uint32_t)ret_val);
+            // CreateFileW returns a HANDLE (pointer-width). On x64,
+            // INVALID_HANDLE_VALUE is the full-width -1 (0xFFFFFFFFFFFFFFFF); a
+            // bare 0x00000000FFFFFFFF fails the game's `== INVALID_HANDLE_VALUE`
+            // check, so it treats a failed open as success and then queries a
+            // bogus size (UE4 read a 4GB Visage.uproject -> OOM).
+            if ((uint32_t)ret_val == 0xFFFFFFFFu && engine->pe_image &&
+                engine->pe_image->is_64bit)
+                ret_val = 0xFFFFFFFFFFFFFFFFULL;
+            WG_LOGI(TAG, "CreateFileW('%s') -> 0x%llX", apath, (unsigned long long)ret_val);
+            if (getenv("WG_FMT") && strstr(apath, ".pak"))
+                WG_LOGW(TAG, "  ^pak opened by caller 0x%llX", (unsigned long long)ret_addr);
 
             // NSIS decompresses its whole data section (one solid raw-LZMA
             // stream) into a temp file, then reads each packed file from it by
@@ -4991,8 +6793,24 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t buf_addr = args[1];
             uint32_t nbytes = args[2];
             uint32_t bytes_read_addr = args[3];
+            uint32_t overlapped_addr = args[4];
             if (nbytes > 0x100000) nbytes = 0x100000;
-            uint32_t pos_before = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
+            // UE4's Windows file handle passes the read position via
+            // OVERLAPPED.Offset/OffsetHigh (it never calls SetFilePointer).
+            // Honor it — otherwise every read defaults to sequential-from-0 and
+            // pak *footer* reads land at position 0, so the pak magic is never
+            // found and no pak ever mounts (breaking all content + ICU).
+            uint64_t pos_before;
+            if (overlapped_addr) {
+                bool is64 = engine->pe_image && engine->pe_image->is_64bit;
+                uint32_t ofield = is64 ? 16 : 8, off_lo = 0, off_hi = 0;  // Offset field
+                wg_blink_read_mem(engine->blink, overlapped_addr + ofield, &off_lo, 4);
+                wg_blink_read_mem(engine->blink, overlapped_addr + ofield + 4, &off_hi, 4);
+                uint64_t offset = ((uint64_t)off_hi << 32) | off_lo;
+                pos_before = wg_files_set_pointer_64(handle, (int64_t)offset, 0); // SEEK_SET
+            } else {
+                pos_before = wg_files_set_pointer(handle, 0, 1); // SEEK_CUR
+            }
             uint8_t *tmpbuf = malloc(nbytes);
             uint32_t first4 = 0, nread = 0;
             if (tmpbuf) {
@@ -5000,6 +6818,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     wg_blink_write_mem(engine->blink, buf_addr, tmpbuf, nread);
                     if (bytes_read_addr) {
                         wg_blink_write_mem(engine->blink, bytes_read_addr, &nread, 4);
+                    }
+                    // Also record bytes transferred in OVERLAPPED.InternalHigh so
+                    // a follow-up GetOverlappedResult reports the right count.
+                    if (overlapped_addr) {
+                        bool is64 = engine->pe_image && engine->pe_image->is_64bit;
+                        uint64_t n64 = nread;
+                        wg_blink_write_mem(engine->blink, overlapped_addr + (is64 ? 8 : 4),
+                                           &n64, is64 ? 8 : 4);
                     }
                     if (nread >= 4) memcpy(&first4, tmpbuf, 4);
                     ret_val = 1;
@@ -5009,8 +6835,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // Log small control reads always, and ANY short read (nread <
             // nbytes) — a short read on the .exe would starve the decoder.
             if (nbytes <= 64 || nread < nbytes) {
-                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%u, n=%u) -> nread=%u first4=0x%08X",
-                        handle, pos_before, nbytes, nread, first4);
+                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%llu, n=%u) -> nread=%u first4=0x%08X",
+                        handle, (unsigned long long)pos_before, nbytes, nread, first4);
+            } else if (getenv("WG_FMT")) {  // diag: see full-buffer reads (pak mounting)
+                WG_LOGI(TAG, "ReadFile(h=0x%X, pos=%llu, n=%u) -> nread=%u first4=0x%08X [full]",
+                        handle, (unsigned long long)pos_before, nbytes, nread, first4);
             }
 #ifdef WG_DECODE_DIAG
             else if (handle == 0x100 || handle == 0x101) {
@@ -5124,13 +6953,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // BOOL GetFileSizeEx(HANDLE, PLARGE_INTEGER lpFileSize)
             // R1S stub never wrote the size — caller read stack garbage and
             // tried to allocate it (Steam: 563MB OOM). Write the real size.
-            uint32_t sz = wg_files_get_size(args[0]);
-            if (args[1] > 0x10000u && args[1] < 0xF0000000u) {
-                uint64_t sz64 = (uint64_t)sz; // low + high dwords
-                wg_blink_write_mem(engine->blink, args[1], &sz64, 8);
+            // Reject the invalid handle (0xFFFFFFFF): return FALSE instead of a
+            // bogus 4GB size that sends the caller into a huge allocation.
+            if (args[0] == 0xFFFFFFFFu) {
+                ret_val = 0; s_last_error = 6; // ERROR_INVALID_HANDLE
+                WG_LOGI(TAG, "GetFileSizeEx(INVALID) -> FALSE");
+            } else {
+                uint32_t sz = wg_files_get_size(args[0]);
+                if (args[1] > 0x10000u && args[1] < 0xF0000000u) {
+                    uint64_t sz64 = (uint64_t)sz; // low + high dwords
+                    wg_blink_write_mem(engine->blink, args[1], &sz64, 8);
+                }
+                ret_val = 1;
+                WG_LOGI(TAG, "GetFileSizeEx(0x%X) -> %u bytes", args[0], sz);
             }
-            ret_val = 1;
-            WG_LOGI(TAG, "GetFileSizeEx(0x%X) -> %u bytes", args[0], sz);
         } else if (strcmp(fn, "SetFilePointer") == 0) {
             // Detect when NSIS finishes its truncated copy and patch the .tmp
             // Track seeks on the data .tmp to know extraction offsets.
@@ -5234,6 +7070,8 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0xFFFFFFFF;
                 s_last_error = 2;
             }
+            if (getenv("WG_FMT") && (strstr(apath, "Content") || strstr(apath, "nternational")))
+                WG_LOGW(TAG, "GetFileAttributesW('%s') -> 0x%llX", apath, (unsigned long long)ret_val);
         } else if (strcmp(fn, "DeleteFileW") == 0) {
             uint16_t wpath[260] = {0};
             char apath[260] = {0};
@@ -5249,7 +7087,14 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 1;
             }
         } else if (strcmp(fn, "FindFirstFileW") == 0) {
-            ret_val = 0xFFFFFFFF; // INVALID_HANDLE_VALUE
+            // FindFirstFileW(lpFileName, lpFindFileData)
+            ret_val = wg_findfile_first(engine, args[0], args[1]);
+        } else if (strcmp(fn, "FindFirstFileExW") == 0) {
+            // FindFirstFileExW(name, InfoLevel, lpFindData, SearchOp, filter, flags)
+            ret_val = wg_findfile_first(engine, args[0], args[2]);
+        } else if (strcmp(fn, "FindNextFileW") == 0) {
+            // FindNextFileW(hFindFile, lpFindFileData)
+            ret_val = wg_findfile_next(engine, args[0], args[1]);
         } else if (strcmp(fn, "GlobalAlloc") == 0) {
             uint32_t size = args[1];
             if (size == 0) size = 4096;
@@ -5302,8 +7147,11 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 0;
             } else {
                 size = (size + 0xFFF) & ~0xFFF;
-                if (s_heap_ptr + size > 0x5F000000u || s_heap_ptr + size < s_heap_ptr) {
-                    ret_val = 0; // would collide with the thread-stack region
+                if (s_heap_ptr + size > 0x5F000000u && s_heap_ptr < 0xA0000000u)
+                    s_heap_ptr = 0xA0000000u;   // hop to region 2 (see wg_guest_alloc)
+                uint32_t hi7 = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
+                if (s_heap_ptr + size > hi7 || s_heap_ptr + size < s_heap_ptr) {
+                    ret_val = 0; // heap full (both regions)
                 } else {
                 uint32_t addr = s_heap_ptr;
                 uint8_t *zeros = calloc(1, size);
@@ -5866,9 +7714,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
         }
     }
 
-    // Stdcall: callee pops return address + all arguments
+    // Stdcall (32-bit): callee pops return address + all arguments.
+    // x64: caller-clean — the callee pops ONLY the return address; popping
+    // num_args*8 here would corrupt the caller's frame on every call.
     int num_args = entry ? entry->num_args : 0;
-    uint64_t new_rsp = rsp + ptr_size + (num_args * ptr_size);
+    uint64_t new_rsp = is_32bit ? rsp + ptr_size + (num_args * ptr_size)
+                                : rsp + 8;
     wg_blink_set_reg(engine->blink, 4, new_rsp); // RSP
     wg_blink_set_rip(engine->blink, ret_addr);
     wg_blink_set_reg(engine->blink, 0, ret_val); // EAX = return value
@@ -5938,8 +7789,10 @@ static bool ensure_blink_vm(WGEngine *engine, bool is_64bit) {
         return false;
     }
 
-    // Warm-up
-    uint8_t warmup[] = { 0x90, 0xC3 };
+    // Warm-up: NOP then HLT (not RET — a RET pops from an unset stack, which
+    // faults; harmless in the software-MMU path but an uncaught host SIGSEGV
+    // under linear memory / JIT). HLT cleanly returns WG_BLINK_HALT.
+    uint8_t warmup[] = { 0x90, 0xF4 };
     wg_blink_load_code(engine->blink, 0x3F0000, warmup, sizeof(warmup), 0x3F0000);
     WGBlinkResult wr = wg_blink_run(engine->blink, 10);
     WG_LOGI(TAG, "Blink JIT warm-up: %s",
@@ -5949,13 +7802,83 @@ static bool ensure_blink_vm(WGEngine *engine, bool is_64bit) {
     return true;
 }
 
+// Build a minimal x64 TEB/PEB + TLS and point GS at the TEB. x64 Windows keeps
+// the TEB at GS (not FS) with 64-bit-wide fields at different offsets than the
+// 32-bit TEB. The MSVC CRT and UE4 read gs:[0x30] (TEB self), gs:[0x58]
+// (ThreadLocalStoragePointer) and gs:[0x60] (PEB). In particular UE4's
+// GCreateMalloc reads a __declspec(thread) guard via gs:[0x58][_tls_index] — so
+// without a real GS base + TLS array the global allocator (GMalloc) is never
+// created and every allocation returns null, which is exactly what stalled
+// static init. Also sets the PE's static TLS block in slot 0.
+static void wg_setup_win32_teb64(WGEngine *engine) {
+    WGPEImage *pe = engine->pe_image;
+    void *bl = engine->blink;
+    uint32_t teb = wg_guest_alloc(engine, 0x2000);   // x64 TEB is ~0x1800
+    uint32_t peb = wg_guest_alloc(engine, 0x1000);
+    uint32_t tls_array = wg_guest_alloc(engine, 0x400);   // 128 slots * 8
+    if (!teb || !peb || !tls_array) return;
+
+    uint32_t image_base  = (uint32_t)pe->image_base;
+    uint64_t stack_base  = 0x7FFF0000, stack_limit = 0x7EFF0000;
+    uint64_t v64; uint32_t v32;
+
+    // NT_TIB (x64, 8-byte fields)
+    v64 = 0;                wg_blink_write_mem(bl, teb + 0x00, &v64, 8); // ExceptionList
+    wg_blink_write_mem(bl, teb + 0x08, &stack_base, 8);                  // StackBase
+    wg_blink_write_mem(bl, teb + 0x10, &stack_limit, 8);                 // StackLimit
+    v64 = teb;              wg_blink_write_mem(bl, teb + 0x30, &v64, 8);  // Self (gs:[0x30])
+    v64 = 0x1000;           wg_blink_write_mem(bl, teb + 0x40, &v64, 8);  // ClientId.UniqueProcess
+    v64 = 0x1004;           wg_blink_write_mem(bl, teb + 0x48, &v64, 8);  // ClientId.UniqueThread
+    v64 = tls_array;        wg_blink_write_mem(bl, teb + 0x58, &v64, 8);  // ThreadLocalStoragePointer
+    v64 = peb;              wg_blink_write_mem(bl, teb + 0x60, &v64, 8);  // PEB (gs:[0x60])
+    v32 = 0;                wg_blink_write_mem(bl, teb + 0x68, &v32, 4);  // LastErrorValue
+
+    // PEB (x64 offsets)
+    uint8_t bd = 0;         wg_blink_write_mem(bl, peb + 0x02, &bd, 1);   // BeingDebugged
+    v64 = image_base;       wg_blink_write_mem(bl, peb + 0x10, &v64, 8);  // ImageBaseAddress
+    v64 = 0x00D00000;       wg_blink_write_mem(bl, peb + 0x30, &v64, 8);  // ProcessHeap
+    v32 = 10;               wg_blink_write_mem(bl, peb + 0x118, &v32, 4); // OSMajorVersion
+    v32 = 0;                wg_blink_write_mem(bl, peb + 0x11C, &v32, 4); // OSMinorVersion
+    uint16_t bld = 19045;   wg_blink_write_mem(bl, peb + 0x120, &bld, 2); // OSBuildNumber
+    v32 = 2;                wg_blink_write_mem(bl, peb + 0x124, &v32, 4); // OSPlatformId (NT)
+
+    // PE static TLS (IMAGE_TLS_DIRECTORY64 — 8-byte fields). Allocate + copy the
+    // template into a data block and put its pointer in TLS array slot 0, with
+    // the module's _tls_index (at AddressOfIndex) set to 0 so gs:[0x58][0] hits it.
+    uint32_t tls_data = 0;
+    if (pe->tls_rva) {
+        uint64_t raw_start = 0, raw_end = 0, addr_index = 0; uint32_t zerofill = 0;
+        wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x00, &raw_start, 8);
+        wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x08, &raw_end, 8);
+        wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x10, &addr_index, 8);
+        wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x20, &zerofill, 4);
+        uint32_t tpl = (raw_end > raw_start) ? (uint32_t)(raw_end - raw_start) : 0;
+        uint32_t data_size = tpl + zerofill; if (!data_size) data_size = 8;
+        tls_data = wg_guest_alloc(engine, data_size);
+        if (tls_data && tpl) {
+            uint8_t *tmp = malloc(tpl);
+            if (tmp) { wg_blink_read_mem(bl, (uint32_t)raw_start, tmp, tpl);
+                       wg_blink_write_mem(bl, tls_data, tmp, tpl); free(tmp); }
+        }
+        if (addr_index) { uint32_t z = 0; wg_blink_write_mem(bl, (uint32_t)addr_index, &z, 4); }
+        WG_LOGI(TAG, "TLS64: data@0x%X size 0x%X (index 0)", tls_data, data_size);
+    }
+    if (!tls_data) tls_data = wg_guest_alloc(engine, 0x100); // valid zeroed block regardless
+    v64 = tls_data; wg_blink_write_mem(bl, tls_array, &v64, 8);  // array[0]
+
+    wg_blink_set_gs_base(engine->blink, teb);
+    s_main_teb = teb;
+    WG_LOGI(TAG, "Win32 x64 TEB@0x%X PEB@0x%X TLS@0x%X gs-base set", teb, peb, tls_array);
+}
+
 // Build a minimal 32-bit TEB/PEB + TLS and point FS at the TEB. MSVC's CRT reads
 // fs:[0x18] (TEB self), fs:[0x2C] (TLS pointer) and fs:[0x30] (PEB) during
 // startup, plus PEB->ProcessHeap / OS version fields — without these a real
 // app (steam.exe) faults in CRT init. NSIS never touched FS so it ran without.
 static void wg_setup_win32_teb(WGEngine *engine) {
     WGPEImage *pe = engine->pe_image;
-    if (!pe || pe->is_64bit) return;   // 64-bit (GS-based) TEB is a later stage
+    if (!pe) return;
+    if (pe->is_64bit) { wg_setup_win32_teb64(engine); return; }
 
     uint32_t teb = wg_guest_alloc(engine, 0x1000);
     uint32_t peb = wg_guest_alloc(engine, 0x1000);
@@ -5963,7 +7886,7 @@ static void wg_setup_win32_teb(WGEngine *engine) {
     if (!teb || !peb || !tls_array) return;
 
     uint32_t image_base  = (uint32_t)pe->image_base;
-    uint32_t stack_base  = 0x7FFF0000, stack_limit = 0x7FEF0000;
+    uint32_t stack_base  = 0x7FFF0000, stack_limit = 0x7EFF0000;
     uint32_t heap_handle = 0x00D00000;   // fake ProcessHeap handle
     uint32_t v;
 
@@ -5982,7 +7905,7 @@ static void wg_setup_win32_teb(WGEngine *engine) {
     uint8_t bd = 0; wg_blink_write_mem(engine->blink, peb + 0x02, &bd, 1);   // BeingDebugged
     wg_blink_write_mem(engine->blink, peb + 0x08, &image_base, 4);           // ImageBaseAddress
     wg_blink_write_mem(engine->blink, peb + 0x18, &heap_handle, 4);          // ProcessHeap
-    v = 1;     wg_blink_write_mem(engine->blink, peb + 0x64, &v, 4);         // NumberOfProcessors (1 = steer apps to synchronous I/O, not IOCP)
+    v = wg_ncpu(); wg_blink_write_mem(engine->blink, peb + 0x64, &v, 4);     // NumberOfProcessors (WG_NCPU; 1 steers Steam to sync I/O, games need >1)
     v = 10;    wg_blink_write_mem(engine->blink, peb + 0xA4, &v, 4);         // OSMajorVersion
     v = 0;     wg_blink_write_mem(engine->blink, peb + 0xA8, &v, 4);         // OSMinorVersion
     uint16_t bld = 19045; wg_blink_write_mem(engine->blink, peb + 0xAC, &bld, 2); // OSBuildNumber
@@ -6025,7 +7948,46 @@ static void wg_setup_win32_teb(WGEngine *engine) {
 static uint32_t wg_alloc_thread_teb(WGEngine *engine, uint32_t stack_base,
                                     uint32_t stack_limit, uint32_t tid) {
     WGPEImage *pe = engine->pe_image;
-    if (!pe || pe->is_64bit || !s_main_teb) return 0;
+    if (!pe || !s_main_teb) return 0;
+
+    if (pe->is_64bit) {
+        // x64 per-thread TEB (GS-based, 8-byte fields). Shares the process PEB.
+        void *bl = engine->blink;
+        uint32_t teb = wg_guest_alloc(engine, 0x2000);
+        uint32_t tls_array = wg_guest_alloc(engine, 0x400);
+        if (!teb || !tls_array) return 0;
+        uint64_t peb = 0;
+        wg_blink_read_mem(bl, s_main_teb + 0x60, &peb, 8);
+        uint64_t v64;
+        v64 = 0;              wg_blink_write_mem(bl, teb + 0x00, &v64, 8); // ExceptionList
+        v64 = stack_base;     wg_blink_write_mem(bl, teb + 0x08, &v64, 8); // StackBase
+        v64 = stack_limit;    wg_blink_write_mem(bl, teb + 0x10, &v64, 8); // StackLimit
+        v64 = teb;            wg_blink_write_mem(bl, teb + 0x30, &v64, 8); // Self
+        v64 = 0x1000;         wg_blink_write_mem(bl, teb + 0x40, &v64, 8); // ClientId.Process
+        v64 = tid;            wg_blink_write_mem(bl, teb + 0x48, &v64, 8); // ClientId.Thread
+        v64 = tls_array;      wg_blink_write_mem(bl, teb + 0x58, &v64, 8); // TLS pointer
+        v64 = peb;            wg_blink_write_mem(bl, teb + 0x60, &v64, 8); // PEB
+        uint32_t z = 0;       wg_blink_write_mem(bl, teb + 0x68, &z, 4);   // LastError
+        // Per-thread static TLS block (__declspec(thread)) from the TLS dir.
+        uint32_t tls_data = 0;
+        if (pe->tls_rva) {
+            uint32_t image_base = (uint32_t)pe->image_base;
+            uint64_t raw_start = 0, raw_end = 0; uint32_t zerofill = 0;
+            wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x00, &raw_start, 8);
+            wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x08, &raw_end, 8);
+            wg_blink_read_mem(bl, image_base + pe->tls_rva + 0x20, &zerofill, 4);
+            uint32_t tpl = (raw_end > raw_start) ? (uint32_t)(raw_end - raw_start) : 0;
+            uint32_t data_size = tpl + zerofill; if (!data_size) data_size = 8;
+            tls_data = wg_guest_alloc(engine, data_size);
+            if (tls_data && tpl) { uint8_t *tmp = malloc(tpl);
+                if (tmp) { wg_blink_read_mem(bl, (uint32_t)raw_start, tmp, tpl);
+                           wg_blink_write_mem(bl, tls_data, tmp, tpl); free(tmp); } }
+        }
+        if (!tls_data) tls_data = wg_guest_alloc(engine, 0x100);
+        v64 = tls_data; wg_blink_write_mem(bl, tls_array, &v64, 8);
+        WG_LOGI(TAG, "Thread TEB64@0x%X tid=0x%X stack=0x%X-0x%X", teb, tid, stack_limit, stack_base);
+        return teb;
+    }
 
     uint32_t teb = wg_guest_alloc(engine, 0x1000);
     uint32_t tls_array = wg_guest_alloc(engine, 0x400);   // 256 TLS slots
@@ -6087,6 +8049,7 @@ typedef struct {
     uint32_t thread_h;   // wg_sync THREAD handle (for join/WFSO)
     uint32_t tid;        // guest thread id
     int      tls_slot;   // per-thread index into s_tls_slots/s_fls_slots
+    uint32_t flags;      // CreateThread flags (bit 0x4 = CREATE_SUSPENDED)
 } WGWorkerArgs;
 
 static void *wg_worker_thread_entry(void *arg) {
@@ -6098,23 +8061,79 @@ static void *wg_worker_thread_entry(void *arg) {
     s_tls_slot = wa.tls_slot;             // this pthread's TLS/FLS shadow slot
     wg_blink_adopt_machine(wa.machine);   // g_machine = this pthread's Machine
 
-    // Seed the stdcall entry frame: [esp]=return addr 0 (a plain `ret` from the
-    // thread proc lands at rip 0 = our exit sentinel), [esp+4]=arg.
-    uint32_t sp = (wa.stack_top - 0x100) & ~0xFu;
-    uint32_t zero = 0;
-    wg_blink_write_mem(engine->blink, sp,     &zero,     4);
-    wg_blink_write_mem(engine->blink, sp + 4, &wa.param, 4);
-    wg_blink_set_reg(engine->blink, 4, sp);       // ESP
-    wg_blink_set_reg(engine->blink, 5, sp);       // EBP
-    wg_blink_set_fs_base(engine->blink, wa.teb);
-    wg_blink_set_rip(engine->blink, wa.start);
+    // Seed the entry frame UNDER THE GIL: wg_blink_write_mem walks the shared
+    // System page tables (CopyToUser), which races with other threads executing
+    // if unlocked — a corrupted return-address write makes the thread proc `ret`
+    // to a garbage rip (0x1) and crash the instant it starts.
+    wg_thunk_lock();
+    bool g64 = engine->pe_image && engine->pe_image->is_64bit;
+    if (g64) {
+        // x64 thread proc: DWORD WINAPI Proc(LPVOID param) — param in RCX, GS at
+        // the TEB, [rsp]=return address 0 (a `ret` lands at rip 0 = exit
+        // sentinel). rsp%16==8 after the pushed return address; leave 32B shadow.
+        uint32_t sp = (wa.stack_top - 0x100) & ~0xFu;
+        sp -= 8;
+        uint64_t zero64 = 0;
+        wg_blink_write_mem(engine->blink, sp, &zero64, 8);
+        wg_blink_set_reg(engine->blink, 4, sp);            // RSP
+        wg_blink_set_reg(engine->blink, 1, wa.param);      // RCX = param
+        wg_blink_set_gs_base(engine->blink, wa.teb);
+        wg_blink_set_rip(engine->blink, wa.start);
+    } else {
+        // Seed the stdcall entry frame: [esp]=return addr 0 (a plain `ret` from
+        // the thread proc lands at rip 0 = our exit sentinel), [esp+4]=arg.
+        uint32_t sp = (wa.stack_top - 0x100) & ~0xFu;
+        uint32_t zero = 0;
+        wg_blink_write_mem(engine->blink, sp,     &zero,     4);
+        wg_blink_write_mem(engine->blink, sp + 4, &wa.param, 4);
+        wg_blink_set_reg(engine->blink, 4, sp);       // ESP
+        wg_blink_set_reg(engine->blink, 5, sp);       // EBP
+        wg_blink_set_fs_base(engine->blink, wa.teb);
+        wg_blink_set_rip(engine->blink, wa.start);
+    }
+    wg_thunk_unlock();
 
-    WG_LOGI(TAG, "[realthr] worker tid=0x%X start=0x%X esp=0x%X teb=0x%X running",
-            wa.tid, wa.start, sp, wa.teb);
+    // CREATE_SUSPENDED: park until ResumeThread(handle). UE4 fills in this
+    // thread's context between CreateThread and ResumeThread; running before
+    // that reads garbage and crashes.
+    if (wa.flags & 0x4u) {
+        WG_LOGI(TAG, "[realthr] worker tid=0x%X SUSPENDED — waiting for ResumeThread", wa.tid);
+        wg_resume_gate_wait(wa.thread_h);
+    }
+
+    WG_LOGI(TAG, "[realthr] worker tid=0x%X start=0x%X rsp=0x%llX teb=0x%X %s running",
+            wa.tid, wa.start, (unsigned long long)wg_blink_get_reg(engine->blink, 4),
+            wa.teb, g64 ? "x64" : "x86");
 
     uint32_t exit_code = 0;
     for (;;) {
+        // GIL: blink's System (guest memory / page tables) is NOT thread-safe
+        // (built --disable-threads), so no two guest threads may execute at
+        // once. Serialize ALL execution on s_thunk_lock — thunk dispatch below
+        // already holds it, and a blocking thunk (WFSO/Sleep/CV) releases it via
+        // wg_thunk_block_begin so other threads make progress. sched_yield after
+        // each slice keeps the lock fair (no single thread hogs it).
+        wg_thunk_lock();
         WGBlinkResult r = wg_blink_run(engine->blink, engine->instructions_per_tick);
+        wg_thunk_unlock();
+        sched_yield();
+        // Busy-wait breaker (same as the main tick): a run of thunk-less slices =
+        // this worker is spinning on a flag another thread must set; sched_yield is
+        // too weak (it re-grabs the GIL before the other thread is scheduled).
+        // After a run, usleep with the GIL released so the awaited thread gets a
+        // guaranteed window. Breaks the worker-side coordination stall (0xa3).
+        {
+            static __thread int w_okrun = 0;
+            static int w_sy = -1;
+            if (w_sy < 0) w_sy = getenv("WG_NO_SPINYIELD") ? 0 : 1;
+            if (w_sy && r == WG_BLINK_OK) {
+                ++w_okrun;   // adaptive: longer spin -> more GIL time to the others
+                if (w_okrun >= 32 && (w_okrun & 31) == 0) {
+                    int us = w_okrun < 256 ? 150 : (w_okrun < 4096 ? 1500 : 9000);
+                    usleep((useconds_t)us);
+                }
+            } else w_okrun = 0;
+        }
         uint32_t rip = (uint32_t)wg_blink_get_rip(engine->blink);
         if (rip == 0) {   // thread proc returned -> exit
             exit_code = (uint32_t)wg_blink_get_reg(engine->blink, 0); // EAX
@@ -6129,10 +8148,57 @@ static void *wg_worker_thread_entry(void *arg) {
             bool handled = handle_blink_thunk(engine);
             wg_thunk_unlock();
             if (!handled) {
-                WG_LOGE(TAG, "[realthr] worker tid=0x%X unhandled halt/fault at rip=0x%X — exiting",
-                        wa.tid, (uint32_t)wg_blink_get_rip(engine->blink));
-                exit_code = (uint32_t)-1;
-                break;
+                uint32_t frip = (uint32_t)wg_blink_get_rip(engine->blink);
+                // Auto-recover a call through a bad function pointer / vtable, the
+                // SAME as the main tick: if rip landed outside the image and [rsp]
+                // is a valid .text return address, this was an indirect CALL through
+                // garbage — return 0 to the caller and keep running. Killing the
+                // worker instead hangs the main thread waiting on its task.
+                bool g64 = engine->pe_image && engine->pe_image->is_64bit;
+                uint64_t img_lo = engine->pe_image ? engine->pe_image->image_base + 0x1000 : 0x401000;
+                uint64_t img_hi = engine->pe_image ? engine->pe_image->image_base + engine->pe_image->size_of_image : 0x8C0000;
+                bool recovered = false;
+                if (frip < img_lo || frip >= img_hi) {
+                    wg_thunk_lock();   // read_mem walks the shared System page tables
+                    uint64_t sp = wg_blink_get_reg(engine->blink, 4);
+                    uint64_t ret = 0;
+                    wg_blink_read_mem(engine->blink, (uint32_t)sp, &ret, g64 ? 8 : 4);
+                    // [vtdiag] Dump the object+vtable that produced the bad call.
+                    // frip==-1 means call [rax+off] read -1; rax still holds the
+                    // vtable pointer. Reveals: valid static vtable (0x27xxxxx) with a
+                    // -1 hole vs a heap-garbage vtable pointer (wrong/UAF object).
+                    {
+                        static int _vd = 0;
+                        if (_vd++ < 4) {
+                            uint64_t vt = wg_blink_get_reg(engine->blink, 0); // RAX
+                            uint64_t rcxo = wg_blink_get_reg(engine->blink, 1); // RCX (object)
+                            uint64_t vc[12] = {0};
+                            wg_blink_read_mem(engine->blink, (uint32_t)vt, vc, sizeof(vc));
+                            WG_LOGW(TAG, "[vtdiag] obj(rcx)=0x%llx vtable(rax)=0x%llx [+0]=0x%llx [+8]=0x%llx [+0x18]=0x%llx [+0x38]=0x%llx [+0x40]=0x%llx [+0x48]=0x%llx [+0x50]=0x%llx",
+                                (unsigned long long)rcxo, (unsigned long long)vt,
+                                (unsigned long long)vc[0], (unsigned long long)vc[1],
+                                (unsigned long long)vc[3], (unsigned long long)vc[7],
+                                (unsigned long long)vc[8], (unsigned long long)vc[9],
+                                (unsigned long long)vc[10]);
+                        }
+                    }
+                    if (ret >= img_lo && ret < img_hi && wg_recover_ok(ret)) {
+                        wg_blink_set_reg(engine->blink, 0, 0);                  // RAX = 0
+                        wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4)); // pop return addr
+                        wg_blink_set_rip(engine->blink, (uint32_t)ret);
+                        recovered = true;
+                    }
+                    wg_thunk_unlock();
+                    if (recovered) {
+                        static int _wr = 0;
+                        if (_wr++ < 8) WG_LOGW(TAG, "[realthr] worker tid=0x%X auto-recovered bad-addr call 0x%X ret=0x%llx", wa.tid, frip, (unsigned long long)ret);
+                    }
+                }
+                if (!recovered) {
+                    WG_LOGE(TAG, "[realthr] worker tid=0x%X unhandled halt/fault at rip=0x%X — exiting", wa.tid, frip);
+                    exit_code = (uint32_t)-1;
+                    break;
+                }
             }
         }
         if (engine->state == WG_ENGINE_STOPPED) break;
@@ -6141,15 +8207,21 @@ static void *wg_worker_thread_entry(void *arg) {
     WG_LOGI(TAG, "[realthr] worker tid=0x%X exited code=%u", wa.tid, exit_code);
     wg_sync_thread_exit(wa.thread_h, exit_code);
     wg_free_tls_slot(wa.tls_slot);
+    // FreeMachine unlinks this Machine from blink's shared System machine list.
+    // NewMachine (spawn) holds the GIL; blink has no internal lock (--disable-
+    // threads), so a worker exiting while another spawns corrupts the list and
+    // the new thread gets a bad Machine (startup crash at ~21 threads). Serialize.
+    wg_thunk_lock();
     wg_blink_free_thread_machine(wa.machine);
+    wg_thunk_unlock();
     return NULL;
 }
 
 static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
                                      uint32_t param, uint32_t flags,
                                      uint32_t *out_tid) {
-    (void)flags; // CREATE_SUSPENDED not yet honoured for real threads
-    if (!engine->pe_image || engine->pe_image->is_64bit) return 0;
+    // CREATE_SUSPENDED (bit 0x4) is honoured via a resume gate (see below).
+    if (!engine->pe_image) return 0;   // 64-bit workers now supported (x64 TEB/GS)
 
     // Allocate + map a 1MB guest stack from the shared thread-stack region
     // (same bump allocator the cooperative scheduler uses, so no collision).
@@ -6172,6 +8244,8 @@ static uint32_t wg_spawn_real_thread(WGEngine *engine, uint32_t start,
     wa->engine = engine; wa->machine = machine; wa->start = start;
     wa->param = param; wa->stack_top = stack_top; wa->teb = teb;
     wa->thread_h = thread_h; wa->tid = tid; wa->tls_slot = wg_alloc_tls_slot();
+    wa->flags = flags;
+    if (flags & 0x4u) wg_resume_gate_create(thread_h);  // park until ResumeThread
 
     pthread_t pt;
     if (pthread_create(&pt, NULL, wg_worker_thread_entry, wa) != 0) {
@@ -6193,6 +8267,12 @@ static bool load_pe_blink(WGEngine *engine) {
     // lock, and mark the main guest thread's id.
     if (getenv("WG_REAL_THREADS")) s_use_real_threads = true;
     if (getenv("WG_NO_REAL_THREADS")) s_use_real_threads = false;
+    // Cooperative finite-timeout waits: without real timeouts, a worker's timed
+    // WaitForSingleObject (e.g. UE4's 500ms task-wait) yields forever and never
+    // advances, so it never signals the main thread (which then blocks INFINITE)
+    // -> deadlock. Off by default (device/Steam legacy path); WG_REAL_TIMEOUTS=1
+    // turns the wall-clock deadline path on for cooperative multi-thread guests.
+    if (getenv("WG_REAL_TIMEOUTS")) s_real_timeouts = true;
     if (s_use_real_threads && !wg_sync_init) {
         // wg_sync.c didn't get linked (stale Xcode project — the app's
         // -undefined dynamic_lookup masks the missing symbols as NULL). Don't
@@ -6244,6 +8324,69 @@ static bool load_pe_blink(WGEngine *engine) {
         }
     }
 
+    // Pick where the fixed guest scratch pages live. Legacy low addresses
+    // (0xA00000/0xB00000/0xC30000) sit inside a large rebased 64-bit image and
+    // would clobber its .text, so relocate them just above the image. Must be
+    // done AFTER sections load (the trampoline/getaddrinfo maps come next) and
+    // BEFORE the cmdline page is lazily mapped on first GetCommandLine.
+    s_scratch_base = 0;
+    s_cmdline_page = 0x00A00000u;
+    s_tramp_addr   = 0x00C30000u;
+    s_gai_base     = 0x00B00000u;
+    if (pe->is_64bit) {
+        uint64_t img_end = pe->image_base + pe->size_of_image;
+        if (img_end > 0x00A00000ULL) {
+            uint64_t b = (img_end + 0xFFFFFULL) & ~0xFFFFFULL; // round up to 1MB
+            b += 0x100000ULL;                                  // 1MB gap after image
+            s_scratch_base = (uint32_t)b;
+            s_cmdline_page = s_scratch_base + 0x00000;         // 4KB page
+            s_tramp_addr   = s_scratch_base + 0x01000;         // 4KB page
+            s_gai_base     = s_scratch_base + 0x100000;        // 1MB region
+            WG_LOGI(TAG, "Scratch relocated above image: cmdline=0x%X tramp=0x%X gai=0x%X",
+                    s_cmdline_page, s_tramp_addr, s_gai_base);
+        }
+    }
+    if (pe->is_64bit) map_initterm_tramp(engine, s_tramp_addr);
+    wg_winsock_set_gai_base(s_gai_base);
+
+    // Experimental (WG_UPROJ_PATCH=1): Visage's FEngineLoop::PreInit aborts when
+    // IProjectManager::LoadProjectFile fails to validate the .uproject descriptor
+    // (its FileVersion check rejects our parsed JSON). Force PreInit to treat the
+    // load as successful: patch `sete bl` (0F 94 C3) at 0x691a91 to `xor ebx,ebx;
+    // nop` (31 DB 90) so bl=0 (success). Game-specific probe.
+    if (pe->is_64bit && getenv("WG_UPROJ_PATCH")) {
+        uint8_t cur[3] = {0};
+        wg_blink_read_mem(engine->blink, 0x691a91, cur, 3);
+        if (cur[0] == 0x0F && cur[1] == 0x94 && cur[2] == 0xC3) {
+            uint8_t patch[3] = { 0x31, 0xDB, 0x90 };
+            wg_blink_write_mem(engine->blink, 0x691a91, patch, 3);
+            WG_LOGW(TAG, "WG_UPROJ_PATCH: forced LoadProjectFile success @0x691a91");
+        }
+    }
+
+    // General guest-address trace (WG_TRACE): add wg_trace_add(addr,label) calls
+    // here to breakpoint + log register state at guest addresses. Kept as a
+    // reusable diagnostic; no addresses armed by default.
+    s_trace_count = 0;
+    if (pe->is_64bit && getenv("WG_TRACE")) {
+        for (int i = 0; i < s_trace_count; i++) {
+            if (wg_blink_read_mem(engine->blink, s_trace[i].addr, &s_trace[i].orig, 1)) {
+                uint8_t hlt = 0xF4; wg_blink_write_mem(engine->blink, s_trace[i].addr, &hlt, 1);
+                s_trace[i].armed = true;
+            }
+        }
+        WG_LOGW(TAG, "WG_TRACE: armed %d breakpoints", s_trace_count);
+    }
+
+    // Force UE4's simple ANSI allocator on 64-bit games (see the cmdline builder).
+    s_cmdline_extra[0] = 0;
+    if (pe->is_64bit) strncpy(s_cmdline_extra, " -ansimalloc", sizeof(s_cmdline_extra) - 1);
+    // Extra UE4 switches for experiments (e.g. WG_UE_ARGS="-sm5 -nohmd").
+    if (getenv("WG_UE_ARGS")) {
+        size_t n = strlen(s_cmdline_extra);
+        snprintf(s_cmdline_extra + n, sizeof(s_cmdline_extra) - n, " %s", getenv("WG_UE_ARGS"));
+    }
+
     // Resolve imports — write thunk addresses into the IAT
     if (pe->num_imports > 0) {
         WG_LOGI(TAG, "Resolving %d DLL imports...", pe->num_imports);
@@ -6281,14 +8424,14 @@ static bool load_pe_blink(WGEngine *engine) {
     // CRT startup (steam.exe) doesn't fault reading fs:[…].
     wg_setup_win32_teb(engine);
 
-    // Map the getaddrinfo result scratch region (1MB @ 0xB00000) for THIS VM.
+    // Map the getaddrinfo result scratch region (1MB @ s_gai_base) for THIS VM.
     // wg_winsock serializes addrinfo chains here; it must be mapped per VM (the
     // blink VM is recreated per PE load, so a one-shot static flag in winsock
     // would skip re-mapping on the 2nd load and the guest faults reading it).
     {
         uint8_t *zeros = calloc(1, 0x100000);
         if (zeros) {
-            wg_blink_load_code(engine->blink, 0x00B00000u, zeros, 0x100000u, 0);
+            wg_blink_load_code(engine->blink, s_gai_base, zeros, 0x100000u, 0);
             free(zeros);
         }
     }
@@ -6445,6 +8588,12 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
     s_page_hwnd = 0;
     s_com_shelllink = 0; s_com_persistfile = 0;  // rebuilt in the fresh heap
     s_pending_exec[0] = 0;
+    s_null_call_recover = 0;
+    s_recover_last_addr = 0;
+    s_recover_streak = 0;
+    s_recover_total = 0;
+    s_crt_errno = s_crt_commode = s_crt_fmode = 0;  // re-alloc in the fresh heap
+    wg_d3d11_init();                                  // rebuild COM vtables in the fresh VM
     s_tls_next = 0;
     memset(s_tls_slots, 0, sizeof(s_tls_slots));
     s_fls_next = 0;
@@ -6510,6 +8659,18 @@ bool wg_engine_load_pe(WGEngine *engine, const char *path) {
             engine->pe_image->entry_point,
             (unsigned long long)engine->pe_image->image_base);
 
+    // PE32+ images prefer 0x140000000 — above 4GB. Every Win32 handler carries
+    // guest pointers through 32-bit args (and the PEB/thunk plumbing assumes a
+    // sub-4GB guest), so rebase such images down to the classic 0x400000.
+    if (engine->pe_image->is_64bit &&
+        engine->pe_image->image_base + engine->pe_image->size_of_image > 0xE0000000ULL) {
+        if (!wg_pe_rebase(engine->pe_image, 0x00400000ULL)) {
+            WG_LOGW(TAG, "64-bit image base 0x%llx not rebasable — pointers may "
+                    "truncate in Win32 handlers",
+                    (unsigned long long)engine->pe_image->image_base);
+        }
+    }
+
     bool ok = false;
     if (engine->backend == WG_BACKEND_BLINK) {
         ok = load_pe_blink(engine); // this creates the blink VM on demand
@@ -6538,6 +8699,12 @@ bool wg_engine_load_pe_memory(WGEngine *engine, const uint8_t *data, size_t size
             engine->pe_image->entry_point,
             engine->pe_image->num_imports);
 
+    // Same sub-4GB rebase as wg_engine_load_pe (see comment there).
+    if (engine->pe_image->is_64bit &&
+        engine->pe_image->image_base + engine->pe_image->size_of_image > 0xE0000000ULL) {
+        wg_pe_rebase(engine->pe_image, 0x00400000ULL);
+    }
+
     bool ok = false;
     if (engine->backend == WG_BACKEND_BLINK) {
         ok = load_pe_blink(engine);
@@ -6551,10 +8718,50 @@ bool wg_engine_load_pe_memory(WGEngine *engine, const uint8_t *data, size_t size
     return ok;
 }
 
+// Deadlock watchdog: a separate pthread (the main tick blocks inside the guest's
+// WaitForSingleObject during a deadlock, so it can't self-check). When s_thunk_progress
+// stops advancing for WG_DEADLOCK_DUMP seconds, dump every live wait + its event's
+// signalled state — pinpoints whether a wait is on an unsignalled event (dispatch
+// break) or a signalled one (a wake bug).
+static void *wg_deadlock_watchdog(void *arg) {
+    (void)arg;
+    int secs = atoi(getenv("WG_DEADLOCK_DUMP") ? getenv("WG_DEADLOCK_DUMP") : "0");
+    if (secs <= 0) secs = 15;
+    int do_kick = getenv("WG_DEADLOCK_KICK") != NULL;
+    fprintf(stderr, "[watchdog] started (fires after ~%ds near-zero thunk rate, kick=%d)\n", secs, do_kick);
+    unsigned long long last = 0; int low = 0, dumped = 0;
+    for (;;) {
+        struct timespec ts = {3, 0}; nanosleep(&ts, NULL);
+        unsigned long long cur = s_thunk_progress, delta = cur - last; last = cur;
+        // Normal execution is millions of thunks/3s; a deadlock is ~0-hundreds
+        // (a few residual poll-timeouts). Treat < 3000/3s as "stalled".
+        if (delta < 3000) {
+            low += 3;
+            if (low >= secs) {
+                if (!dumped) {
+                    fprintf(stderr, "\n[watchdog] near-zero progress (%llu thunks/3s) ~%ds — DEADLOCK; live waits:\n", delta, low);
+                    wg_sync_dump_waits();
+                    wg_dump_synctrace();
+                    dumped = 1;
+                }
+                if (do_kick) {
+                    int k = wg_sync_kick_workers();
+                    fprintf(stderr, "[watchdog] kicked %d parked worker events\n", k);
+                    low = secs > 6 ? secs - 6 : 0;   // re-check in ~6s; kick again if still stalled
+                }
+            }
+        } else { low = 0; dumped = 0; }
+    }
+    return NULL;
+}
+
 bool wg_engine_run(WGEngine *engine) {
     if (engine->state != WG_ENGINE_LOADED) {
         WG_LOGE(TAG, "Cannot run: no PE loaded (state=%d)", engine->state);
         return false;
+    }
+    if (getenv("WG_DEADLOCK_DUMP")) {
+        pthread_t wt; if (pthread_create(&wt, NULL, wg_deadlock_watchdog, NULL) == 0) pthread_detach(wt);
     }
     engine->state = WG_ENGINE_RUNNING;
     WG_LOGI(TAG, "Execution started (backend: %s)",
@@ -6572,7 +8779,11 @@ bool wg_engine_run(WGEngine *engine) {
     // patch/trap block -> empty cipher list -> fatal internal_error alert
     // instead of a ClientHello. (The macOS harness loads Steam directly, so it
     // never hit this — device-only regression.)
-    if (engine->blink && engine->pe_image &&
+    // 32-bit ONLY: these patches/traps write HLT + patched bytes at Steam.exe's
+    // hardcoded 32-bit addresses (0x6BB882, 0x69B720, …). A 64-bit game rebased
+    // to the same 0x400000 base (e.g. Visage, 55MB) would otherwise get them
+    // stamped into its own .text — corrupting code (0x24 -> 0xF4) and crashing.
+    if (engine->blink && engine->pe_image && !engine->pe_image->is_64bit &&
         engine->pe_image->image_base == 0x400000 &&
         engine->pe_image->raw_size > 0x100000 && !s_tls_setup_done) {
       // The armed HLT diagnostic traps (below) are handled only by the main tick,
@@ -6739,13 +8950,279 @@ void wg_engine_tick(WGEngine *engine) {
 
     engine->tick_count++;
 
+    // Diagnostic: sample the guest RIP periodically to locate a slow tight loop
+    // (the post-Slate compute/busy-wait phase). WG_RIPSAMPLE=1.
+    if (getenv("WG_RIPSAMPLE") && (engine->tick_count % 2000) == 0) {
+        uint64_t rip = wg_blink_get_rip(engine->blink);
+        // Walk the stack for .text return addrs so we see the caller chain of
+        // the hot loop (the guest allocator alone doesn't identify the workload).
+        char chain[300]; int ci = 0, found = 0; uint32_t prev = 0;
+        uint32_t sp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+        uint32_t lo = engine->pe_image ? (uint32_t)engine->pe_image->image_base + 0x1000 : 0x401000;
+        uint32_t hi = engine->pe_image ? (uint32_t)engine->pe_image->image_base + 0x2358000 : 0x2758000;
+        for (int w = 0; w < 400 && found < 10; w++) {
+            uint32_t v = 0; wg_blink_read_mem(engine->blink, sp + (uint32_t)w * 8, &v, 4);
+            if (v >= lo && v < hi && v != prev) {
+                ci += snprintf(chain + ci, sizeof(chain) - ci, "0x%X ", v); found++; prev = v;
+            }
+        }
+        WG_LOGW(TAG, "RIPSAMPLE tick=%llu rip=0x%llX callers: %s",
+                (unsigned long long)engine->tick_count, (unsigned long long)rip, chain);
+        // DRAIN PROBE: when the hot rip is inside the FArchive::Serialize frontier
+        // function (~0x815800-0x8158a0), dump the FArchive (RBX) + its buffer write
+        // position [RBX+0x90] + base [RBX+0x98] + the source ptr [RBX+0x98]-deref.
+        // If RBX changes across samples (distinct archives) OR the position advances
+        // monotonically => FINITE PROGRESS. If RBX constant AND position repeats =>
+        // busy-wait SPIN. Resolves the multi-session slow-vs-deadlock crux.
+        if (getenv("WG_DRAINPROBE") && rip >= 0x815700 && rip <= 0x8159a0) {
+            uint64_t rbx = wg_blink_get_reg(engine->blink, 3);
+            uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
+            uint64_t pos = 0, base = 0, srcbuf = 0;
+            wg_blink_read_mem(engine->blink, rbx + 0x90, &pos, 8);
+            wg_blink_read_mem(engine->blink, rbx + 0x98, &base, 8);
+            if (base) wg_blink_read_mem(engine->blink, base, &srcbuf, 8);
+            WG_LOGW(TAG, "DRAINPROBE tick=%llu FArchive(rbx)=0x%llX pos[+0x90]=0x%llX base[+0x98]=0x%llX src=0x%llX rsi=0x%llX",
+                    (unsigned long long)engine->tick_count, (unsigned long long)rbx,
+                    (unsigned long long)pos, (unsigned long long)base,
+                    (unsigned long long)srcbuf, (unsigned long long)rsi);
+        }
+        // LINKPROBE: the 0xA5AC30 list-walk (rbx=node, rbx=[rbx+0x28] until null,
+        // calls the 0xB66D50 setter per node) that BOTH Path A and Path B grind for
+        // 2M+ ticks (>whole native boot). Dump the node (rbx), its next[+0x28], the
+        // filter cmp[+0x20], rsi. If node values are DISTINCT + monotone => huge-but-
+        // finite; if they REPEAT/cycle => circular walk (the real stuck bug).
+        if (getenv("WG_DRAINPROBE") && rip >= 0xA5AC00 && rip <= 0xA5AC80) {
+            uint64_t rbx = wg_blink_get_reg(engine->blink, 3);
+            uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
+            uint64_t next = 0, cmp = 0;
+            wg_blink_read_mem(engine->blink, rbx + 0x28, &next, 8);
+            wg_blink_read_mem(engine->blink, rbx + 0x20, &cmp, 8);
+            WG_LOGW(TAG, "LINKPROBE tick=%llu node(rbx)=0x%llX next[+0x28]=0x%llX cmp[+0x20]=0x%llX rsi=0x%llX",
+                    (unsigned long long)engine->tick_count, (unsigned long long)rbx,
+                    (unsigned long long)next, (unsigned long long)cmp,
+                    (unsigned long long)rsi);
+        }
+        // WORKAROUND (WG_BREAK_SELFLOOP): the corrupted UObject registration list
+        // has nodes whose next-ptr points to ITSELF ([rbx+0x28]==rbx), so the walk
+        // 0xA5AC30 `rbx=[rbx+0x28]; test rbx; jne` spins forever. RIPSAMPLE catches
+        // the SETTER 0xB66D50 (deep in the per-node call) far more than the walk, and
+        // rbx (callee-saved) is still the walked node there — so check at BOTH sites.
+        // Write next=0 to terminate the walk so the boot proceeds past the stuck reg.
+        if (getenv("WG_BREAK_SELFLOOP") &&
+            ((rip >= 0xA5AC00 && rip <= 0xA5AC80) ||
+             (rip >= 0xB66D40 && rip <= 0xB66D80))) {
+            uint64_t rbx = wg_blink_get_reg(engine->blink, 3);
+            uint64_t next = 0;
+            if (rbx) wg_blink_read_mem(engine->blink, rbx + 0x28, &next, 8);
+            if (rbx != 0 && next == rbx) {
+                uint64_t zero = 0;
+                wg_blink_write_mem(engine->blink, rbx + 0x28, &zero, 8);
+                WG_LOGW(TAG, "BREAK_SELFLOOP: node 0x%llX next->self; forced next=0",
+                        (unsigned long long)rbx);
+            }
+        }
+        // STALLPROBE: dump the state at the post-drain 0xA5C7E7 stall (string scan /
+        // wait). rdi/rsi = scan counters (HUGE = runaway scan on a corrupt string);
+        // r12/r14 = the strings. Tells whether to terminate a scan or it's a real wait.
+        if (getenv("WG_STALLPROBE") && rip >= 0xA5C700 && rip <= 0xA5C900) {
+            uint64_t r12 = wg_blink_get_reg(engine->blink, 12);
+            uint64_t r14 = wg_blink_get_reg(engine->blink, 14);
+            uint64_t rdi = wg_blink_get_reg(engine->blink, 7);
+            uint64_t rsi = wg_blink_get_reg(engine->blink, 6);
+            uint64_t s12 = 0, s14 = 0;
+            if (r12) wg_blink_read_mem(engine->blink, r12, &s12, 8);
+            if (r14) wg_blink_read_mem(engine->blink, r14, &s14, 8);
+            WG_LOGW(TAG, "STALLPROBE rip=0x%llX rdi=0x%llX rsi=0x%llX r12=0x%llX([r12]=0x%llX) r14=0x%llX([r14]=0x%llX)",
+                    (unsigned long long)rip, (unsigned long long)rdi, (unsigned long long)rsi,
+                    (unsigned long long)r12, (unsigned long long)s12,
+                    (unsigned long long)r14, (unsigned long long)s14);
+        }
+        // Cascade breaker: after the list is un-stuck, a corrupt (huge) string LENGTH
+        // makes the wide-string scan at 0xB89D60 (`for(r8=start;r8<end=start+len*2;r8+=2)
+        // if(*r8=='\'')`) run effectively forever (Path B reads demand-zero past the
+        // string). Force r8=rax(end) so `cmp r8,rax; jne` exits and the boot continues.
+        if (getenv("WG_BREAK_SELFLOOP") && rip >= 0xB89D40 && rip <= 0xB89D80) {
+            uint64_t rax = wg_blink_get_reg(engine->blink, 0);  // scan end
+            wg_blink_set_reg(engine->blink, 8, rax);            // r8 = end -> loop exits
+            WG_LOGW(TAG, "BREAK_SCAN: terminated runaway string scan at 0xB89D60");
+        }
+    }
+
     if (engine->blink) {
-        WGBlinkResult r = wg_blink_run(engine->blink, engine->instructions_per_tick);
+        // Adaptive slice (real-threads): after a run of thunk-free (compute-bound)
+        // slices the guest is grinding pure computation (the UObject drain). Give it
+        // a MUCH bigger instruction budget so it holds the GIL longer — otherwise the
+        // polling workers (WAITCAP_INF) contend the GIL away every 100k instructions
+        // and the game thread stalls re-acquiring it (_pthread_mutex_..lock_slow, the
+        // ~40 ticks/s coordination phase). Reset to the small slice the instant a
+        // thunk/coordination point is hit (a HALT), so workers get the GIL promptly.
+        // WG_NO_BIGSLICE disables.
+        static int s_okstreak = 0;
+        int slice = engine->instructions_per_tick;
+        if (s_use_real_threads && getenv("WG_RSSSLICE")) {
+            // RSS-ADAPTIVE SLICE (the clean fix for construction-vs-coordination): a
+            // UObject CONSTRUCTION allocates (process RSS grows) -> BIG atomic slice so
+            // no worker interleaves BETWEEN slices and uses the half-built class (the
+            // drain corruption). A BUSY-WAIT / coordination point does NOT allocate (RSS
+            // flat) -> small base slice for frequent GIL handoffs. RSS growth cleanly
+            // separates the two (the drain grows 0.4->2.8GB; coordination stalls are
+            // flat) where RIP/thunk heuristics couldn't. WG_IPT = small base (e.g. 300000).
+            static long s_lastrss = 0; static int s_flat = 0;
+            struct rusage _ru; getrusage(RUSAGE_SELF, &_ru);
+            long _rss = _ru.ru_maxrss;   /* macOS: bytes (high-water) */
+            if (_rss > s_lastrss) { s_flat = 0; s_lastrss = _rss; }
+            else if (s_flat < 200) ++s_flat;
+            /* Also big-slice during the registration tick WINDOW: some constructions
+               link PRE-ALLOCATED nodes (flat RSS but still >8M compute), which RSS
+               growth misses. The window (env-tunable) spans past the 2.76M coordination
+               through the drain so those constructions are atomic too. */
+            static long _lo = -1, _hi = -1;
+            if (_lo < 0) { const char *a = getenv("WG_BIGTICK_LO"); _lo = a ? atol(a) : 2765000;
+                           const char *b = getenv("WG_BIGTICK_HI"); _hi = b ? atol(b) : 3300000; }
+            int _inwin = (long)engine->tick_count >= _lo && (long)engine->tick_count < _hi;
+            if (s_flat < 24 || _inwin) slice *= 48;  /* construction => big atomic slice */
+            /* else RSS flat + outside window => busy-wait/coordination => small slice */
+            (void)s_okstreak;
+        } else if (s_use_real_threads && getenv("WG_RIPSLICE")) {
+            // RIP-ADAPTIVE SLICE (the fix for the boot's construction-vs-coordination
+            // tension): a UObject class CONSTRUCTION advances the guest RIP across
+            // slices -> give it a BIG atomic slice so no worker can interleave and use
+            // the half-built class (the registration corruption). A BUSY-WAIT keeps the
+            // RIP pinned -> use the SMALL base slice so workers get frequent GIL
+            // handoffs to break the coordination spin. Picking per-slice from RIP
+            // movement gets BOTH (big slices alone starve coordination; small slices
+            // alone corrupt constructions). Set WG_IPT to the small base (e.g. 500000).
+            static uint64_t s_prevrip = 0; static int s_pinned = 0;
+            uint64_t crip = wg_blink_get_rip(engine->blink);
+            uint64_t dd = crip >= s_prevrip ? crip - s_prevrip : s_prevrip - crip;
+            s_prevrip = crip;
+            if (dd < 0x1000) { if (s_pinned < 64) ++s_pinned; } else s_pinned = 0;
+            if (s_pinned < 3) slice *= 32;   // advancing => construction => big atomic
+            // else pinned => busy-wait => small base slice (frequent handoffs)
+            (void)s_okstreak;
+        } else if (s_use_real_threads && s_okstreak >= 4 && !getenv("WG_NO_BIGSLICE"))
+            slice *= 12;
+        // GIL (real-threads): serialize guest execution with the workers — see
+        // wg_worker_thread_entry. No-op in cooperative mode (lock is a no-op).
+        wg_thunk_lock();
+        WGBlinkResult r = wg_blink_run(engine->blink, slice);
+        wg_thunk_unlock();
+        s_okstreak = (r == WG_BLINK_OK) ? s_okstreak + 1 : 0;
+        // Fairness (real-threads): the main guest thread runs here; without a yield
+        // it re-grabs the GIL immediately and can starve a worker. If the main
+        // thread is busy-waiting (esp. JIT, where a slice runs fast) for a result a
+        // worker must produce, that's a livelock. Let a waiting worker take the GIL.
+        if (s_use_real_threads) sched_yield();
+        // consecutive thunk-less slices (real-threads busy-wait detector, below)
+        static int s_okrun = 0;
         switch (r) {
             case WG_BLINK_OK:
+                // Cooperative time-slice preemption: this slice ran to the
+                // instruction budget WITHOUT hitting a thunk — the guest is in a
+                // tight loop with no Win32 calls (e.g. a spinlock/busy-wait on a
+                // flag another thread must set). Thunk-boundary preemption can't
+                // fire here, so the spinning thread would starve the others forever
+                // (the deadlock that stalls UE4 boot). Yield to any other runnable
+                // thread so it can make progress and release the spin.
+                if (!s_use_real_threads && engine->scheduler &&
+                    wg_sched_other_ready(engine->scheduler)) {
+                    wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
+                }
+                // Real-threads: the plain sched_yield above is too weak for a PURE
+                // guest-code busy-wait (the main spins on a flag a worker must set,
+                // with NO thunk to yield at — the async-loading stall at 0x815879
+                // where the HB freezes). The main re-grabs the GIL before the OS
+                // schedules the worker -> livelock. Count consecutive thunk-less
+                // slices; after a run of them, SLEEP briefly with the GIL released
+                // (it's unlocked here) so a worker is GUARANTEED a window to run,
+                // produce, and break the spin. A legit compute burst makes a Win32
+                // call (WG_BLINK_HALT) well within the threshold, resetting the
+                // counter, so it isn't penalized. WG_NO_SPINYIELD disables.
+                else if (s_use_real_threads && !getenv("WG_NO_SPINYIELD")) {
+                    // ADAPTIVE: s_okrun counts CONSECUTIVE thunk-less slices (reset on
+                    // any thunk). A short run = a compute burst (yield little). A LONG
+                    // run = the main is busy-waiting for a worker result (0xB66D50
+                    // task-graph spin) and making zero progress — so the longer it
+                    // spins, the MORE GIL time we hand the workers so they can process
+                    // and signal it, breaking the spin much faster than a fixed 150us.
+                    ++s_okrun;
+                    // WG_RIPYIELD: yield ONLY when the guest RIP is STUCK (a genuine
+                    // busy-wait spinning in a tiny range). A UObject class CONSTRUCTION
+                    // is also thunk-less but ADVANCES the RIP — yielding mid-construction
+                    // lets a worker interleave and use the half-built class (the boot
+                    // corruption). So keep the GIL (atomic) while the RIP advances, and
+                    // only release it once the RIP is pinned = a real spin. This breaks
+                    // busy-waits (0xA5C7E7) without corrupting constructions.
+                    if (getenv("WG_RANGEYIELD")) {
+                        // BOUNDED-RANGE busy-wait detector: a coordination spin cycles a
+                        // FEW nearby code blocks (RIP min..max stays within a small window
+                        // over many slices); a CONSTRUCTION advances through much wider code
+                        // (calls the allocator etc., MB apart). Yield only for the bounded
+                        // case -> breaks the 2.618M coordination WITHOUT interrupting
+                        // constructions, so big atomic slices can run (zero corruption).
+                        static uint64_t s_win[24]; static int s_wi = 0;
+                        uint64_t cr = wg_blink_get_rip(engine->blink);
+                        s_win[s_wi % 24] = cr; ++s_wi;
+                        if (s_wi >= 24) {
+                            uint64_t mn = ~0ULL, mx = 0;
+                            for (int _i = 0; _i < 24; ++_i) {
+                                if (s_win[_i] < mn) mn = s_win[_i];
+                                if (s_win[_i] > mx) mx = s_win[_i];
+                            }
+                            long rng = getenv("WG_RANGE") ? atol(getenv("WG_RANGE")) : 0x40000;
+                            if ((long)(mx - mn) < rng) usleep(3000);  // bounded => busy-wait
+                        }
+                    } else if (getenv("WG_RIPYIELD")) {
+                        static uint64_t s_lastrip = 0; static int s_ripstuck = 0;
+                        uint64_t cr = wg_blink_get_rip(engine->blink);
+                        uint64_t dd = cr >= s_lastrip ? cr - s_lastrip : s_lastrip - cr;
+                        s_lastrip = cr;
+                        // A construction ADVANCES the RIP across slices (dd large) => reset,
+                        // stay atomic. A busy-wait keeps the RIP pinned (dd small) => count.
+                        // Once pinned, yield on EVERY slice (escalating) so even big atomic
+                        // slices hand the workers a frequent window to break the coordination
+                        // spin, while never yielding mid-construction (RIP moving).
+                        if (dd < 0x1000) { ++s_ripstuck; } else { s_ripstuck = 0; }
+                        if (s_ripstuck >= 3) {
+                            int us = s_ripstuck < 12 ? 500 : (s_ripstuck < 96 ? 3000 : 12000);
+                            usleep((useconds_t)us);
+                        }
+                    } else if (s_okrun >= 32 && (s_okrun & 31) == 0) {
+                        int us = s_okrun < 256 ? 150 : (s_okrun < 4096 ? 1500 : 9000);
+                        usleep((useconds_t)us);
+                    }
+                }
                 break;
             case WG_BLINK_HALT: {
-                { wg_thunk_lock(); bool _htk = handle_blink_thunk(engine); wg_thunk_unlock(); if (_htk) break; }
+                s_okrun = 0;   // a thunk fired -> not a pure busy-wait; reset detector
+                uint32_t pre_tid = (!s_use_real_threads && engine->scheduler)
+                                       ? wg_sched_current_tid(engine->scheduler) : 0;
+                { wg_thunk_lock(); bool _htk = handle_blink_thunk(engine); wg_thunk_unlock();
+                  if (_htk) {
+                    // Cooperative preemption (path B): a thunk (HLT) is a safe path
+                    // boundary. Threads otherwise switch only at blocking calls, so a
+                    // long non-blocking stretch starves the others — the render thread
+                    // (id=0x1000) sat READY for ~1M Win32 calls during init. Every
+                    // WG_PREEMPT thunks, if another thread is runnable AND the handler
+                    // didn't already switch, yield so all threads make progress.
+                    if (!s_use_real_threads && engine->scheduler &&
+                        wg_sched_current_tid(engine->scheduler) == pre_tid) {
+                        static uint64_t s_pc = 0;
+                        static int s_pq = -1;
+                        if (s_pq < 0) {
+                            const char *e = getenv("WG_PREEMPT");
+                            s_pq = e ? atoi(e) : 1024;
+                            if (s_pq < 1) s_pq = 1;
+                        }
+                        if ((++s_pc % (uint64_t)s_pq) == 0 &&
+                            wg_sched_other_ready(engine->scheduler)) {
+                            wg_sched_yield(engine->scheduler, engine->blink,
+                                           WG_THREAD_READY);
+                        }
+                    }
+                    break;
+                  }
+                }
                 uint64_t halt_rip = wg_blink_get_rip(engine->blink);
                 if (s_watch_armed && halt_rip == s_watch_addr) {
                     // ssl_cipher_list_to_bytes, before the cipher loop: esi=s,
@@ -7073,30 +9550,119 @@ void wg_engine_tick(WGEngine *engine) {
                         if (wg_sched_current(engine->scheduler))
                             break; // a runnable thread is now active — keep going
                     }
+                    // Main-thread jump-to-null recovery. A UE4 static constructor
+                    // (or any guest code) that calls through an uninitialized
+                    // function pointer lands at RIP=0. If the word on top of the
+                    // stack is a return address a CALL pushed — i.e. it points
+                    // into the image's .text — this was a call-to-null, NOT a real
+                    // exit (an entry RET-to-0 leaves a non-.text word there).
+                    // Return 0 to the caller and keep running so the program makes
+                    // progress instead of dying on the first null indirect call.
+                    if (engine->pe_image) {
+                        bool g64 = engine->pe_image->is_64bit;
+                        uint64_t sp = wg_blink_get_reg(engine->blink, 4);
+                        uint64_t ret = 0;
+                        wg_blink_read_mem(engine->blink, sp, &ret, g64 ? 8 : 4);
+                        uint64_t img_lo = engine->pe_image->image_base + 0x1000;
+                        uint64_t img_hi = engine->pe_image->image_base +
+                                          engine->pe_image->size_of_image;
+                        if (ret >= img_lo && ret < img_hi && wg_recover_ok(ret)) {
+                            s_null_call_recover++;
+                            if (getenv("WG_BADVTBL")) {
+                                static int _bv = 0;
+                                if (_bv++ < 3) {
+                                    uint64_t r14 = wg_blink_get_reg(engine->blink, 14);
+                                    uint64_t rcx = wg_blink_get_reg(engine->blink, 1);
+                                    uint64_t vt = 0; wg_blink_read_mem(engine->blink, r14, &vt, 8);
+                                    WG_LOGW(TAG, "[badvtbl] bad=0x%llx ret=0x%llx r14(obj)=0x%llx rcx=0x%llx vtbl=[r14]=0x%llx",
+                                            (unsigned long long)halt_rip, (unsigned long long)ret,
+                                            (unsigned long long)r14, (unsigned long long)rcx,
+                                            (unsigned long long)vt);
+                                    for (int _k = 0; _k < 8; _k++) {
+                                        uint64_t e = 0; wg_blink_read_mem(engine->blink, vt + _k * 8, &e, 8);
+                                        WG_LOGW(TAG, "   vtbl[+0x%x]=0x%llx", _k * 8, (unsigned long long)e);
+                                    }
+                                }
+                            }
+                            if ((s_null_call_recover % 1000) == 1)
+                                WG_LOGW(TAG, "Recover null indirect call -> return 0 "
+                                        "to 0x%llX (count=%llu)",
+                                        (unsigned long long)ret,
+                                        (unsigned long long)s_null_call_recover);
+                            // One-shot: identify the null-vtable object being polled
+                            // (e.g. the RHI device-lost spin at 0xE1D98A).
+                            { static uint64_t s_seen = 0; if (getenv("WG_FMT") && ret != s_seen) {
+                                s_seen = ret;
+                                uint64_t r9 = wg_blink_get_reg(engine->blink, 9);
+                                uint64_t rcx = wg_blink_get_reg(engine->blink, 1);
+                                uint64_t rdi = wg_blink_get_reg(engine->blink, 7);
+                                uint32_t vt0 = 0, m7 = 0;
+                                wg_blink_read_mem(engine->blink, (uint32_t)r9, &vt0, 4);
+                                wg_blink_read_mem(engine->blink, (uint32_t)r9 + 0x38, &m7, 4);
+                                WG_LOGW(TAG, "  null-vtable @0x%llX: R9(vtbl)=0x%llX [vtbl+0]=0x%X "
+                                        "[vtbl+0x38]=0x%X RCX=0x%llX RDI=0x%llX",
+                                        (unsigned long long)ret, (unsigned long long)r9, vt0, m7,
+                                        (unsigned long long)rcx, (unsigned long long)rdi);
+                            } }
+                            wg_blink_set_reg(engine->blink, 0, 0);            // RAX = 0
+                            wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4));
+                            wg_blink_set_rip(engine->blink, (uint32_t)ret);
+                            break;
+                        }
+                        if (s_recover_streak > WG_RECOVER_SPIN_LIMIT)
+                            WG_LOGE(TAG, "Null-call spin at 0x%llX exceeded %d "
+                                    "recoveries — stopping (needs real runtime)",
+                                    (unsigned long long)ret, WG_RECOVER_SPIN_LIMIT);
+                    }
                     WG_LOGI(TAG, "Program exited normally after %llu ticks",
                             (unsigned long long)engine->tick_count);
                 } else {
-                    // Try auto-recovery for calls to unmapped addresses (bad
-                    // vtable / uninitialized function pointer): if RIP is
-                    // outside all PE sections and the return address on the
-                    // stack points into .text, return 0 to the caller.
-                    uint32_t pe_end = engine->pe_image
-                        ? (uint32_t)(engine->pe_image->image_base + 0x4C0000)
+                    // Try auto-recovery for calls to a bad address (uninitialized
+                    // function pointer / bad vtable): if RIP landed OUTSIDE the
+                    // image and the word on top of the stack is a return address
+                    // into .text, this was an indirect CALL through garbage —
+                    // return 0 to the caller and keep going. A fault INSIDE the
+                    // image is a real data access (e.g. NULL deref) and falls
+                    // through to the SEH path below. Uses the real image bounds
+                    // (a 64-bit UE4 image is tens of MB — the old fixed
+                    // image_base+0x4C0000 window was far too small).
+                    bool g64 = engine->pe_image && engine->pe_image->is_64bit;
+                    uint64_t img_lo = engine->pe_image
+                        ? engine->pe_image->image_base + 0x1000 : 0x401000;
+                    uint64_t img_hi = engine->pe_image
+                        ? engine->pe_image->image_base + engine->pe_image->size_of_image
                         : 0x8C0000;
-                    if (halt_rip > pe_end) {
-                        uint32_t esp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
-                        uint32_t ret = 0;
-                        wg_blink_read_mem(engine->blink, esp, &ret, 4);
-                        uint32_t text_lo = engine->pe_image
-                            ? (uint32_t)engine->pe_image->image_base + 0x1000
-                            : 0x401000;
-                        if (ret >= text_lo && ret < pe_end) {
-                            WG_LOGW(TAG, "Auto-recover: call to unmapped 0x%llx, "
-                                    "returning 0 to 0x%X",
-                                    (unsigned long long)halt_rip, ret);
-                            wg_blink_set_reg(engine->blink, 0, 0); // EAX = 0
-                            wg_blink_set_reg(engine->blink, 4, esp + 4);
-                            wg_blink_set_rip(engine->blink, ret);
+                    if (halt_rip < img_lo || halt_rip >= img_hi) {
+                        uint64_t sp = wg_blink_get_reg(engine->blink, 4);
+                        uint64_t ret = 0;
+                        wg_blink_read_mem(engine->blink, sp, &ret, g64 ? 8 : 4);
+                        if (ret >= img_lo && ret < img_hi && wg_recover_ok(ret)) {
+                            s_null_call_recover++;
+                            if (getenv("WG_BADVTBL")) {
+                                static int _bv = 0;
+                                if (_bv++ < 3) {
+                                    uint64_t r14 = wg_blink_get_reg(engine->blink, 14);
+                                    uint64_t rcx = wg_blink_get_reg(engine->blink, 1);
+                                    uint64_t vt = 0; wg_blink_read_mem(engine->blink, r14, &vt, 8);
+                                    WG_LOGW(TAG, "[badvtbl] bad=0x%llx ret=0x%llx r14(obj)=0x%llx rcx=0x%llx vtbl=[r14]=0x%llx",
+                                            (unsigned long long)halt_rip, (unsigned long long)ret,
+                                            (unsigned long long)r14, (unsigned long long)rcx,
+                                            (unsigned long long)vt);
+                                    for (int _k = 0; _k < 8; _k++) {
+                                        uint64_t e = 0; wg_blink_read_mem(engine->blink, vt + _k * 8, &e, 8);
+                                        WG_LOGW(TAG, "   vtbl[+0x%x]=0x%llx", _k * 8, (unsigned long long)e);
+                                    }
+                                }
+                            }
+                            if ((s_null_call_recover % 1000) == 1)
+                                WG_LOGW(TAG, "Auto-recover: call to bad addr 0x%llx "
+                                        "-> return 0 to 0x%llX (count=%llu)",
+                                        (unsigned long long)halt_rip,
+                                        (unsigned long long)ret,
+                                        (unsigned long long)s_null_call_recover);
+                            wg_blink_set_reg(engine->blink, 0, 0); // RAX = 0
+                            wg_blink_set_reg(engine->blink, 4, sp + (g64 ? 8 : 4));
+                            wg_blink_set_rip(engine->blink, (uint32_t)ret);
                             break;
                         }
                     }
@@ -7336,4 +9902,10 @@ const char *wg_engine_take_pending_exec(WGEngine *engine) {
     path[sizeof(path) - 1] = 0;
     s_pending_exec[0] = 0;   // one-shot
     return path;
+}
+
+// Accessors for the D3D11/DXGI layer (wg_d3d11.c).
+void *wg_engine_blink(WGEngine *engine) { return engine ? engine->blink : NULL; }
+uint32_t wg_engine_guest_alloc(WGEngine *engine, uint32_t size) {
+    return engine ? wg_guest_alloc(engine, size) : 0;
 }

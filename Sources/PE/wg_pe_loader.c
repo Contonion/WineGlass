@@ -415,6 +415,87 @@ void wg_pe_image_free(WGPEImage *image) {
     free(image);
 }
 
+// Mutable RVA lookup with an explicit byte count, so a fixup straddling the
+// end of a section's raw data is skipped instead of read/written out of bounds.
+static uint8_t *rva_to_mut(WGPEImage *img, uint32_t rva, uint32_t need) {
+    for (int i = 0; i < img->num_sections; i++) {
+        WGPESection *s = &img->sections[i];
+        if (s->data && rva >= s->virtual_address &&
+            rva + need <= s->virtual_address + s->raw_size) {
+            return s->data + (rva - s->virtual_address);
+        }
+    }
+    return NULL;
+}
+
+bool wg_pe_rebase(WGPEImage *img, uint64_t new_base) {
+    if (!img) return false;
+    if (img->image_base == new_base) return true;
+    if (!img->reloc_rva || !img->reloc_size) {
+        WG_LOGE(TAG, "Rebase: no .reloc directory (base 0x%llx is fixed)",
+                (unsigned long long)img->image_base);
+        return false;
+    }
+
+    int64_t delta = (int64_t)(new_base - img->image_base);
+    uint32_t off = 0;
+    int fixups = 0, skipped = 0;
+    while (off + 8 <= img->reloc_size) {
+        const uint8_t *blk = rva_to_ptr(img, img->reloc_rva + off);
+        if (!blk) break;
+        uint32_t page_rva, blk_size;
+        memcpy(&page_rva, blk, 4);
+        memcpy(&blk_size, blk + 4, 4);
+        if (blk_size < 8 || off + blk_size > img->reloc_size) break;
+        int n = (int)((blk_size - 8) / 2);
+        for (int i = 0; i < n; i++) {
+            uint16_t e;
+            memcpy(&e, blk + 8 + i * 2, 2);
+            uint32_t type = e >> 12;
+            uint32_t fix_rva = page_rva + (e & 0xFFF);
+            if (type == 0) continue;                    // ABSOLUTE (padding)
+            if (type == 10) {                           // DIR64
+                uint8_t *p = rva_to_mut(img, fix_rva, 8);
+                if (!p) { skipped++; continue; }
+                uint64_t v; memcpy(&v, p, 8);
+                v = (uint64_t)((int64_t)v + delta);
+                memcpy(p, &v, 8);
+                fixups++;
+            } else if (type == 3) {                     // HIGHLOW (PE32)
+                uint8_t *p = rva_to_mut(img, fix_rva, 4);
+                if (!p) { skipped++; continue; }
+                uint32_t v; memcpy(&v, p, 4);
+                v = (uint32_t)((int64_t)v + delta);
+                memcpy(p, &v, 4);
+                fixups++;
+            } else {
+                skipped++;
+            }
+        }
+        off += blk_size;
+    }
+
+    // Keep the mapped header consistent (guest code walks its own PE header):
+    // rewrite ImageBase in the optional header in raw_data.
+    if (img->raw_data && img->raw_size > 0x100) {
+        uint32_t pe_off; memcpy(&pe_off, img->raw_data + 0x3C, 4);
+        if ((size_t)pe_off + 24 + 36 <= img->raw_size) {
+            if (img->is_64bit) {
+                memcpy(img->raw_data + pe_off + 24 + 24, &new_base, 8);
+            } else {
+                uint32_t nb32 = (uint32_t)new_base;
+                memcpy(img->raw_data + pe_off + 24 + 28, &nb32, 4);
+            }
+        }
+    }
+
+    WG_LOGI(TAG, "Rebased 0x%llx -> 0x%llx (%d fixups, %d skipped)",
+            (unsigned long long)img->image_base, (unsigned long long)new_base,
+            fixups, skipped);
+    img->image_base = new_base;
+    return true;
+}
+
 const char *wg_pe_machine_name(uint16_t machine) {
     switch (machine) {
         case IMAGE_FILE_MACHINE_AMD64: return "x86-64";

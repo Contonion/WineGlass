@@ -357,6 +357,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", QueryPerformanceFrequency, 1);
     RS("KERNEL32.dll", GetSystemInfo, 1);
     RS("KERNEL32.dll", GetNativeSystemInfo, 1);
+    RS("KERNEL32.dll", GetLogicalProcessorInformation, 2);  // UE4 core-count probe
     // stdcall/3 args (RelationshipType, Buffer, ReturnedLength). MUST be registered
     // with the right arg count: as an auto-stub (num_args=0) it leaks 12 bytes of
     // caller stack -> corrupts saved regs -> SIGSEGV in Steam's CPU-topology init
@@ -522,6 +523,7 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", GetModuleHandleExA, 3);
     RS ("KERNEL32.dll", GetModuleFileNameA, 3);
     RS ("KERNEL32.dll", FindResourceA, 3);
+    RS ("KERNEL32.dll", FindResourceW, 3);
     RS ("KERNEL32.dll", LoadResource, 2);
     RS ("KERNEL32.dll", LockResource, 1);
     RS ("KERNEL32.dll", SizeofResource, 2);
@@ -885,6 +887,16 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     RS("SHELL32.dll", SHGetFileInfoW, 5);
     R("SHELL32.dll", ShellExecuteW, stub_ShellExecuteW, 6);
     RS("SHELL32.dll", SHFileOperationW, 1);
+    R1S("SHELL32.dll", ShellExecuteExW, 1);
+
+    // === SHLWAPI.dll === (path helpers — the UE4/Visage launcher builds its
+    // shipping-exe path with these; engine handlers write the real results)
+    R1S("SHLWAPI.dll", PathRemoveFileSpecW, 1);
+    RS("SHLWAPI.dll", PathCombineW, 3);
+    R1S("SHLWAPI.dll", PathCanonicalizeW, 2);
+    R1S("SHLWAPI.dll", PathFileExistsW, 1);
+    RS("SHLWAPI.dll", PathFindFileNameW, 1);
+    RS("SHLWAPI.dll", PathAppendW, 2);
 
     // === ADVAPI32.dll ===
     RS("ADVAPI32.dll", RegDeleteKeyW, 2);

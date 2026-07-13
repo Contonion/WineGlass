@@ -60,6 +60,9 @@ void wg_sync_thread_exit(uint32_t h, uint32_t exit_code);
 // mutex ownership/recursion. Returns WG_WAIT_OBJECT_0(+i) / WG_WAIT_TIMEOUT /
 // WG_WAIT_ABANDONED / WG_WAIT_FAILED.
 uint32_t wg_sync_wait_single(uint32_t h, uint32_t timeout_ms, uint32_t caller_tid);
+void wg_sync_dump_waits(void);   // deadlock probe: dump live waits + event states
+int  wg_sync_kick_workers(void); // deadlock-breaker: wake parked worker events
+int  wg_sync_kick_tid(uint32_t tid); // directed: wake the event `tid` is parked on
 uint32_t wg_sync_wait_multiple(const uint32_t *handles, int count, bool wait_all,
                                uint32_t timeout_ms, uint32_t caller_tid);
 

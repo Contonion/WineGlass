@@ -64,6 +64,12 @@ WGPEImage *wg_pe_load_file(const char *path);
 WGPEImage *wg_pe_load_memory(const uint8_t *data, size_t size);
 void       wg_pe_image_free(WGPEImage *image);
 
+// Apply base relocations so the image can be mapped at new_base instead of the
+// header's preferred ImageBase. Needed for PE32+ images preferring 0x140000000:
+// the engine's Win32 handlers carry guest pointers in 32-bit args, so the whole
+// guest must live below 4GB. Requires a .reloc directory.
+bool       wg_pe_rebase(WGPEImage *image, uint64_t new_base);
+
 const char *wg_pe_machine_name(uint16_t machine);
 const char *wg_pe_subsystem_name(uint16_t subsystem);
 

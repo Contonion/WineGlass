@@ -20,6 +20,13 @@
 
 #include "wg_blink_bridge.h"
 
+// Guest scratch base for serialized getaddrinfo results. The engine maps a 1MB
+// region here per VM load and tells us where via wg_winsock_set_gai_base()
+// (it's relocated above the image for large 64-bit PEs). Defaults to the legacy
+// low address for small/32-bit guests.
+static uint32_t s_gai_base = 0x00B00000u;
+void wg_winsock_set_gai_base(uint32_t base) { if (base) s_gai_base = base; }
+
 // ── Windows socket constants ────────────────────────────────────────
 #define WSADESCRIPTION_LEN  256
 #define WSASYS_STATUS_LEN   128
@@ -785,13 +792,12 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
         }
 
         // Serialize addrinfo chain into the guest scratch region (1MB @
-        // 0xB00000). The ENGINE maps this region per VM load (load_pe_blink), so
-        // it's always valid for the current VM — a winsock-side one-shot static
-        // flag would skip re-mapping after a VM recreation and the guest would
-        // fault reading the result. Bump from the base each call (results are
-        // short-lived / freed before the next lookup).
-        #define WG_GAI_BASE 0x00B00000u
-        uint32_t ptr = WG_GAI_BASE;
+        // s_gai_base). The ENGINE maps this region per VM load (load_pe_blink),
+        // so it's always valid for the current VM — a winsock-side one-shot
+        // static flag would skip re-mapping after a VM recreation and the guest
+        // would fault reading the result. Bump from the base each call (results
+        // are short-lived / freed before the next lookup).
+        uint32_t ptr = s_gai_base;
         uint32_t prev_next = 0;
 
         for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
@@ -854,7 +860,7 @@ bool wg_winsock_handle(WGWinsock *ws, const char *fn,
 
         // Write pointer to first node (always the region base).
         if (args[3]) {
-            uint32_t first = WG_GAI_BASE;
+            uint32_t first = s_gai_base;
             wg_blink_write_mem(blink, args[3], &first, 4);
         }
         (void)ptr;

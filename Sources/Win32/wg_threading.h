@@ -17,9 +17,12 @@ typedef enum {
 } WGThreadState;
 
 typedef struct {
-    uint32_t gpr[8];     // EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
-    uint32_t rip;
-    uint32_t fs_base;    // TEB address
+    uint64_t gpr[16];    // RAX..R15 (full x86-64; low 8 double as EAX..EDI)
+    uint64_t rip;
+    uint64_t flags;      // blink lazy EFLAGS (m->flags) — MUST be preserved or a
+                         // switch mid-computation corrupts the next cmp/Jcc
+    uint64_t fs_base;    // 32-bit TEB base
+    uint64_t gs_base;    // 64-bit TEB base
 } WGThreadRegs;
 
 typedef struct {
@@ -63,6 +66,9 @@ void wg_sched_save_current(WGThreadScheduler *sched, void *blink,
 // Pick the next runnable thread and restore its state into blink.
 // Returns true if a thread was switched to, false if no runnable threads.
 bool wg_sched_switch_next(WGThreadScheduler *sched, void *blink);
+
+// True if a thread other than the current one is READY (for preemptive slicing).
+bool wg_sched_other_ready(WGThreadScheduler *sched);
 
 // Called when the current thread should yield (blocking call).
 // Saves current state, finds next runnable thread, switches.

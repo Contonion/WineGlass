@@ -47,4 +47,9 @@ WGEngineState wg_engine_run_sync(WGEngine *engine, int max_ticks);
 // chain-loads it after the engine stops.
 const char *wg_engine_take_pending_exec(WGEngine *engine);
 
+// Accessors used by the D3D11/DXGI -> Metal layer (wg_d3d11.c) to reach the
+// blink VM and the guest bump allocator without seeing the private struct.
+void    *wg_engine_blink(WGEngine *engine);
+uint32_t wg_engine_guest_alloc(WGEngine *engine, uint32_t size);
+
 #endif

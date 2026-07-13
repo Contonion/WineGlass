@@ -12,6 +12,11 @@ typedef struct WGBlinkVM WGBlinkVM;
 extern WGBlinkVM *WGBlinkVM_Create(void);
 extern WGBlinkVM *WGBlinkVM_Create32(void);
 extern void WGBlinkVM_Destroy(WGBlinkVM *vm);
+extern void WGBlinkVM_ForceJit(int on);
+
+// Force blink's JIT on/off before the first VM is created. The iOS app calls
+// this after the MAP_JIT smoke test passes on-device (see wg_jit_probe.c).
+void wg_blink_force_jit(int on) { WGBlinkVM_ForceJit(on); }
 extern int WGBlinkVM_LoadCode(WGBlinkVM *vm, unsigned long long addr,
                                const void *code, unsigned int size,
                                unsigned long long entry_rip);
@@ -25,10 +30,18 @@ extern int WGBlinkVM_WriteMem(WGBlinkVM *vm, unsigned long long addr,
                                const void *buf, unsigned int len);
 extern int WGBlinkVM_ReadMem(WGBlinkVM *vm, unsigned long long addr,
                               void *buf, unsigned int len);
+extern unsigned long long WGBlinkVM_MemCopy(WGBlinkVM *vm, unsigned long long dst,
+                                            unsigned long long src, unsigned long long n);
+extern unsigned long long WGBlinkVM_MemSet(WGBlinkVM *vm, unsigned long long dst,
+                                           int c, unsigned long long n);
 extern int WGBlinkVM_SetupStack(WGBlinkVM *vm, unsigned long long entry_rip);
 extern void WGBlinkVM_SwitchTo32(WGBlinkVM *vm);
 extern void WGBlinkVM_SetFsBase(WGBlinkVM *vm, unsigned long long base);
 extern void WGBlinkVM_SetGsBase(WGBlinkVM *vm, unsigned long long base);
+extern unsigned long long WGBlinkVM_GetFlags(WGBlinkVM *vm);
+extern void WGBlinkVM_SetFlags(WGBlinkVM *vm, unsigned long long f);
+extern unsigned long long WGBlinkVM_GetFsBase(WGBlinkVM *vm);
+extern unsigned long long WGBlinkVM_GetGsBase(WGBlinkVM *vm);
 extern int WGBlinkVM_GetStopReason(WGBlinkVM *vm);
 extern unsigned long long WGBlinkVM_GetFaultAddr(WGBlinkVM *vm);
 extern void *WGBlinkVM_NewThreadMachine(WGBlinkVM *vm);
@@ -238,6 +251,19 @@ void wg_blink_set_gs_base(WGBlinkInstance *inst, uint64_t base) {
     if (inst && inst->vm) WGBlinkVM_SetGsBase(inst->vm, base);
 }
 
+uint64_t wg_blink_get_flags(WGBlinkInstance *inst) {
+    return (inst && inst->vm) ? WGBlinkVM_GetFlags(inst->vm) : 0;
+}
+void wg_blink_set_flags(WGBlinkInstance *inst, uint64_t f) {
+    if (inst && inst->vm) WGBlinkVM_SetFlags(inst->vm, f);
+}
+uint64_t wg_blink_get_fs_base(WGBlinkInstance *inst) {
+    return (inst && inst->vm) ? WGBlinkVM_GetFsBase(inst->vm) : 0;
+}
+uint64_t wg_blink_get_gs_base(WGBlinkInstance *inst) {
+    return (inst && inst->vm) ? WGBlinkVM_GetGsBase(inst->vm) : 0;
+}
+
 bool wg_blink_write_mem(WGBlinkInstance *inst, uint64_t addr,
                          const void *buf, uint32_t len) {
     if (!inst || !inst->vm) return false;
@@ -248,6 +274,17 @@ bool wg_blink_read_mem(WGBlinkInstance *inst, uint64_t addr,
                         void *buf, uint32_t len) {
     if (!inst || !inst->vm) return false;
     return WGBlinkVM_ReadMem(inst->vm, addr, buf, len) != 0;
+}
+
+// Fast guest->guest copy / fill (direct host page walk; no malloc/bounce). Return
+// 0 on an unmapped page so the caller can fall back to its slow path.
+uint64_t wg_blink_mem_copy(WGBlinkInstance *inst, uint64_t dst, uint64_t src, uint64_t n) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_MemCopy(inst->vm, dst, src, n);
+}
+uint64_t wg_blink_mem_set(WGBlinkInstance *inst, uint64_t dst, int c, uint64_t n) {
+    if (!inst || !inst->vm) return 0;
+    return WGBlinkVM_MemSet(inst->vm, dst, c, n);
 }
 
 bool wg_blink_has_jit(void) {

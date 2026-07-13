@@ -21,6 +21,11 @@ Tests/*.dSYM/
 Vendor/blink/lib/*.a
 Vendor/blink/lib/*.o
 
+# Local bottle contents (game data, logs — GBs, not for git)
+Tests/Bottle/
+# Bundled game tree (7.7GB — shipped into the .app, never committed)
+GameData/
+
 # OS
 .DS_Store
 
@@ -30,3 +35,6 @@ Vendor/blink/lib/*.o
 # xcodegen/user scheme noise
 WineGlass.xcodeproj/xcshareddata/
 .xcodeproj.xcodeproj/
+
+# stray build-artifact backups
+Vendor/blink/lib/*.prethreads

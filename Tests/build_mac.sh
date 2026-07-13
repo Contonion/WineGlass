@@ -13,7 +13,10 @@ BLINK="${BLINK_SRC:-$HOME/Developer/blink}"
 BUILD="${BUILD_DIR:-/tmp/wineglass_mac}"
 mkdir -p "$BUILD"
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
-CC="clang -arch arm64 -isysroot $SDK -O1 -g -Wno-everything"
+CC="clang -arch arm64 -isysroot $SDK -O2 -g -Wno-everything"
+# blink is the interpreter hot loop (90%+ of runtime); build it -O3 (it's
+# designed for it — computed-goto dispatch). Big speedup vs the old -O1.
+BLINKCC="clang -arch arm64 -isysroot $SDK -O3 -Wno-everything"
 
 # 1. blink.a for macOS arm64 (only if missing — slow). Uses blink's current
 #    config.h (copy config.h.ios over it first if you changed flags).
@@ -29,7 +32,7 @@ if [ ! -f "$BUILD/blink_macos.a" ]; then
     [ -f config.h ] || cp config.h.ios config.h
     rm -rf "$BUILD/obj"; mkdir -p "$BUILD/obj"
     for o in $(ar t "$WG/Vendor/blink/lib/blink.a.bak" | grep -v SYMDEF); do
-      $CC -I. -c "blink/${o%.o}.c" -o "$BUILD/obj/$o"
+      $BLINKCC -I. -c "blink/${o%.o}.c" -o "$BUILD/obj/$o"
     done
     ar rcs "$BUILD/blink_macos.a" "$BUILD/obj"/*.o; ranlib "$BUILD/blink_macos.a" )
 fi
@@ -50,6 +53,7 @@ $CC \
   "$WG"/Sources/Win32/wg_win32_bitmap.c "$WG"/Sources/Win32/wg_win32_files.c \
   "$WG"/Sources/Win32/wg_win32_gdi.c "$WG"/Sources/Win32/wg_win32_windows.c \
   "$WG"/Sources/Win32/wg_winhttp.c "$WG"/Sources/Win32/wg_winsock.c \
+  "$WG"/Sources/Win32/wg_d3d11.c \
   "$WG/Sources/LZMA/LzmaDec.c" "$WG/Tests/run_exe.c" \
   "$WG/Tests/wg_native_download_mac.m" \
   "$BUILD/wg_blink_impl_macos.o" "$BUILD/blink_macos.a" \

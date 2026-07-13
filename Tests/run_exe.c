@@ -25,24 +25,38 @@ int main(int argc, char *argv[]) {
 
     WGEngine *engine = wg_engine_create();
     if (!engine || !wg_engine_init(engine)) { WG_LOGE("RUN", "engine init failed"); return 1; }
-    if (!wg_engine_load_pe(engine, exe))     { WG_LOGE("RUN", "PE load failed");    return 1; }
-    if (!wg_engine_run(engine))              { WG_LOGE("RUN", "engine start failed"); return 1; }
 
-    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
-    unsigned long long ticks = 0;
-    for (;;) {
-        wg_engine_tick(engine);
-        ticks++;
-        WGEngineState st = wg_engine_get_state(engine);
-        if (st != WG_ENGINE_RUNNING && st != WG_ENGINE_PAUSED) {
-            WG_LOGI("RUN", "engine stopped: state=%d after %llu ticks", st, ticks);
-            break;
+    // Run the exe; if it queues a child launch (installer -> steam.exe,
+    // launcher -> Visage-Win64-Shipping.exe), chain-load it — same as the
+    // iOS scene delegate's engineLoop.
+    char chain[1024];
+    const char *exe_to_run = exe;
+    for (int chained = 0; ; chained++) {
+        if (!wg_engine_load_pe(engine, exe_to_run)) { WG_LOGE("RUN", "PE load failed");    return 1; }
+        if (!wg_engine_run(engine))                 { WG_LOGE("RUN", "engine start failed"); return 1; }
+
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        unsigned long long ticks = 0;
+        for (;;) {
+            wg_engine_tick(engine);
+            ticks++;
+            WGEngineState st = wg_engine_get_state(engine);
+            if (st != WG_ENGINE_RUNNING && st != WG_ENGINE_PAUSED) {
+                WG_LOGI("RUN", "engine stopped: state=%d after %llu ticks", st, ticks);
+                break;
+            }
+            if ((ticks & 0x3FF) == 0) {
+                struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+                double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+                if (el > max_seconds) { WG_LOGW("RUN", "time limit %.1fs hit (%llu ticks)", max_seconds, ticks); break; }
+            }
         }
-        if ((ticks & 0x3FF) == 0) {
-            struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-            double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-            if (el > max_seconds) { WG_LOGW("RUN", "time limit %.1fs hit (%llu ticks)", max_seconds, ticks); break; }
-        }
+        const char *next = wg_engine_take_pending_exec(engine);
+        if (!next || !next[0] || chained >= 3) break;
+        strncpy(chain, next, sizeof(chain) - 1);
+        chain[sizeof(chain) - 1] = 0;
+        WG_LOGI("RUN", "chain-loading: %s", chain);
+        exe_to_run = chain;
     }
     WG_LOGI("RUN", "done");
     wg_engine_destroy(engine);

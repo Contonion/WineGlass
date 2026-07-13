@@ -15,6 +15,12 @@ targets:
           - "**/*.h"
       - path: Resources
         buildPhase: resources
+      # Bundled Visage game tree (folder reference — structure preserved as-is in
+      # the .app). Laid out under drive_c so the guest C:\ mapping resolves. The
+      # app auto-loads it from the bundle when nothing is in Documents.
+      - path: GameData
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.wineglass.app

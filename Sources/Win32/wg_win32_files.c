@@ -65,7 +65,20 @@ void wg_files_ensure_parents(const char *real_path) {
 // across runs.
 static void ensure_bottle(void) {
     if (s_drive_c[0] || !s_exe_dir[0]) return;
-    snprintf(s_drive_c, sizeof(s_drive_c), "%sBottle/drive_c", s_exe_dir);
+    // If the exe already lives inside a bottle (".../drive_c/..."), anchor C:\
+    // at that drive_c — a game run from its installed location must see the
+    // existing prefix (its own dir at C:\Program Files (x86)\...), not a fresh
+    // bottle nested next to its exe. Also makes a chain-loaded steam.exe see
+    // the tree its installer just wrote.
+    const char *dc = strstr(s_exe_path, "/drive_c/");
+    if (dc) {
+        size_t n = (size_t)(dc - s_exe_path) + strlen("/drive_c");
+        if (n >= sizeof(s_drive_c)) n = sizeof(s_drive_c) - 1;
+        memcpy(s_drive_c, s_exe_path, n);
+        s_drive_c[n] = '\0';
+    } else {
+        snprintf(s_drive_c, sizeof(s_drive_c), "%sBottle/drive_c", s_exe_dir);
+    }
     mkdir_p(s_drive_c);
     const char *subdirs[] = {
         "Temp", "Program Files", "Program Files (x86)", "windows", NULL
@@ -233,6 +246,21 @@ const char *wg_files_map_path(uint32_t guest_path_addr, void *blink,
             src += 4; // \\?\UNC\server\share -> server\share (best effort)
     }
 
+    // Some guest path logic concatenates its base dir with an already-absolute
+    // path, producing a doubled path like
+    //   "C:/…/Win64/../../C:/…/Win64/../../../Engine/GlobalShaderCache-*.bin".
+    // On Windows a drive letter ("X:\" or "X:/") appearing after position 0
+    // restarts the absolute path, so the LAST such segment is the real target.
+    // Use it (fixes UE4's GlobalShaderCache lookup, which otherwise "goes
+    // missing" and aborts PreInit at CompileGlobalShaderMap).
+    for (int i = (int)strlen(src) - 3; i > 0; i--) {
+        if (((src[i] >= 'A' && src[i] <= 'Z') || (src[i] >= 'a' && src[i] <= 'z')) &&
+            src[i+1] == ':' && (src[i+2] == '\\' || src[i+2] == '/')) {
+            src += i;
+            break;
+        }
+    }
+
     // The installer .exe itself is the file the user picked — it lives in the
     // app sandbox, not inside the bottle, so keep mapping it to the real path.
     if (strcasecmp(src, "C:\\a.exe") == 0 ||
@@ -376,6 +404,17 @@ uint32_t wg_files_set_pointer(uint32_t handle, int32_t distance, uint32_t method
     }
     fseek(f->fp, distance, whence);
     return (uint32_t)ftell(f->fp);
+}
+
+// 64-bit seek — needed for pak footers, which sit near the end of multi-GB
+// .pak files (offsets that don't fit in the 32-bit variant above).
+uint64_t wg_files_set_pointer_64(uint32_t handle, int64_t offset, uint32_t method) {
+    WGFileEntry *f = find_file(handle);
+    if (!f || !f->fp) return 0;
+    int whence = (method == 1) ? SEEK_CUR : (method == 2) ? SEEK_END : SEEK_SET;
+    fseeko(f->fp, (off_t)offset, whence);
+    off_t p = ftello(f->fp);
+    return p < 0 ? 0 : (uint64_t)p;
 }
 
 void wg_files_prepopulate_nsis_data(const char *exe_path, const char *tmp_path) {

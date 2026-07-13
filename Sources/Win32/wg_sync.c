@@ -4,9 +4,12 @@
 #include <pthread.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
-#define WG_SYNC_MAX   256
+#define WG_SYNC_MAX   8192   // UE4's task graph + thread pool keep hundreds of
+                             // events/mutexes/CVs live at once; 256 exhausted
+                             // (create_thread_obj returned 0 -> parked forever)
 #define WG_SYNC_BASE  0x00090000u   // distinct from file(0x1xx)/socket(0x1xxx)/thread(0x71xx) handles
 
 enum { WGO_FREE = 0, WGO_EVENT, WGO_MUTEX, WGO_SEM, WGO_THREAD, WGO_CV };
@@ -39,6 +42,80 @@ void wg_sync_init(void) {
     pthread_mutex_lock(&g_lock);
     if (!g_inited) { memset(g_objs, 0, sizeof(g_objs)); g_inited = true; }
     pthread_mutex_unlock(&g_lock);
+}
+
+// ── Deadlock probe: track which guest thread is blocked on which handle NOW ───
+#include <stdio.h>
+static WGSyncObj *find_locked(uint32_t h);  // fwd
+static struct { uint32_t tid, handle; bool active; } s_waitq[128];
+static void wq_set(uint32_t tid, uint32_t h) {   // caller holds g_lock
+    for (int i = 0; i < 128; i++) if (s_waitq[i].active && s_waitq[i].tid == tid) { s_waitq[i].handle = h; return; }
+    for (int i = 0; i < 128; i++) if (!s_waitq[i].active) { s_waitq[i].tid = tid; s_waitq[i].handle = h; s_waitq[i].active = true; return; }
+}
+static void wq_clr(uint32_t tid) {   // caller holds g_lock
+    for (int i = 0; i < 128; i++) if (s_waitq[i].active && s_waitq[i].tid == tid) { s_waitq[i].active = false; return; }
+}
+// Dump every live wait + the target event's signalled state. If a thread waits on
+// an EVENT that is signalled=1, that's a wg_sync wake bug; signalled=0 => the
+// producer never SetEvent'd it (dispatch break).
+void wg_sync_dump_waits(void) {
+    pthread_mutex_lock(&g_lock);
+    fprintf(stderr, "=== wg_sync LIVE WAITS (deadlock probe) ===\n");
+    for (int i = 0; i < 128; i++) if (s_waitq[i].active) {
+        WGSyncObj *o = find_locked(s_waitq[i].handle);
+        const char *st = !o ? "UNKNOWN-handle"
+            : o->type == WGO_EVENT ? (o->signalled ? "EVENT signalled=1 (!!wake-bug)" : "EVENT signalled=0 (never SetEvent'd)")
+            : o->type == WGO_MUTEX ? "MUTEX" : o->type == WGO_SEM ? "SEM" : o->type == WGO_THREAD ? "THREAD" : "other";
+        fprintf(stderr, "  tid=0x%-6X waits h=0x%-6X %s%s\n", s_waitq[i].tid, s_waitq[i].handle,
+                st, (o && o->type == WGO_EVENT && o->manual) ? " [manual-reset]" : "");
+    }
+    fprintf(stderr, "=== end live waits ===\n");
+    pthread_mutex_unlock(&g_lock);
+}
+
+// Deadlock-breaker: wake parked WORKER threads (tid != 1) by signalling the events
+// they wait on, so they re-run their "Wait(); ProcessQueue();" loop and pick up any
+// work whose wake-signal was lost (our threading timing perturbs UE4's precise
+// SetEvent/Wait ordering). AUTO-reset only (a manual event would re-fire and spin).
+// The MAIN thread is left blocked so it wakes only on its real completion signal.
+// Returns how many events were kicked. Called by the engine's deadlock watchdog.
+int wg_sync_kick_workers(void) {
+    static signed char kickall = -1, kickman = -1;
+    if (kickall < 0) kickall = getenv("WG_DEADLOCK_KICKALL") ? 1 : 0;   // include main (tid 1)
+    if (kickman < 0) kickman = getenv("WG_DEADLOCK_KICKMANUAL") ? 1 : 0; // include manual-reset events
+    pthread_mutex_lock(&g_lock);
+    int kicked = 0;
+    for (int i = 0; i < 128; i++) {
+        if (!s_waitq[i].active) continue;
+        if (!kickall && s_waitq[i].tid == 1) continue;
+        WGSyncObj *o = find_locked(s_waitq[i].handle);
+        if (o && o->type == WGO_EVENT && (kickman || !o->manual) && !o->signalled) { o->signalled = true; kicked++; }
+    }
+    if (kicked) pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_lock);
+    return kicked;
+}
+
+// Directed kick: force-signal the event that `tid` is currently parked on, so a
+// specific producer wakes IMMEDIATELY (not after a WAITCAP_INF poll). Used when a
+// thread blocks on a completion whose producer is `tid` — the producer wakes,
+// processes its task, and if IT blocks on its own dependency the same kick fires
+// there, cascading the whole dependency chain forward in ms instead of resolving
+// one 2ms poll at a time. Only auto-reset events (worker wake-events) are kicked.
+int wg_sync_kick_tid(uint32_t tid) {
+    if (!tid) return 0;
+    pthread_mutex_lock(&g_lock);
+    int kicked = 0;
+    for (int i = 0; i < 128; i++) {
+        if (s_waitq[i].active && s_waitq[i].tid == tid) {
+            WGSyncObj *o = find_locked(s_waitq[i].handle);
+            if (o && o->type == WGO_EVENT && !o->manual && !o->signalled) { o->signalled = true; kicked = 1; }
+            break;
+        }
+    }
+    if (kicked) pthread_cond_broadcast(&g_cond);
+    pthread_mutex_unlock(&g_lock);
+    return kicked;
 }
 
 // Caller must hold g_lock.
@@ -220,6 +297,7 @@ uint32_t wg_sync_wait_single(uint32_t h, uint32_t timeout_ms, uint32_t caller_ti
     if (have_deadline) deadline_from_ms(&ts, timeout_ms);
 
     uint32_t rv;
+    wq_set(caller_tid, h);   // deadlock probe: this thread now waits on h
     for (;;) {
         if (satisfied_locked(o, caller_tid)) { acquire_locked(o, caller_tid); rv = WG_WAIT_OBJECT_0; break; }
         if (timeout_ms == 0) { rv = WG_WAIT_TIMEOUT; break; }
@@ -237,6 +315,7 @@ uint32_t wg_sync_wait_single(uint32_t h, uint32_t timeout_ms, uint32_t caller_ti
         o = find_locked(h);
         if (!o) { rv = WG_WAIT_FAILED; break; }
     }
+    wq_clr(caller_tid);
     pthread_mutex_unlock(&g_lock);
     return rv;
 }
