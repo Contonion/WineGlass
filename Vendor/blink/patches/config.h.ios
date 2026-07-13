@@ -1,0 +1,87 @@
+#ifndef BLINK_CONFIG_H_
+#define BLINK_CONFIG_H_
+
+// WineGlass iOS build config — features known to be available on iOS/Darwin
+
+// DISABLE_JIT — JIT compiled in; runtime-disabled for the nolinear default (see wg_blink_impl.c). Linear+JIT via WG_LINEAR.
+// #define DISABLE_X87
+#ifndef WG_PATHB
+#define WG_NOLINEAR_JIT  // force kSkew=0: JIT uses software-MMU path (nolinear; 16KB Apple pages)
+#endif                   // WG_PATHB (Path B): leave WG_NOLINEAR_JIT undefined -> kSkew=0x088800000000,
+                         // JIT emits NATIVE linear loads (host = kSkew+guest_va). Guest memory is one
+                         // big pre-mapped region at kSkew (see wg_blink_impl.c + memorymalloc.c).
+#define DISABLE_THREADS
+                         // ReserveVirtual at load. Real-threads locking is done piecemeal:
+                         // WGJIT_LOCK (jit), WG_REAL_ATOMICS (guest TSO), + a machine-list lock.
+#define WG_REAL_ATOMICS  // real C11 atomics (+barriers) for the guest's LOCK-prefixed
+                         // ops even under DISABLE_THREADS — required for WG_REAL_THREADS
+                         // guest threads' lock-free structures not to tear/race.
+#define DISABLE_SOCKETS
+// #define DISABLE_OVERLAYS
+#define DISABLE_VFS
+// #define DISABLE_NONPOSIX
+// #define DISABLE_ANCILLARY
+// #define DISABLE_DISASSEMBLER
+// #define DISABLE_BACKTRACE
+#define DISABLE_STRACE
+// #define DISABLE_METAL
+// #define DISABLE_MMX
+// #define DISABLE_BCD
+// #define DISABLE_ROM
+#define DISABLE_BMI2  // MULX/ADCX/ADOX miscompute under iOS interp -> BoringSSL X25519 keygen bad -> TLS internal_error. Force portable bignum.
+
+// Features available on iOS / Darwin ARM64
+#define HAVE_SYNC
+#define HAVE_INT128
+#define HAVE_SA_LEN
+#define HAVE_MEMCCPY
+#define HAVE_SEEKDIR
+#define HAVE_REALPATH
+#define HAVE_FDATASYNC
+#define HAVE_STRCHRNUL
+#define HAVE_VASPRINTF
+// #define HAVE_GETENTROPY  // not available on iOS 27 SDK
+// #define HAVE_SYS_GETENTROPY
+#define HAVE_MAP_SHARED
+#define HAVE_DEV_URANDOM
+#define HAVE_MAP_ANONYMOUS
+
+// Not available or not safe on iOS
+// #define HAVE_FORK
+// #define HAVE_DUP3
+// #define HAVE_PIPE2
+// #define HAVE_WAIT4
+// #define HAVE_SYSCTL
+// #define HAVE_PREADV
+// #define HAVE_MKFIFO
+// #define HAVE_WCWIDTH
+// #define HAVE_SYSINFO
+// #define HAVE_FEXECVE
+// #define HAVE_SCHED_H
+// #define HAVE_MKFIFOAT
+// #define HAVE_SETREUID
+// #define HAVE_SETRESUID
+// #define HAVE_KERN_ARND
+// #define HAVE_GETRANDOM
+// #define HAVE_SETGROUPS
+// #define HAVE_LIBUNWIND
+// #define HAVE_SENDTO_ZERO
+// #define HAVE_SIOCGIFCONF
+// #define HAVE_F_GETOWN_EX
+// #define HAVE_SCHED_YIELD
+// #define HAVE_RTLGENRANDOM
+// #define HAVE_EPOLL_PWAIT1
+// #define HAVE_EPOLL_PWAIT2
+// #define HAVE_GETDOMAINNAME
+// #define HAVE_CLOCK_SETTIME
+// #define HAVE_SYS_GETRANDOM
+// #define HAVE_SYS_GETENTROPY
+// #define HAVE_SCM_CREDENTIALS
+// #define HAVE_STRUCT_TIMEZONE
+// #define HAVE_SCHED_GETAFFINITY
+// #define HAVE_PTHREAD_PROCESS_SHARED
+#define HAVE_SYS_MOUNT_H
+// #define HAVE_PTHREAD_SETCANCELSTATE
+// #define HAVE_SOCKATMARK
+
+#endif /* BLINK_CONFIG_H_ */

@@ -1,0 +1,1037 @@
+diff --git a/blink/atomic.h b/blink/atomic.h
+index 2026a97..d6986f7 100644
+--- a/blink/atomic.h
++++ b/blink/atomic.h
+@@ -2,7 +2,14 @@
+ #define BLINK_ATOMIC_H_
+ #include "blink/builtin.h"
+ #include "blink/thread.h"
+-#if defined(HAVE_FORK) || defined(HAVE_THREADS)
++#if defined(HAVE_FORK) || defined(HAVE_THREADS) || defined(WG_REAL_ATOMICS)
++// WineGlass: WG_REAL_ATOMICS forces REAL C11 atomics even under DISABLE_THREADS.
++// The guest's LOCK-prefixed instructions (the game's lock-free structures /
++// Interlocked*) MUST be atomic with real acquire/release ordering when real
++// guest worker threads (WG_REAL_THREADS) share memory — the plain-op fallback
++// below tears them (e.g. a half-written 64-bit vtable pointer -> crash). Real
++// atomics are lock-free hardware ops, so (unlike making LOCK real) this is safe
++// in the async-signal SMC handler.
+ #include <stdatomic.h>
+ #else
+ #include "blink/types.h"
+diff --git a/blink/cpuid.c b/blink/cpuid.c
+index 597c7c6..6e42b73 100644
+--- a/blink/cpuid.c
++++ b/blink/cpuid.c
+@@ -130,7 +130,7 @@ void OpCpuid(P) {
+       break;
+     case 1:
+       cx |= 1 << 0;    // sse3
+-      cx |= 1 << 1;    // pclmulqdq
++      cx |= 0 << 1;    // pclmulqdq (off: force portable GHASH under iOS interp)
+       cx |= 1 << 9;    // ssse3
+       cx |= 1 << 23;   // popcnt
+       cx |= 1 << 30;   // rdrnd
+diff --git a/blink/deps.c b/blink/deps.c
+index e6e3339..e9b3b5d 100644
+--- a/blink/deps.c
++++ b/blink/deps.c
+@@ -472,6 +472,12 @@ int ClassifyOp(u64 rde) {
+     case 0x0F1:  // OpInterrupt1
+     case 0x0CC:  // OpInterrupt3
+     case 0x0CD:  // OpInterruptImm
++    case 0x0F4:  // OpHlt — WineGlass: our Win32 thunk trap; OpHlt HaltMachine's
++                 // -> DeliverSignalToUser -> TerminateSignal -> siglongjmp out of
++                 // the run loop. That's precisely a "longjmp could do anything"
++                 // op, so it must be excluded from JIT pathmaking (else the JIT
++                 // runs PAST the HLT into the next thunk-slot byte, corrupting
++                 // the dispatched Win32 call). Interpreted, it halts correctly.
+     case 0x105:  // OpSyscall
+       // precious ops are excluded from jit pathmaking entirely. not
+       // doing this would be inviting disaster, since system calls and
+diff --git a/blink/fusion.c b/blink/fusion.c
+index fdcc3e3..b534a4d 100644
+--- a/blink/fusion.c
++++ b/blink/fusion.c
+@@ -16,6 +16,7 @@
+ │ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
+ │ PERFORMANCE OF THIS SOFTWARE.                                                │
+ ╚─────────────────────────────────────────────────────────────────────────────*/
++#include <stdlib.h>
+ #include "blink/assert.h"
+ #include "blink/builtin.h"
+ #include "blink/debug.h"
+@@ -31,6 +32,7 @@
+ 
+ bool FuseBranchTest(P) {
+ #ifdef HAVE_JIT
++  { static signed char nf=-1; if(nf<0)nf=getenv("WG_NOFUSE")?1:0; if(nf) return false; }
+   i64 bdisp;
+   u8 *p, jcc, jlen;
+   if (RegLog2(rde) < 2) {
+@@ -145,6 +147,7 @@ bool FuseBranchTest(P) {
+ 
+ bool FuseBranchCmp(P, bool imm) {
+ #ifdef HAVE_JIT
++  { static signed char nf=-1; if(nf<0)nf=getenv("WG_NOFUSE")?1:0; if(nf) return false; }
+   i64 bdisp;
+   u8 *p, jcc, jlen;
+   if (RegLog2(rde) < 2) {
+diff --git a/blink/jit.c b/blink/jit.c
+index 6e6240e..f0f8ac4 100644
+--- a/blink/jit.c
++++ b/blink/jit.c
+@@ -16,6 +16,8 @@
+ │ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
+ │ PERFORMANCE OF THIS SOFTWARE.                                                │
+ ╚─────────────────────────────────────────────────────────────────────────────*/
++#include <pthread.h>  // WineGlass: real pthread, BEFORE blink's DISABLE_THREADS
++                      // macros shadow pthread_mutex_init/cond_* etc.
+ #include "blink/jit.h"
+ 
+ #include <errno.h>
+@@ -650,11 +652,21 @@ static int MakeJitJump(u8 buf[5], uintptr_t pc, uintptr_t addr) {
+   return n;
+ }
+ 
++// WineGlass: dedicated recursive mutex serializing all JIT compilation/
++// invalidation across real guest worker threads (see jit.h). Recursive because
++// the block pool (g_jit.lock sites) is acquired while a per-jit section is held.
++// pthread_mutex_lock/unlock aren't shadowed by blink's DISABLE_THREADS macros
++// (only init/cond/etc. are), and <pthread.h> was included first, so these are
++// the real primitives.
++static pthread_mutex_t wg_jitmu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
++void wg_jitlock_lock(void) { pthread_mutex_lock(&wg_jitmu); }
++void wg_jitlock_unlock(void) { pthread_mutex_unlock(&wg_jitmu); }
++
+ // Obtains JitBlock from global pool or creates one if none exist.
+ static struct JitBlock *AcquireJitBlock(struct Jit *jit) {
+   struct Dll *e;
+   struct JitBlock *jb;
+-  LOCK(&g_jit.lock);
++  WGJIT_LOCK();
+   if ((e = dll_first(g_jit.freeblocks))) {
+     dll_remove(&g_jit.freeblocks, e);
+     jb = JITBLOCK_CONTAINER(e);
+@@ -663,7 +675,7 @@ static struct JitBlock *AcquireJitBlock(struct Jit *jit) {
+   } else {
+     jb = 0;
+   }
+-  UNLOCK(&g_jit.lock);
++  WGJIT_UNLOCK();
+   if (jb) dll_make_last(&jit->agedblocks, &jb->aged);
+   JIT_LOGF("acquired jit block %p (freecount=%d)", jb, g_jit.freecount);
+   return jb;
+@@ -688,10 +700,10 @@ static void ReleaseJitBlock(struct JitBlock *jb) {
+   jb->wasretired = false;
+   jb->isprotected = false;
+   dll_init(&jb->aged);
+-  LOCK(&g_jit.lock);
++  WGJIT_LOCK();
+   dll_make_first(&g_jit.freeblocks, &jb->elem);
+   ++g_jit.freecount;
+-  UNLOCK(&g_jit.lock);
++  WGJIT_UNLOCK();
+ }
+ 
+ // Frees JitBlock and adds it to the global free list in such a way that
+@@ -710,10 +722,10 @@ static void RetireJitBlock(struct Jit *jit, struct JitBlock *jb) {
+   jb->index = 0;
+   jb->committed = 0;
+   jb->wasretired = true;
+-  LOCK(&g_jit.lock);
++  WGJIT_LOCK();
+   dll_make_last(&g_jit.freeblocks, &jb->elem);
+   ++g_jit.freecount;
+-  UNLOCK(&g_jit.lock);
++  WGJIT_UNLOCK();
+ }
+ 
+ // creates new jit block and sets up its jit memory
+@@ -729,15 +741,15 @@ static struct JitBlock *InitJitBlock(struct Jit *jit, long *state) {
+ }
+ 
+ static void LockJit(struct Jit *jit) {
+-  if (jit->threaded) {
+-    LOCK(&jit->lock);
+-  }
++  // WineGlass: always serialize via the dedicated recursive mutex — real guest
++  // worker threads share this jit, and jit->threaded isn't set under our build.
++  (void)jit;
++  WGJIT_LOCK();
+ }
+ 
+ static void UnlockJit(struct Jit *jit) {
+-  if (jit->threaded) {
+-    UNLOCK(&jit->lock);
+-  }
++  (void)jit;
++  WGJIT_UNLOCK();
+ }
+ 
+ /**
+@@ -1592,6 +1604,27 @@ bool RecordJitJump(struct JitBlock *jb, u64 virt, int addend) {
+ // @assume jit->lock
+ static bool RecordJitEdgeImpl(struct Jit *jit, i64 src, i64 dst) {
+   i64 visits[kJitDepth];
++  // WG: WG_NOSPLICE disables direct path→path splicing (all connections go through
++  // the ender/dispatch). Suspected fix for a real-threads SIGILL where a spliced
++  // target is flushed and the stale direct jump lands on garbage. Small perf cost.
++  static signed char wg_nosplice = -1;
++  static unsigned long long ns_lo = 1, ns_hi = 0;  // lo>hi = disabled
++  if (wg_nosplice < 0) {
++    wg_nosplice = getenv("WG_NOSPLICE") ? 1 : 0;
++    const char *lo = getenv("WG_NOSPLICE_LO"), *hi = getenv("WG_NOSPLICE_HI");
++    if (lo && hi) { ns_lo = strtoull(lo, 0, 16); ns_hi = strtoull(hi, 0, 16); }
++  }
++  if (wg_nosplice) return false;
++  // WG: narrow splice exclusion — a blink branch-splice miscompile corrupts a
++  // specific UE4 config-parse factory (returns the wrong refcounted object ->
++  // vtable type-confusion crash under full JIT+real-threads on Visage). Excluding
++  // splicing for just that IP window keeps the hot shader/UObject grind spliced
++  // (full speed) while routing the factory's path transitions through the ender.
++  if (ns_lo <= ns_hi &&
++      (((unsigned long long)src >= ns_lo && (unsigned long long)src <= ns_hi) ||
++       ((unsigned long long)dst >= ns_lo && (unsigned long long)dst <= ns_hi))) {
++    return false;
++  }
+   if (src == dst) return false;
+   visits[0] = src;
+   if (IsCyclic(&jit->edges, visits, 1, dst)) {
+diff --git a/blink/jit.h b/blink/jit.h
+index e872822..93e8156 100644
+--- a/blink/jit.h
++++ b/blink/jit.h
+@@ -10,15 +10,38 @@
+ #include "blink/tunables.h"
+ #include "blink/types.h"
+ 
++// WineGlass: serialize JIT COMPILATION across real guest worker threads
++// (WG_REAL_THREADS) via a DEDICATED real recursive mutex. blink's own
++// LOCK/jit->lock stay no-ops under DISABLE_THREADS — deliberate, to keep the
++// async-signal-safe SMC fault handler lock-free. Taken ONLY on compilation/
++// invalidation paths (jit block/hook/page mutation + the GetMicroOpLength
++// cache), NEVER from a signal handler. Implemented as plain functions (not
++// pthread macros) so this header can't clobber <pthread.h> where blink's
++// DISABLE_THREADS macros are active.
++void wg_jitlock_lock(void);
++void wg_jitlock_unlock(void);
++#define WGJIT_LOCK()   wg_jitlock_lock()
++#define WGJIT_UNLOCK() wg_jitlock_unlock()
++
+ #define kJitFit          1000
+ #define kJitDepth        16
+ #define kJitAlign        16
+ #define kJitJumpTries    16
+ #define kJitBlockSize    262144
+-#define kJitMemorySize   32505856
+-#define kJitRetireQueue  (int)(kJitMemorySize / kJitBlockSize * .10)
++/* WineGlass: was 32505856 (~31MB). A full UE4 boot compiles enough hot code to
++ * fill it -> blocks retire+recycle -> a stale hook to a reused block -> jump into
++ * overwritten code -> SIGILL (real-threads NCPU=4). Enlarge so boot never recycles. */
++#define kJitMemorySize   134217728  /* 128MB (was 512MB; iOS-palatable). Enough that
++                                     * a UE4 boot doesn't recycle blocks (recycling ->
++                                     * stale hook -> SIGILL). iOS may need less + a real
++                                     * hook-invalidation-on-retire fix; noted in jit-roadmap. */
++#define kJitRetireQueue  (int)(kJitMemorySize / kJitBlockSize * .90)
+ #define kJitSlabInts     (65536 / sizeof(struct JitInts))
+-#define kJitInitialHooks 16384
++#define kJitInitialHooks (1 << 20)  /* WineGlass: was 16384. RehashJitHooks resizes
++   with memory_order_relaxed while GetJitHook reads lock-free -> a torn read races
++   under WG_REAL_THREADS (wild jump to a stale table -> crash). Pre-size so the
++   table never resizes for a full game's path count (~1M hooks, ~12MB), avoiding
++   the resize entirely. (Proper fix later: make the resize publish acquire/release.) */
+ #define kJitInitialEdges 4096
+ 
+ #ifdef __x86_64__
+diff --git a/blink/machine.c b/blink/machine.c
+index ad309eb..953c04c 100644
+--- a/blink/machine.c
++++ b/blink/machine.c
+@@ -119,8 +119,41 @@ static void OpLeaGvqpM(P) {
+ }
+ 
+ static void OpMovEvqpGvqp(P) {
+-  WriteRegisterOrMemory(rde, GetModrmRegisterWordPointerWriteOszRexw(A),
+-                        ReadRegister(rde, RegRexrReg(m, rde)));
++  u8 *wgdst = GetModrmRegisterWordPointerWriteOszRexw(A);
++  u64 wgval = ReadRegister(rde, RegRexrReg(m, rde));
++  // WG_STOREWATCH: catch the store that writes a UObject list node's own address
++  // into its next-ptr (node->next=node, i.e. store value==(guest_addr-0x28)) — the
++  // root corruption that self-loops the registration walk. Logs the guest RIP so
++  // the mis-emulated instruction can be found. Path B only (needs linear kSkew).
++  {
++    extern void *wg_linear_base;
++    extern unsigned long long wg_linear_size;
++    static int wgsw = -1;
++    if (wgsw < 0) wgsw = getenv("WG_STOREWATCH") ? 1 : 0;
++    if (wgsw && wg_linear_base && !IsModrmRegister(rde) &&
++        (u8 *)wgdst >= (u8 *)wg_linear_base &&
++        (u8 *)wgdst < (u8 *)wg_linear_base + wg_linear_size) {
++      u64 ga = (u64)((uintptr_t)wgdst - (uintptr_t)wg_linear_base);
++      // Only the guest HEAP (UObjects live ~0x20000000+); exclude stack (0x7FFxxxxx,
++      // where value==addr-0x28 is a legit &local store) and the image (<0x10000000).
++      if (wgval != 0 && wgval == ga - 0x28 &&
++          ga >= 0x10000000ULL && ga < 0x7F000000ULL) {
++        // Distinguish the DOUBLE-ADD corruption from a legit "fresh unlinked" init:
++        // a legit init writes self over 0/uninit; the corruption OVERWRITES an
++        // already-valid successor pointer with self (the node re-added to a list
++        // that already links it). Only the latter is the bug that self-loops the walk.
++        u64 oldv = Read64(wgdst);
++        if (oldv != wgval && oldv >= 0x10000000ULL && oldv < 0x7F000000ULL) {
++          fprintf(stderr,
++                  "WG_STOREWATCH: DOUBLE-ADD [%#llx] valid-next %#llx -> self %#llx rip=%#llx\n",
++                  (unsigned long long)ga, (unsigned long long)oldv,
++                  (unsigned long long)wgval, (unsigned long long)m->ip);
++          fflush(stderr);
++        }
++      }
++    }
++  }
++  WriteRegisterOrMemory(rde, wgdst, wgval);
+   if (IsMakingPath(m)) {
+     Jitter(A, "A"      // res0 = GetReg(RexrReg)
+               "r0D");  // PutRegOrMem(RexbRm, res0)
+@@ -2175,6 +2208,12 @@ static void GeneralDispatch(P) {
+       // branches, calls, and jumps always force end of path
+       // unlike precious ops the branching op can be in path
+       CompletePath(A);
++    } else {
++      // WineGlass: WG_JIT1 caps JIT paths to a single op — isolates whether a
++      // miscompile is in single-op codegen vs multi-op path optimization.
++      static signed char s_jit1 = -1;
++      if (s_jit1 < 0) s_jit1 = getenv("WG_JIT1") ? 1 : 0;
++      if (s_jit1) CompletePath(A);
+     }
+   }
+   m->oplen = 0;
+@@ -2185,6 +2224,29 @@ void ExecuteInstruction(struct Machine *m) {
+ #if LOG_CPU
+   LogCpu(m);
+ #endif
++  {  // WineGlass: WG_JITTRACE — compact per-instruction (RIP, GPR-hash) trace to
++     // diff interpreter vs length-1 JIT and pinpoint a miscompiled op.
++    static signed char wgtr = -1;
++    static unsigned long long trlo = 0, trhi = ~0ull;
++    if (wgtr < 0) {
++      wgtr = getenv("WG_JITTRACE") ? 1 : 0;
++      const char *lo = getenv("WG_TRACELO"), *hi = getenv("WG_TRACEHI");
++      if (lo) trlo = strtoull(lo, 0, 16);
++      if (hi) trhi = strtoull(hi, 0, 16);
++    }
++    if (wgtr && (unsigned long long)m->ip >= trlo && (unsigned long long)m->ip <= trhi) {
++      unsigned long long h = 1469598103934665603ull; int wi;
++      for (wi = 0; wi < 16; wi++) { h ^= Read64(m->weg[wi]); h *= 1099511628211ull; }
++      unsigned long long fl = ExportFlags(m->flags) & 0x8d5;  // CF PF AF ZF SF OF
++      if (getenv("WG_JITREGS")) {  // full 16-GPR dump to identify the corrupted reg
++        fprintf(stderr, "WGTR m=%p %010llx", (void *)m, (unsigned long long)m->ip);
++        for (wi = 0; wi < 16; wi++) fprintf(stderr, " %llx", (unsigned long long)Read64(m->weg[wi]));
++        fprintf(stderr, " fl=%03llx\n", fl);
++      } else {
++        fprintf(stderr, "WGTR m=%p %010llx %016llx fl=%03llx\n", (void *)m, (unsigned long long)m->ip, h, fl);
++      }
++    }
++  }
+ #ifdef HAVE_JIT
+   u8 *dst;
+   nexgen32e_f func;
+diff --git a/blink/machine.h b/blink/machine.h
+index be17a8a..10550ba 100644
+--- a/blink/machine.h
++++ b/blink/machine.h
+@@ -339,6 +339,14 @@ struct MachineTlb {
+   u64 entry;
+ };
+ 
++// WineGlass: generation-tagged entry for the large software-MMU TLB (tlb2).
++struct MachineTlbG {
++  i64 page;
++  u64 entry;
++  u8 *host;   // WineGlass Path A: cached host base ptr (GetPageAddress(entry))
++  u32 gen;
++};
++
+ struct Machine {               //
+   u64 ip;                      // instruction pointer
+   u8 oplen;                    // length of operation
+@@ -450,6 +458,17 @@ struct Machine {               //
+   struct Dll elem;                       //
+   struct SmcQueue smcqueue;              //
+   struct OpCache opcache[1];             //
++  // WineGlass: large gen-tagged software-MMU TLB — MUST be LAST (JIT bakes
++  // offsets for opcache/registers). ResetTlb bumps tlbgen (O(1)).
++  struct MachineTlbG tlb2[8192];         //
++  u32 tlbgen;                            //
++  // WineGlass: O(1) membership hash for the SMC queue (also MUST be last). The
++  // linear scan of smcqueue.p[4096] ran on EVERY guest write to a writable page
++  // (LookupAddress2) and dominated write-heavy phases (the UObject drain). This
++  // open-addressing hash (keyed by page, 0=empty) makes IsPageInSmcQueue O(1).
++  // Kept exactly in sync with smcqueue: set on Add, memset on Flush.
++  i64 smchash[16384];                    //
++  int smc_n;                             // WineGlass: # filled smcqueue entries
+ };  //
+ 
+ extern struct HostPages g_hostpages;
+diff --git a/blink/map.h b/blink/map.h
+index 069ca2c..bf2a5c3 100644
+--- a/blink/map.h
++++ b/blink/map.h
+@@ -13,6 +13,10 @@
+ 
+ #if defined(__APPLE__) && defined(__aarch64__)
+ #include <libkern/OSCacheControl.h>
++// MAP_JIT support — these are in pthread.h but we can't include it
++// when DISABLE_THREADS strips the pthread type prerequisites.
++extern void pthread_jit_write_protect_np(int enabled);
++extern int pthread_jit_write_protect_supported_np(void);
+ #else
+ #define pthread_jit_write_protect_supported_np() 0
+ #define pthread_jit_write_protect_np(x)          (void)(x)
+diff --git a/blink/memory.c b/blink/memory.c
+index 6c2d34c..cee5ca7 100644
+--- a/blink/memory.c
++++ b/blink/memory.c
+@@ -188,9 +188,10 @@ u64 FindPageTableEntry(struct Machine *m, u64 page) {
+     ResetTlb(m);
+     atomic_store_explicit(&m->invalidated, false, memory_order_relaxed);
+   }
+-  tlbkey = (page >> 12) & (ARRAYLEN(m->tlb) - 1);
+-  if (LIKELY(m->tlb[tlbkey].page == page &&
+-             ((entry = m->tlb[tlbkey].entry) & PAGE_V))) {
++  tlbkey = (page >> 12) & (ARRAYLEN(m->tlb2) - 1);
++  if (LIKELY(m->tlb2[tlbkey].page == page &&
++             m->tlb2[tlbkey].gen == m->tlbgen &&
++             ((entry = m->tlb2[tlbkey].entry) & PAGE_V))) {
+     STATISTIC(++tlb_hits);
+     return entry;
+   }
+@@ -252,8 +253,10 @@ TryAgain:
+       return 0;
+     }
+   }
+-  m->tlb[tlbkey].page = page;
+-  m->tlb[tlbkey].entry = entry;
++  m->tlb2[tlbkey].page = page;
++  m->tlb2[tlbkey].entry = entry;
++  m->tlb2[tlbkey].host = GetPageAddress(m->system, entry, false);  // Path A cache
++  m->tlb2[tlbkey].gen = m->tlbgen;
+   return entry;
+ MapError:
+   m->segvcode = SEGV_MAPERR_LINUX;
+@@ -328,6 +331,11 @@ u8 *SpyAddress(struct Machine *m, i64 virt) {
+ 
+ u8 *ResolveAddress(struct Machine *m, i64 v) {
+   u8 *r;
++  // WineGlass Path A: the inline-TLB fast-path lives in ReserveAddress (the main
++  // memory chokepoint). An earlier fast-path here (Load/BeginStore/AccessRam)
++  // measured ~6x SLOWER across two runs vs ReserveAddress-only, so it's reverted;
++  // AccessRam goes through GetAddress (which still benefits from the gen-TLB in
++  // FindPageTableEntry). Keep this path plain.
+   if ((r = GetAddress(m, v))) return r;
+   ThrowSegmentationFault(m, v);
+ }
+@@ -415,7 +423,10 @@ void CommitStash(struct Machine *m) {
+   m->stashaddr = 0;
+ }
+ 
+-u8 *ReserveAddress(struct Machine *m, i64 v, size_t n, bool writable) {
++// WineGlass: flatten the hit path — inlines LookupAddress2+FindPageTableEntry+
++// GetPageAddress so a TLB hit is a few instructions, not 4 nested function calls
++// (the ~5M inst/s cap on UE4's memory-heavy UObject drain). Pure inlining hint.
++flattencalls u8 *ReserveAddress(struct Machine *m, i64 v, size_t n, bool writable) {
+   long k;
+   u64 mask, need;
+   u8 *res, *p1, *p2;
+@@ -427,6 +438,25 @@ u8 *ReserveAddress(struct Machine *m, i64 v, size_t n, bool writable) {
+   if (HasLinearMapping()) {
+     return ToHost(v);
+   }
++  // WineGlass Path A: inline TLB fast-path. A single-page access that hits the
++  // TLB (cached host + adequate perms) returns host+offset directly, skipping
++  // the LookupAddress2/GetPageAddress/FindHostPage chain — the QEMU-style inline
++  // softmmu. Writes still do the (now O(1)) SMC-queue tracking for JIT
++  // correctness. Skipped when insyscall (the slow path takes page locks then).
++  if (LIKELY(!m->insyscall && (v & 4095) + n <= 4096)) {
++    long fk = (v >> 12) & (ARRAYLEN(m->tlb2) - 1);
++    struct MachineTlbG *e = &m->tlb2[fk];
++    u64 fneed = Cpl(m) == 3 ? (writable ? (PAGE_U | PAGE_RW) : PAGE_U) : 0;
++    if (LIKELY(e->page == (v & -4096) && e->gen == m->tlbgen && e->host &&
++               (e->entry & fneed) == fneed)) {
++      if (writable &&
++          (e->entry & (PAGE_U | PAGE_RW | PAGE_XD)) == (PAGE_U | PAGE_RW) &&
++          !IsJitDisabled(&m->system->jit) && !IsPageInSmcQueue(m, v)) {
++        AddPageToSmcQueue(m, v);
++      }
++      return e->host + (v & 4095);
++    }
++  }
+   m->reserving = true;
+   if (Cpl(m) == 3) {
+     if (!writable) {
+@@ -478,7 +508,7 @@ u8 *ReserveAddress(struct Machine *m, i64 v, size_t n, bool writable) {
+   }
+ }
+ 
+-static u8 *AccessRam2(struct Machine *m, i64 v, size_t n, void *p[2], u8 *tmp,
++flattencalls static u8 *AccessRam2(struct Machine *m, i64 v, size_t n, void *p[2], u8 *tmp,
+                       bool copy, bool protect_rom) {
+   u8 *a, *b;
+   unsigned k;
+diff --git a/blink/memorymalloc.c b/blink/memorymalloc.c
+index 7d5cc93..47c4a09 100644
+--- a/blink/memorymalloc.c
++++ b/blink/memorymalloc.c
+@@ -43,6 +43,9 @@
+ #include "blink/util.h"
+ #include "blink/x86.h"
+ 
++extern void wg_jitlock_lock(void);
++extern void wg_jitlock_unlock(void);
++
+ struct Allocator {
+   pthread_mutex_t_ lock;
+   struct HostPage *pages GUARDED_BY(lock);
+@@ -89,11 +92,11 @@ static u64 TrackHostPage(u8 *ptr) {
+ void FreeAnonymousPage(struct System *s, u8 *page) {
+   struct HostPage *h;
+   unassert((h = NewHostPage()));
+-  LOCK(&g_allocator.lock);
++  wg_jitlock_lock();
+   h->page = page;
+   h->next = g_allocator.pages;
+   g_allocator.pages = h;
+-  UNLOCK(&g_allocator.lock);
++  wg_jitlock_unlock();
+ }
+ 
+ static size_t GetBigSize(size_t n) {
+@@ -452,28 +455,28 @@ u64 AllocateAnonymousPage(struct System *s) {
+   u8 *page;
+   size_t i, n;
+   struct HostPage *h;
+-  LOCK(&g_allocator.lock);
++  wg_jitlock_lock();
+   if ((h = g_allocator.pages)) {
+     g_allocator.pages = h->next;
+-    UNLOCK(&g_allocator.lock);
++    wg_jitlock_unlock();
+     page = h->page;
+     FreeHostPage(h);
+     goto Finished;
+   } else {
+-    UNLOCK(&g_allocator.lock);
++    wg_jitlock_unlock();
+   }
+   n = 64;
+   page = (u8 *)AllocateBig(n * 4096, PROT_READ | PROT_WRITE,
+                            MAP_ANONYMOUS_ | MAP_PRIVATE, -1, 0);
+   if (!page) return -1;
+-  LOCK(&g_allocator.lock);
++  wg_jitlock_lock();
+   for (i = n; i-- > 1;) {
+     unassert((h = NewHostPage()));
+     h->page = page + i * 4096;
+     h->next = g_allocator.pages;
+     g_allocator.pages = h;
+   }
+-  UNLOCK(&g_allocator.lock);
++  wg_jitlock_unlock();
+ Finished:
+   s->rss += 1;
+   i = TrackHostPage(page);
+@@ -792,6 +795,19 @@ static int DetermineHostProtection(int prot) {
+   return sysprot;
+ }
+ 
++// WineGlass Path B: the whole <4GB guest space is ONE big pre-mapped host region
++// at kSkew (see wg_blink_impl.c). These describe it so ReserveVirtual/RemoveVirtual
++// SUB-allocate within it instead of per-region mmap/munmap (which would need 16KB
++// MAP_FIXED alignment the 4KB guest can't satisfy, and would punch holes in the
++// big mapping). Zero on (re)reserve for fresh semantics; MADV_FREE on release.
++void *wg_linear_base = 0;
++unsigned long long wg_linear_size = 0;
++static bool wg_in_linear(i64 virt, i64 size) {
++  return wg_linear_base && virt >= 0 && size >= 0 &&
++         (u64)virt + (u64)size <= wg_linear_size &&
++         (u64)virt + (u64)size >= (u64)virt;  // no overflow
++}
++
+ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
+                    i64 offset, bool shared, bool fixedmap) {
+   u8 *mi;
+@@ -834,7 +850,10 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
+ 
+   pagesize = FLAG_pagesize;
+ 
+-  if (HasLinearMapping()) {
++  if (HasLinearMapping() && !wg_in_linear(virt, size)) {
++    // WineGlass Path B: inside the big pre-mapped region a 4KB-aligned virt is
++    // fine (no per-region host mmap happens), so the 16KB host-page alignment
++    // requirement only applies to mappings OUTSIDE the linear region.
+     if (virt & (pagesize - 1)) {
+       return FailDueToHostAlignment(virt, pagesize, "address");
+     }
+@@ -877,6 +896,8 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
+       } else {
+         // holes exist; try to create a greenfield
+         for (i = 0; i < ranges.i; ++i) {
++          // WineGlass Path B: never munmap inside the big pre-mapped region.
++          if (wg_in_linear(ranges.p[i].a, ranges.p[i].b - ranges.p[i].a)) continue;
+           Munmap(ToHost(ranges.p[i].a), ranges.p[i].b - ranges.p[i].a);
+           mutated = true;
+         }
+@@ -897,30 +918,42 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
+     // lets us report a friendly error to the user, when that happens.
+     // the solution is most likely to rebuild with -Wl,-Ttext-segment=
+     // please note we need to take off the seatbelt after an execve().
+-    errno = 0;
+-    want = virt ? ToHost(virt) : 0;
+-    if ((got = Mmap(want, size, sysprot,                    //
+-                    (method |                               //
+-                     (fd == -1 ? MAP_ANONYMOUS_ : 0) |      //
+-                     (shared ? MAP_SHARED : MAP_PRIVATE)),  //
+-                    fd, offset, "linear")) != want) {
+-      if (got == MAP_FAILED && errno == ENOMEM && !mutated) {
+-        LOGF("host system returned ENOMEM");
+-        return -1;
+-      } else if (got != MAP_FAILED && !want) {
+-        virt = ToGuest(got);
+-        unassert(IsValidAddrSize(virt, size));
+-      } else {
+-        ERRF("mmap(%#" PRIx64 "[%p], %#" PRIx64 ")"
+-             " -> %#" PRIx64 "[%p] crisis: %s",
+-             virt, want, size, ToGuest(got), got,
+-             (method == MAP_DEMAND && errno == MAP_DENIED)
+-                 ? "requested memory overlapped blink image or system memory. "
+-                   "try using `blink -m` to disable memory optimizations, or "
+-                   "try compiling blink using -Wl,--image-base=0x23000000 or "
+-                   "possibly -Wl,-Ttext-segment=0x23000000 in LDFLAGS"
+-                 : DescribeHostErrno(errno));
+-        PanicDueToMmap();
++    if (getenv("WG_SIGLOG"))
++      fprintf(stderr, "[wg] RV virt=%#llx size=%#llx in_linear=%d base=%p fd=%d\n",
++              (unsigned long long)virt, (unsigned long long)size,
++              (int)wg_in_linear(virt, size), wg_linear_base, fd);
++    if (wg_in_linear(virt, size) && fd == -1) {
++      // WineGlass Path B: anonymous memory is already backed by the big region.
++      // Skip the per-region host mmap (which would need 16KB MAP_FIXED alignment
++      // and would clobber neighbors). Zero it for fresh (re)reservation semantics
++      // — up to 256MB explicitly; larger relies on the region's demand-zero.
++      if (size <= (256LL << 20)) memset(ToHost(virt), 0, (size_t)size);
++    } else {
++      errno = 0;
++      want = virt ? ToHost(virt) : 0;
++      if ((got = Mmap(want, size, sysprot,                    //
++                      (method |                               //
++                       (fd == -1 ? MAP_ANONYMOUS_ : 0) |      //
++                       (shared ? MAP_SHARED : MAP_PRIVATE)),  //
++                      fd, offset, "linear")) != want) {
++        if (got == MAP_FAILED && errno == ENOMEM && !mutated) {
++          LOGF("host system returned ENOMEM");
++          return -1;
++        } else if (got != MAP_FAILED && !want) {
++          virt = ToGuest(got);
++          unassert(IsValidAddrSize(virt, size));
++        } else {
++          ERRF("mmap(%#" PRIx64 "[%p], %#" PRIx64 ")"
++               " -> %#" PRIx64 "[%p] crisis: %s",
++               virt, want, size, ToGuest(got), got,
++               (method == MAP_DEMAND && errno == MAP_DENIED)
++                   ? "requested memory overlapped blink image or system memory. "
++                     "try using `blink -m` to disable memory optimizations, or "
++                     "try compiling blink using -Wl,--image-base=0x23000000 or "
++                     "possibly -Wl,-Ttext-segment=0x23000000 in LDFLAGS"
++                   : DescribeHostErrno(errno));
++          PanicDueToMmap();
++        }
+       }
+     }
+     s->memstat.committed += pages;
+@@ -1018,7 +1051,14 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
+           s->rss += rss_delta;
+           s->vss += vss_delta;
+ #ifndef DISABLE_JIT
+-          if (HasLinearMapping() && !IsJitDisabled(&s->jit)) {
++          // WineGlass Path B: do NOT RO-protect RWX pages inside the big region at
++          // reserve time. WineGlass loads guest code with CopyToUser AFTER the
++          // reserve, so a premature RO mprotect makes that write fault. The guest
++          // pages only need R/W (blink reads instructions from them and emits host
++          // code into a separate JIT buffer); UE4 doesn't self-modify, so skipping
++          // this SMC pre-protection is safe.
++          if (HasLinearMapping() && !IsJitDisabled(&s->jit) &&
++              !wg_in_linear(result, size)) {
+             result = ProtectRwxMemory(s, result, result, size, pagesize, prot);
+           }
+ #endif
+@@ -1080,6 +1120,13 @@ int FreeVirtual(struct System *s, i64 virt, i64 size) {
+                 &executable_code_was_made_non_executable, &mutated, &vss_delta,
+                 &rss_delta);
+   for (rc = i = 0; i < ranges.i; ++i) {
++    // WineGlass Path B: NEVER munmap inside the big pre-mapped region — that would
++    // punch a hole and the next linear access (host=kSkew+va) would fault. The
++    // page-table entries are already cleared by RemoveVirtual (guest sees it as
++    // freed); the host pages stay resident and get zeroed on the next reserve.
++    if (wg_in_linear(ranges.p[i].a, ranges.p[i].b - ranges.p[i].a)) {
++      continue;
++    }
+     if (Munmap(ToHost(ranges.p[i].a), ranges.p[i].b - ranges.p[i].a)) {
+       LOGF("failed to %s subrange"
+            " [%" PRIx64 ",%" PRIx64 ") within requested range"
+@@ -1259,6 +1306,13 @@ FinishedCrawling:
+     for (i = 0; i < ranges.i; ++i) {
+       a = ROUNDDOWN(ranges.p[i].a, pagesize);
+       b = ranges.p[i].b;
++      // WineGlass Path B: keep the big region flat-RW — don't honor the guest's
++      // VirtualProtect at the host level (16KB rounding would over-protect the
++      // 4KB neighbors sharing a host page and cause false faults). blink's own
++      // JIT self-modifying-code protection (smc.c) is separate and still applies.
++      if (wg_in_linear(a, b - a)) {
++        continue;
++      }
+       if (Mprotect(ToHost(a), b - a, sysprot, "linear")) {
+         LOGF("failed to %s subrange"
+              " [%" PRIx64 ",%" PRIx64 ") within requested range"
+diff --git a/blink/path.c b/blink/path.c
+index 47e5cab..b7b6794 100644
+--- a/blink/path.c
++++ b/blink/path.c
+@@ -19,10 +19,13 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ 
+ #include "blink/assert.h"
++#include "blink/endian.h"
+ #include "blink/builtin.h"
+ #include "blink/debug.h"
+ #include "blink/dis.h"
+@@ -634,10 +637,36 @@ void FlushSkew(P) {
+   }
+ }
+ 
++// WG: op trace emitted INTO the generated JIT code (runs during NATIVE execution,
++// unlike the interp-only WG_JITTRACE) so a splice miscompile can be observed. Dumps
++// guest GPRs at each op in the WG_JOP window. Capped.
++void WgJitOpTrace(struct Machine *m, i64 ip) {
++  static signed char on = -1;
++  static long cap = 0;
++  if (on < 0) on = getenv("WG_JOP") ? 1 : 0;
++  if (!on || cap > 6000) return;
++  ++cap;
++  fprintf(stderr, "JOP %010llx", (unsigned long long)ip);
++  for (int i = 0; i < 16; i++)
++    fprintf(stderr, " %llx", (unsigned long long)Read64(m->weg[i]));
++  fprintf(stderr, "\n");
++}
++
+ void AddPath_StartOp(P) {
+ #if LOG_CPU
+   Jitter(A, "qmq", LogCpu);
+ #endif
++  {
++    static signed char wjop = -1;
++    if (wjop < 0) wjop = getenv("WG_JOP") ? 1 : 0;
++    if (wjop && (u64)m->ip >= 0x90fb40 && (u64)m->ip < 0x90fb60) {
++      Jitter(A,
++             "a1i"  // arg1 = ip
++             "q"    // arg0 = machine
++             "c",   // call WgJitOpTrace
++             m->ip, WgJitOpTrace);
++    }
++  }
+   BeginCod(m, GetPc(m));
+ #ifndef NDEBUG
+   if (FLAG_statistics) {
+diff --git a/blink/reset.c b/blink/reset.c
+index 77dac9b..c9e1f60 100644
+--- a/blink/reset.c
++++ b/blink/reset.c
+@@ -100,7 +100,10 @@ void ResetCpu(struct Machine *m) {
+ 
+ void ResetTlb(struct Machine *m) {
+   STATISTIC(++tlb_resets);
+-  memset(m->tlb, 0, sizeof(m->tlb));
++  if (++m->tlbgen == 0) {  // WineGlass: O(1) gen-bump invalidation of tlb2
++    memset(m->tlb2, 0, sizeof(m->tlb2));
++    m->tlbgen = 1;
++  }
+   m->opcache->codevirt = 0;
+   m->opcache->codehost = 0;
+ }
+diff --git a/blink/smc.c b/blink/smc.c
+index ec04e87..18b81b5 100644
+--- a/blink/smc.c
++++ b/blink/smc.c
+@@ -16,6 +16,8 @@
+ │ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR             │
+ │ PERFORMANCE OF THIS SOFTWARE.                                                │
+ ╚─────────────────────────────────────────────────────────────────────────────*/
++#include <string.h>
++
+ #include "blink/assert.h"
+ #include "blink/builtin.h"
+ #include "blink/flag.h"
+@@ -51,39 +53,47 @@ static int UnprotectSelfModifyingCode(struct System *s, i64 vaddr, i64 size) {
+   return ProtectHostPages(s, vaddr, size, PROT_READ | PROT_WRITE);
+ }
+ 
++// WineGlass: O(1) SMC-queue membership via an open-addressing hash (m->smchash,
++// keyed by page number, 0=empty). Replaces the O(kSmcQueueSize) linear scan that
++// ran on EVERY guest write to a writable page and dominated the write-heavy
++// UObject drain. Kept exactly in sync with m->smcqueue: added together, cleared
++// together. m->smc_n tracks the filled queue count for O(1) add + fast flush.
++#define SMC_HASH_MASK (ARRAYLEN(((struct Machine *)0)->smchash) - 1)
++static inline u64 SmcHash(i64 page) {
++  return ((u64)((page & -4096) >> 12) * 2654435761u);
++}
++
+ // @asyncsignalsafe
+ bool IsPageInSmcQueue(struct Machine *m, i64 page) {
+-  int i;
+-  i64 tmp;
++  i64 e;
++  u64 h;
+   page &= -4096;
+   STATISTIC(++smc_checks);
+-  for (i = 0; i < kSmcQueueSize; ++i) {
+-    if ((tmp = m->smcqueue.p[i]) == page) {
+-      if (i) {
+-        m->smcqueue.p[i - 0] = m->smcqueue.p[i - 1];
+-        m->smcqueue.p[i - 1] = tmp;
+-      }
+-      return true;
+-    }
++  for (h = SmcHash(page) & SMC_HASH_MASK;; h = (h + 1) & SMC_HASH_MASK) {
++    if ((e = m->smchash[h]) == page) return true;
++    if (!e) return false;
+   }
+-  return false;
+ }
+ 
+ // @asyncsignalsafe
+ void AddPageToSmcQueue(struct Machine *m, i64 page) {
+-  int i;
++  u64 h;
+   page &= -4096;
+-  for (i = 0; i < kSmcQueueSize; ++i) {
+-    if (!m->smcqueue.p[i]) {
+-      STATISTIC(++smc_enqueued);
+-      m->smcqueue.p[i] = page;
+-      m->selfmodifying = true;
+-      atomic_store_explicit(&m->attention, true, memory_order_release);
+-      return;
+-    }
++  if (m->smc_n >= kSmcQueueSize) {
++    // Queue full — flush it (invalidate all queued JIT pages) and add. Games
++    // write large RWX regions (module loaders, IAT/thunk fixups) that dirty far
++    // more than kSmcQueueSize pages inside ONE jit path; nolinear runs this from
++    // the memory write path so a non-async-signal-safe flush is safe here.
++    FlushSmcQueue(m);
++  }
++  STATISTIC(++smc_enqueued);
++  m->smcqueue.p[m->smc_n++] = page;
++  for (h = SmcHash(page) & SMC_HASH_MASK; m->smchash[h]; h = (h + 1) & SMC_HASH_MASK) {
++    if (m->smchash[h] == page) { m->smc_n--; break; }  // already present (race)
+   }
+-  ERRF("self-modifying code page queue exhausted");
+-  Abort();
++  if (!m->smchash[h]) m->smchash[h] = page;
++  m->selfmodifying = true;
++  atomic_store_explicit(&m->attention, true, memory_order_release);
+ }
+ 
+ void FlushSmcQueue(struct Machine *m) {
+@@ -91,7 +101,8 @@ void FlushSmcQueue(struct Machine *m) {
+   i64 page;
+   unassert(m->selfmodifying);
+   STATISTIC(++smc_flushes);
+-  for (i = 0; i < kSmcQueueSize; ++i) {
++  memset(m->smchash, 0, sizeof(m->smchash));
++  for (i = 0; i < m->smc_n; ++i) {
+     if ((page = m->smcqueue.p[i])) {
+       m->smcqueue.p[i] = 0;
+       if (!IsJitDisabled(&m->system->jit)) {
+@@ -105,6 +116,7 @@ void FlushSmcQueue(struct Machine *m) {
+       }
+     }
+   }
++  m->smc_n = 0;  // WineGlass: queue + hash now empty
+ }
+ 
+ i64 ProtectRwxMemory(struct System *s, i64 rc, i64 virt, i64 size,
+diff --git a/blink/throw.c b/blink/throw.c
+index a2f8a88..6afe8a1 100644
+--- a/blink/throw.c
++++ b/blink/throw.c
+@@ -129,6 +129,14 @@ void ThrowProtectionFault(struct Machine *m) {
+ void ThrowSegmentationFault(struct Machine *m, i64 va) {
+   RestoreIp(m);
+   m->faultaddr = va;
++  if (getenv("WG_FAULTLOG")) {
++    int _r;
++    fprintf(stderr, "[GSEGV] rip=%llx va=%llx\n  regs:",
++            (unsigned long long)m->ip, (unsigned long long)va);
++    for (_r = 0; _r < 16; _r++)
++      fprintf(stderr, " r%d=%llx", _r, (unsigned long long)Read64(m->weg[_r]));
++    fprintf(stderr, "\n");
++  }
+   HaltMachine(m, kMachineSegmentationFault);
+ }
+ 
+@@ -142,9 +150,9 @@ void OpUd(P) {
+ }
+ 
+ void OpHlt(P) {
+-  if (Cpl(m) == 0 && GetFlag(m->flags, FLAGS_IF)) {
+-    sched_yield();
+-  } else {
+-    HaltMachine(m, kMachineHalt);
+-  }
++  // WineGlass: HLT is our Win32 thunk trap — it must ALWAYS halt so the engine
++  // dispatches the call. The original ring-0+IF fast path (sched_yield, continue)
++  // let the JIT run PAST the HLT into thunk-slot padding, corrupting the call.
++  if (getenv("WG_OPHLTLOG")) fprintf(stderr, "OPHLT ip=%llx\n", (unsigned long long)m->ip);
++  HaltMachine(m, kMachineHalt);
+ }
+diff --git a/blink/tunables.h b/blink/tunables.h
+index a9f19f8..56b8f60 100644
+--- a/blink/tunables.h
++++ b/blink/tunables.h
+@@ -17,9 +17,14 @@
+ #define LINUX_VERSION       MKVERSION(LINUX_MAJOR, LINUX_MINOR, LINUX_PATCH)
+ #define BLINK_VERSION       MKVERSION(BLINK_MAJOR, BLINK_MINOR, BLINK_PATCH)
+ 
+-#if CAN_64BIT && defined(__APPLE__)
++#if CAN_64BIT && defined(__APPLE__) && !defined(WG_NOLINEAR_JIT)
+ #define kSkew 0x088800000000
+ #else
++// WineGlass: force kSkew=0 so the JIT emits its software-MMU (!kSkew) memory
++// path. On Apple Silicon (16KB host pages) linear memory is impossible for a
++// 4KB-aligned Windows guest, so we always run nolinear; the JIT keys its
++// linear-vs-nolinear codegen off kSkew (compile-time), not FLAG_nolinear, so a
++// nonzero kSkew here makes JIT'd loads read kSkew+va (unmapped) and miscompile.
+ #define kSkew 0x000000000000
+ #endif
+ 
+@@ -40,7 +45,10 @@
+ #define kBusRegion    128  // 16 is sufficient for 8-byte loads/stores
+ #define kFutexMax     100
+ #define kRedzoneSize  128
+-#define kSmcQueueSize 32
++#define kSmcQueueSize 4096  /* WineGlass: was 32. A single rep-movs/memcpy in a JIT
++                               path dirties hundreds of RWX pages before the dispatch
++                               loop flushes; a tiny queue overflowed -> flush thrash
++                               (3.5x slowdown) or abort. Big queue absorbs one copy. */
+ #define kMaxMapSize   (UINT64_C(8) * 1024 * 1024 * 1024)
+ #define kMaxResident  (UINT64_C(8) * 1024 * 1024 * 1024)
+ #define kMaxVirtual   (kMaxResident * 8)
+diff --git a/blink/uop.c b/blink/uop.c
+index 1547710..7bc32fc 100644
+--- a/blink/uop.c
++++ b/blink/uop.c
+@@ -45,7 +45,11 @@
+  * @fileoverview X86 Micro-Operations w/ Printf RPN Glue-Generating DSL.
+  */
+ 
+-#define kMaxOps 256
++#define kMaxOps 1024  /* WineGlass: was 256. This is the global dedup cache of
++                         distinct micro-op *lengths* (a power-of-2 hash table). A
++                         full game exercises >256 distinct micro-ops over its life,
++                         overflowing the cache -> Abort inside Jitter. blink's
++                         micro-op set is finite, so a bigger cap fixes it for good. */
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ // ESSENTIAL
+@@ -796,6 +800,51 @@ MICRO_OP void MovsdWpsVpsOp(u8 *p, struct Machine *m, long reg) {
+     defined(TRIVIALLY_RELOCATABLE)
+ #define LOADSTORE "m"
+ 
++#ifdef WG_REAL_ATOMICS
++// WineGlass: x86-TSO emulation for WG_REAL_THREADS. The guest's PLAIN aligned
++// loads/stores carry acquire/release ordering on x86 (TSO); ARM is weak, so
++// without this a lock-free publication (e.g. a lazy singleton whose pointer is
++// stored after its object is constructed) tears across real guest threads (the
++// reader sees the pointer before the object). Aligned -> LDAR/STLR (cheap on
++// Apple Silicon); unaligned -> plain (x86 gives no atomicity there either and
++// such accesses aren't used for cross-thread synchronisation).
++// Branchless (copy-and-patch safe) + alignment-agnostic: an aligned plain
++// load/store IS single-copy atomic on ARM, and the release/acquire FENCE gives
++// x86-TSO ordering. (A conditional aligned LDAR/STLR breaks blink's micro-op
++// copy-and-patch — the internal branch relocates wrong. Perf can be revisited.)
++MICRO_OP static i64 NativeLoad8(const u8 *p) {
++  i64 v = *p; __atomic_thread_fence(__ATOMIC_ACQUIRE); return v;
++}
++MICRO_OP static i64 NativeLoad16(const u8 *p) {
++  i64 v = *(const u16 *)p; __atomic_thread_fence(__ATOMIC_ACQUIRE); return v;
++}
++MICRO_OP static i64 NativeLoad32(const u8 *p) {
++  i64 v = *(const u32 *)p; __atomic_thread_fence(__ATOMIC_ACQUIRE); return v;
++}
++MICRO_OP static i64 NativeLoad64(const u8 *p) {
++  i64 v = *(const u64 *)p; __atomic_thread_fence(__ATOMIC_ACQUIRE); return v;
++}
++MICRO_OP static XMM_TYPE NativeLoad128(u8 *p) {
++  RETURN_XMM(((const u64 *)p)[0], ((const u64 *)p)[1]);
++}
++
++MICRO_OP static void NativeStore8(u8 *p, u64 x) {
++  __atomic_thread_fence(__ATOMIC_RELEASE); *p = x;
++}
++MICRO_OP static void NativeStore16(u8 *p, u64 x) {
++  __atomic_thread_fence(__ATOMIC_RELEASE); *(u16 *)p = x;
++}
++MICRO_OP static void NativeStore32(u8 *p, u64 x) {
++  __atomic_thread_fence(__ATOMIC_RELEASE); *(u32 *)p = x;
++}
++MICRO_OP static void NativeStore64(u8 *p, u64 x) {
++  __atomic_thread_fence(__ATOMIC_RELEASE); *(u64 *)p = x;
++}
++MICRO_OP static void NativeStore128(u8 *p, u64 x, u64 y) {
++  ((u64 *)p)[0] = x;
++  ((u64 *)p)[1] = y;
++}
++#else
+ MICRO_OP static i64 NativeLoad8(const u8 *p) {
+   return *p;
+ }
+@@ -828,6 +877,7 @@ MICRO_OP static void NativeStore128(u8 *p, u64 x, u64 y) {
+   ((u64 *)p)[0] = x;
+   ((u64 *)p)[1] = y;
+ }
++#endif
+ 
+ static const load_f kLoad[] = {
+     (load_f)NativeLoad8,    //
+@@ -1579,23 +1629,28 @@ static long GetMicroOpLengthImpl(void *uop) {
+ 
+ static long GetMicroOpLength(void *uop) {
+   _Static_assert(IS2POW(kMaxOps), "");
++  // WineGlass: this global dedup cache is shared across real guest worker
++  // threads doing concurrent JIT compilation; serialize it via the dedicated
++  // JIT lock (the crash at ~0xa00026 was this cache's count/table racing).
+   static unsigned count;
+   static void *ops[kMaxOps * 2];
+   static short len[kMaxOps * 2];
+   long res;
+   unsigned hash, i, step;
++  WGJIT_LOCK();
+   i = 0;
+   step = 0;
+   hash = ((uintptr_t)uop * 0x9e3779b1u) >> 16;
+   do {
+     i = (hash + step * (step + 1) / 2) & (kMaxOps - 1);
+-    if (ops[i] == uop) return len[i];
++    if (ops[i] == uop) { res = len[i]; WGJIT_UNLOCK(); return res; }
+     ++step;
+   } while (ops[i]);
+   res = GetMicroOpLengthImpl(uop);
+   unassert(count++ < kMaxOps);
+   ops[i] = uop;
+   len[i] = res;
++  WGJIT_UNLOCK();
+   return res;
+ }
+ 
