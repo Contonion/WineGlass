@@ -86,6 +86,12 @@ uint32_t wg_sched_create_thread(WGThreadScheduler *sched, void *blink,
     // Set up initial register state:
     // ESP = top of stack minus space for return address + arg
     uint32_t sp = t->stack_base + t->stack_size - 0x100;
+    // x64 ABI: at a function's entry RSP must be (16-aligned - 8) — i.e. RSP%16==8,
+    // the state "just after a CALL pushed the 8-byte return address" — so the proc's
+    // aligned SSE spills (movaps [rsp+N]) don't #GP/SIGSEGV. Cooperative 64-bit thread
+    // procs (e.g. Visage's) crashed at movaps on a misaligned stack. This is also
+    // harmless for 32-bit procs (MSVC re-aligns with `and esp,-16` when it needs SSE).
+    sp &= ~0xFu; sp -= 8;
     // Push the thread parameter and a fake return address (ExitThread)
     // Stack layout: [ret_addr=0] [param]
     // The thread function is __stdcall: DWORD WINAPI ThreadProc(LPVOID)
@@ -94,7 +100,13 @@ uint32_t wg_sched_create_thread(WGThreadScheduler *sched, void *blink,
     wg_blink_write_mem(blink, sp + 4, &param, 4);
 
     t->regs.gpr[0] = 0;         // EAX
-    t->regs.gpr[1] = 0;         // ECX
+    // RCX = param: the x64 calling convention passes the thread proc's first (only)
+    // argument in RCX, NOT on the stack. A 64-bit thread proc (e.g. Visage's, whose
+    // entry immediately does `mov rbx,rcx; ...; WaitForSingleObject([rbx+0x18])`)
+    // reads its object from RCX — leaving RCX=0 gave it a NULL param, so it waited on
+    // a null event forever (the cooperative-mode 0x9FDA6F null-event deadlock). Also
+    // keep the stack param below for 32-bit __stdcall procs (which ignore RCX).
+    t->regs.gpr[1] = param;     // RCX (x64 arg0)
     t->regs.gpr[2] = 0;         // EDX
     t->regs.gpr[3] = 0;         // EBX
     t->regs.gpr[4] = sp;        // ESP

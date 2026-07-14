@@ -480,6 +480,8 @@ void wg_dll_mapper_register_defaults(WGDllMapper *m) {
     R1S("KERNEL32.dll", GetProcessAffinityMask, 3);
     RS ("KERNEL32.dll", CreateEventW, 4);
     RS ("KERNEL32.dll", CreateEventA, 4);
+    RS ("KERNEL32.dll", CreateEventExW, 4);   // UE4 FEventWin uses this, not CreateEventW
+    RS ("KERNEL32.dll", CreateEventExA, 4);
     RS ("KERNEL32.dll", OpenEventA, 3);
     R1S("KERNEL32.dll", SetEvent, 1);
     R1S("KERNEL32.dll", ResetEvent, 1);

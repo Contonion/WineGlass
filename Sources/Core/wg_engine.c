@@ -167,6 +167,42 @@ static signed char s_dir_on = -1;
 // we only hand the GIL to a producer that can actually run (not one parked itself).
 #define WG_MAX_TID 0x1100
 static volatile uint8_t s_tid_blocked[WG_MAX_TID];
+// Count of threads currently CONTENDING for the GIL — i.e. blocked in dir_lock's
+// acquire loop wanting to run guest code (NOT parked on a guest event, which
+// releases the GIL and does not count). This is the signal that separates the two
+// adaptive-slice cases the RIP heuristic alone cannot: a RIP-pinned main with a
+// contender (>0) is a real busy-wait where the awaited worker is starved -> shrink
+// so it can run; a RIP-pinned main with NO contender (==0) is a tight construction/
+// registration loop whose workers are blocked on events waiting for it to finish
+// and SetEvent -> keep BIG slices so it races to that signal. Read racy (a hint).
+static volatile int s_gil_waiters = 0;
+// WG_BLOCK_WORKERS: on real HW, UObject registration/loading during boot is
+// single-threaded; WineGlass only corrupts it because it runs the UE4 task-graph
+// pool workers (all start at 0x9FFC70) IN PARALLEL with the main, so a worker reads
+// a half-built, early-published object (the construction race -> O(N^2) name scan).
+// This gate PARKS those pool workers while the main is making forward progress
+// (its RIP advances), so the boot runs effectively single-threaded (no race). It is
+// deadlock-safe: if the main's RIP goes PINNED (it is genuinely waiting for a worker
+// to produce something), s_main_rip_stall climbs past the threshold and the workers
+// are released to run. Pair with -noasyncloadingthread so the main does its own
+// loading and rarely needs a worker during boot. Main-only publisher (main tick).
+static volatile uint64_t s_main_rip_pub = 0;    // the main guest thread's last RIP
+static volatile unsigned s_main_rip_stall = 0;  // consecutive main slices at the same RIP
+static volatile int s_main_blocked = 0;         // main is in a genuine blocking wait (release gated workers)
+// WG_CTOR_HOOK: inline entry hook on the UObject base constructor (default 0x9E36E0,
+// called by ALL ~4036 register sites). On each call it GIL-pins the constructing
+// thread for a short window so the publish-before-construct sequence (alloc → publish
+// → construct → link) runs ATOMICALLY w.r.t. every other guest thread — the true fix
+// for the multi-threaded level-load construction race (works for main AND workers,
+// unlike WG_BLOCK_WORKERS). Uses the proven WG_TRACE restore→single-step→re-arm path.
+static bool     s_ctor_armed = false;
+static uint8_t  s_ctor_orig  = 0;
+static uint64_t s_ctor_addr  = 0x9E36E0;
+// Set once the boot is PAST early UObject registration (the corruption window) — the
+// game shows its main window only after engine PreInit/registration. From then on the
+// WG_BLOCK_WORKERS gate stops parking pool workers so the post-init task-graph
+// coordination (viewport/swapchain/first frame) runs with full worker parallelism.
+static volatile int s_past_init = 0;
 static inline int wg_directed(void) {
     if (s_dir_on < 0) s_dir_on = getenv("WG_NO_DIRECTED_GIL") ? 0 : 1;
     return s_dir_on;
@@ -175,8 +211,10 @@ static void dir_lock(void) {
     pthread_mutex_lock(&s_dir_m);
     if (s_dir_owned && pthread_equal(s_dir_owner, pthread_self())) { s_dir_rec++; pthread_mutex_unlock(&s_dir_m); return; }
     uint32_t me = s_cur_guest_tid;
+    int counted = 0;
     for (;;) {
         if (!s_dir_owned && (s_dir_prefer == 0 || s_dir_prefer == me)) break;
+        if (!counted) { s_gil_waiters++; counted = 1; }   // contending for the GIL
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 1000 * 1000;   // 1ms
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
@@ -187,13 +225,118 @@ static void dir_lock(void) {
             s_dir_prefer = 0; s_dir_stall = 0;
         }
     }
+    if (counted) s_gil_waiters--;
     s_dir_owner = pthread_self(); s_dir_owned = 1; s_dir_rec = 1;
     if (s_dir_prefer == me) { s_dir_prefer = 0; s_dir_stall = 0; }   // consumed
     pthread_mutex_unlock(&s_dir_m);
 }
+// GIL-PIN ACROSS A GUEST CRITICAL SECTION / EXCLUSIVE LOCK (WG_CS_PIN, default ON
+// under real threads). The render-blocking corruption is a lock-free READER (the
+// UObject list walk at guest 0xA5AC30) observing a node mid-CONSTRUCTION: the
+// constructing thread holds its lock, then hits a THUNK (malloc, etc.) — a GIL
+// handoff point — and another guest thread grabs the GIL and walks the half-linked
+// list (a node whose next still points to itself). The guest's own critical section
+// is honored (real mutex), but the WALK doesn't take it, so mutual exclusion at the
+// guest-lock level can't save it. Fix: while a thread holds a guest exclusive lock
+// (EnterCriticalSection / AcquireSRWLockExclusive), do NOT release the GIL between
+// slices — the whole locked construction runs atomically w.r.t. every other guest
+// thread, so no reader can ever see it half-built. `s_blocking` overrides the pin so
+// a genuine blocking wait (WFSO/CV sleep) inside the lock still releases the GIL
+// (else deadlock). Both thread-local (each thread pins only its own GIL holds).
+static _Thread_local int s_cs_held = 0;    // depth of guest exclusive locks held
+static _Thread_local int s_blocking = 0;   // in a blocking wait -> force GIL release
+static _Thread_local int s_pin_slices = 0; // consecutive pinned GIL releases (safety cap)
+static _Thread_local int s_spin_pin = 0;   // slices left to pin after a guest spinlock acquire
+static signed char s_cs_pin = -1;
+static signed char s_spinpin_on = -1;
+static long s_pin_cap = -1;
+static long s_spin_window = -1;
+static inline int wg_cs_pin_on(void) {
+    // OPT-IN (WG_CS_PIN=1): honoring intercepted guest locks by pinning the GIL is
+    // correct hardening, but it does NOT fix the Visage UObject corruption (that
+    // construction is guarded by a GUEST-SIDE spinlock we don't intercept, not a
+    // CS/SRW/mutex), and it can let a worker pin the GIL during the garbage-name
+    // scan. Default OFF so the codebase isn't regressed; enable for CS-protected races.
+    if (s_cs_pin < 0) s_cs_pin = getenv("WG_CS_PIN") ? 1 : 0;
+    return s_cs_pin;
+}
+static inline int wg_spinpin_on(void) {
+    if (s_spinpin_on < 0) s_spinpin_on = getenv("WG_SPINPIN") ? 1 : 0;
+    return s_spinpin_on;
+}
+// GUEST-SPINLOCK GIL-PIN (WG_SPINPIN=1). The render-blocking UObject corruption is a
+// lock-free READER (the 0xA5AC30 walk) seeing a node mid-construction while the
+// constructing thread holds a GUEST-SIDE SPINLOCK (a `lock cmpxchg` acquire, no
+// thunk to pin on). blink's cmpxchg calls wg_on_guest_spinlock when a LOCK CMPXCHG
+// swaps 0 -> non-zero (a lock ACQUIRE); we then pin the GIL for the next
+// WG_SPIN_WINDOW slices so the (short) locked construction runs atomically vs other
+// guest threads. The window auto-expires (no release detection needed) and is
+// refreshed on each acquire, so nested/re-acquired locks stay covered.
+extern void (*wg_spinlock_acquire_hook)(unsigned long long addr, unsigned long long rip);
+// Histogram of guest-spinlock ACQUIRE sites (RIP) — to see if construction locks and
+// coordination locks are acquired at DISTINCT instruction addresses (then a RIP-scoped
+// pin can target only the construction lock). WG_SPINLOG dumps it periodically.
+#define WG_SPINRIP_MAX 64
+static struct { uint64_t rip; uint64_t count; } s_spinrip[WG_SPINRIP_MAX];
+static int s_spinrip_n = 0;
+static pthread_mutex_t s_spinrip_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t s_spinlo = 0, s_spinhi = 0; static signed char s_spinscope = -1;
+static void wg_on_guest_spinlock(unsigned long long addr, unsigned long long rip) {
+    (void)addr;
+    if (!s_use_real_threads) return;
+    if (getenv("WG_SPINLOG")) {
+        pthread_mutex_lock(&s_spinrip_lock);
+        int i; for (i = 0; i < s_spinrip_n; i++) if (s_spinrip[i].rip == rip) { s_spinrip[i].count++; break; }
+        if (i == s_spinrip_n && s_spinrip_n < WG_SPINRIP_MAX) { s_spinrip[s_spinrip_n].rip = rip; s_spinrip[s_spinrip_n].count = 1; s_spinrip_n++; }
+        pthread_mutex_unlock(&s_spinrip_lock);
+    }
+    if (!wg_spinpin_on()) return;   // logging only, no pin
+    // RIP-SCOPE: if WG_SPINLO/HI are set, pin ONLY for acquires whose site is in that
+    // instruction range (the construction lock) — not coordination locks elsewhere.
+    if (s_spinscope < 0) { const char *lo = getenv("WG_SPINLO"), *hi = getenv("WG_SPINHI");
+        if (lo && hi) { s_spinlo = strtoull(lo, 0, 16); s_spinhi = strtoull(hi, 0, 16); s_spinscope = 1; } else s_spinscope = 0; }
+    if (s_spinscope && !(rip >= s_spinlo && rip <= s_spinhi)) return;   // out of construction scope
+    if (s_spin_window < 0) { const char *e = getenv("WG_SPIN_WINDOW"); s_spin_window = e ? atol(e) : 24; }
+    s_spin_pin = (int)s_spin_window;   // pin the GIL for the next N slices
+}
+// Dump the spinlock-acquire-site histogram (top sites by count). Called from the tick.
+static void wg_dump_spinrips(void) {
+    if (!getenv("WG_SPINLOG")) return;
+    pthread_mutex_lock(&s_spinrip_lock);
+    // simple selection of the top ~12 by count
+    for (int k = 0; k < 12 && k < s_spinrip_n; k++) {
+        int best = -1; uint64_t bc = 0;
+        for (int i = 0; i < s_spinrip_n; i++) if (s_spinrip[i].count > bc) { bc = s_spinrip[i].count; best = i; }
+        if (best < 0) break;
+        uint64_t rt = 0x400000 + (s_spinrip[best].rip - 0x140000000);
+        WG_LOGW("Engine", "SPINRIP site=0x%llX (runtime~0x%llX) acquires=%llu",
+                (unsigned long long)s_spinrip[best].rip, (unsigned long long)rt, (unsigned long long)bc);
+        s_spinrip[best].count = 0;   // consume so next iteration finds the next
+    }
+    s_spinrip_n = 0;
+    pthread_mutex_unlock(&s_spinrip_lock);
+}
 static void dir_unlock(void) {
     pthread_mutex_lock(&s_dir_m);
-    if (--s_dir_rec <= 0) { s_dir_rec = 0; s_dir_owned = 0; pthread_cond_broadcast(&s_dir_c); }
+    if (--s_dir_rec <= 0) {
+        s_dir_rec = 0;
+        // SAFETY CAP: a thread that holds a lock while BUSY-WAITING (not a blocking
+        // wait, so s_blocking is clear) would pin the GIL forever and deadlock the
+        // awaited thread. A real construction releases its lock within a few slices,
+        // so cap the number of consecutive pinned releases; past it, release anyway
+        // (accepting a rare interleave over a hard hang). WG_PIN_CAP tunes it.
+        if (s_pin_cap < 0) { const char *e = getenv("WG_PIN_CAP"); s_pin_cap = e ? atol(e) : 64; }
+        int want_pin = (wg_cs_pin_on() && s_cs_held > 0) || s_spin_pin > 0;
+        if (want_pin && !s_blocking && s_pin_slices < s_pin_cap) {
+            // Pin: keep the GIL owned across the locked region (do NOT release).
+            // The next wg_thunk_lock re-enters via the owner==self fast path (++rec).
+            s_pin_slices++;
+            if (s_spin_pin > 0) s_spin_pin--;   // spinlock window counts down
+        } else {
+            s_pin_slices = 0; s_spin_pin = 0;
+            s_dir_owned = 0; pthread_cond_broadcast(&s_dir_c);
+        }
+    }
     pthread_mutex_unlock(&s_dir_m);
 }
 // Hand the GIL to `tid` next (called right before a thread blocks on a wait whose
@@ -230,13 +373,25 @@ static inline void wg_thunk_unlock(void) { if (!s_use_real_threads) return; if (
 // won't prefer it (it can't take the GIL until its wait returns).
 static inline void wg_thunk_block_begin(void) {
     if (!s_use_real_threads) return;
+    // A genuine blocking wait must RELEASE the GIL even if this thread holds a guest
+    // critical section (a CS-pin here would deadlock — no other thread could run to
+    // signal the wait). s_blocking overrides the pin in dir_unlock.
+    s_blocking++;
+    // WG_BLOCK_WORKERS valve: release gated pool workers ONLY while the MAIN is in a
+    // genuine blocking wait (it may be waiting on a worker). This is the RIGHT signal
+    // — unlike RIP-stall it does NOT misfire during the main's compute-bound
+    // registration loop or the O(N^2) scan (both RIP-pinned but NOT blocked), so
+    // workers stay parked through construction and can't race it. Cleared on unblock.
+    if (s_cur_guest_tid == 1) s_main_blocked = 1;
     if (wg_directed()) { uint32_t t = s_cur_guest_tid; if (t < WG_MAX_TID) s_tid_blocked[t] = 1; dir_unlock(); }
     else if (wg_fair()) fair_unlock(); else pthread_mutex_unlock(&s_thunk_lock);
 }
 static inline void wg_thunk_block_end(void) {
     if (!s_use_real_threads) return;
+    if (s_cur_guest_tid == 1) s_main_blocked = 0;   // main resumed -> re-gate pool workers
     if (wg_directed()) { dir_lock(); uint32_t t = s_cur_guest_tid; if (t < WG_MAX_TID) s_tid_blocked[t] = 0; }
     else if (wg_fair()) fair_lock(); else pthread_mutex_lock(&s_thunk_lock);
+    if (s_blocking > 0) s_blocking--;
 }
 
 // CREATE_SUSPENDED gates for real threads. UE4's thread pool creates workers
@@ -377,7 +532,7 @@ static uint32_t wg_cv_handle_for(uint32_t cv_ptr) {
 // reader blocked on the 1st's exclusive mutex -> deadlock (two threads stuck in
 // the config driver 0x14AA). This is a real reader/writer lock keyed by the
 // guest SRW pointer: many shared holders OR one exclusive holder.
-#define WG_MAX_SRW 8192
+#define WG_MAX_SRW 32768
 typedef struct { uint32_t ptr; int readers; uint32_t writer_tid; int writer_rec; } WGSrw;
 static WGSrw s_srw[WG_MAX_SRW];
 static int s_srw_count = 0;
@@ -385,6 +540,15 @@ static int s_srw_hash[WG_MAX_SRW * 2];   // ptr -> (index+1); 0 = empty
 static pthread_mutex_t s_srw_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_srw_cond = PTHREAD_COND_INITIALIZER;
 static int s_srw_log = -1;
+// Shared fallback entry for when the SRW table is FULL. Previously wg_srw_for
+// returned NULL on overflow and BOTH acquire paths treated NULL as "uncontended,
+// proceed WITHOUT locking" -> a full table silently disabled mutual exclusion for
+// every new lock, so a UObject construction (writer) and a list walk (reader) ran
+// concurrently and corrupted the registration list (the render-blocking bug). A big
+// UE4 title easily exceeds a few-thousand distinct FRWLocks. Fix: never return NULL
+// — hand back one shared entry so overflow locks are OVER-serialized (all treated as
+// one lock: correct, never corrupt; a little extra contention is harmless vs the bug).
+static WGSrw s_srw_overflow;
 // Caller MUST hold s_srw_lock.
 static WGSrw *wg_srw_for(uint32_t p) {
     uint32_t h = (p * 2654435761u) & (WG_MAX_SRW * 2 - 1);
@@ -399,7 +563,10 @@ static WGSrw *wg_srw_for(uint32_t p) {
         s_srw_hash[h] = s_srw_count + 1; s_srw_count++;
         return s;
     }
-    return NULL;
+    static int warned = 0;
+    if (!warned) { warned = 1;
+        fprintf(stderr, "[SRW-OVERFLOW] table full at %d locks — falling back to shared serializing entry (was a no-op corruption bug)\n", WG_MAX_SRW); }
+    return &s_srw_overflow;   // over-serialize the overflow set; NEVER no-op
 }
 static void wg_srw_acquire_shared(uint32_t p, uint32_t tid) {
     pthread_mutex_lock(&s_srw_lock);
@@ -794,11 +961,18 @@ static uint32_t s_fls_next = 0;
 // Fake event/mutex/semaphore handles. Single-threaded, so events are just
 // signalled/unsignalled flags. Handles start at 0x200 to avoid collisions.
 #define WG_EVENT_BASE   0x200u
-#define WG_MAX_EVENTS   256
+// Events occupy handles 0x200..0xFFF (3584 slots) — right up to the socket base
+// 0x1000, so no collision. Was 256, which OVERFLOWED (s_event_next only ever
+// incremented, never freed on CloseHandle) -> CreateEvent returned 0 -> guest
+// threads waited on NULL events forever (the cooperative-mode 0x9FDA6F/0x815879
+// deadlock). Now also recycled via s_event_free (below).
+#define WG_MAX_EVENTS   3584
 #define WG_SELECT_WAIT  0x5E1EC7u   // sentinel wait_handle: thread is pacing a select() timeout
 static bool s_event_signalled[WG_MAX_EVENTS];
 static bool s_event_manual[WG_MAX_EVENTS];   // true = manual-reset, false = auto-reset
 static uint32_t s_event_next = 0;
+static uint32_t s_event_free[WG_MAX_EVENTS];  // free-list of closed slots (recycle)
+static int s_event_free_n = 0;
 
 // A satisfied wait on an AUTO-reset event consumes its signalled state. Without
 // this an auto-reset event stays signalled forever and waiters spin (the network
@@ -1560,7 +1734,11 @@ static uint32_t wg_guest_alloc(WGEngine *engine, uint32_t size) {
     if (s_heap_ptr + alloc > 0x5F000000u && s_heap_ptr < 0xA0000000u)
         s_heap_ptr = 0xA0000000u;                       // hop to region 2
     uint32_t hi = (s_heap_ptr >= 0xA0000000u) ? 0xF0000000u : 0x5F000000u;
-    if (s_heap_ptr + alloc > hi || s_heap_ptr + alloc < s_heap_ptr) return 0;
+    if (s_heap_ptr + alloc > hi || s_heap_ptr + alloc < s_heap_ptr) {
+        static int s_oom = 0;
+        if (s_oom++ < 30) WG_LOGW(TAG, "★ wg_guest_alloc OOM #%d: heap_ptr=0x%X + alloc=0x%X > hi=0x%X — 32-bit guest heap EXHAUSTED (VirtualAlloc/HeapAlloc returns 0)", s_oom, s_heap_ptr, alloc, hi);
+        return 0;
+    }
     uint32_t addr = s_heap_ptr;
     uint8_t *zeros = calloc(1, alloc);
     if (!zeros) return 0;
@@ -2890,6 +3068,35 @@ static bool handle_blink_thunk(WGEngine *engine) {
         return true;
     }
 
+    // WG_CTOR_HOOK: UObject base-constructor entry — serialize the construction.
+    if (s_ctor_armed && rip == s_ctor_addr) {
+        // Pin the GIL on THIS thread for the construction window so no other guest
+        // thread reads the published-but-unlinked object (the self-loop corruption).
+        // The publish (mov [slot],obj) happens in the caller a few insns BEFORE the
+        // `call <ctor>`, with no thunk in between, so it is already slice-atomic; the
+        // pin then covers the ctor body + the caller's field-linking that follows.
+        if (s_use_real_threads) {
+            static int s_ctor_win = -1;
+            if (s_ctor_win < 0) { const char *e = getenv("WG_CTOR_PIN_SLICES"); s_ctor_win = e ? atoi(e) : 8; }
+            if (s_spin_pin < s_ctor_win) s_spin_pin = s_ctor_win;
+        }
+        // EMULATE the displaced first instruction `mov [rsp+8], rbx` (48 89 5C 24 08)
+        // in C and jump PAST it (rip+5), leaving the HLT byte IN PLACE. Single-stepping
+        // the restored instruction would let the JIT re-cache the block at s_ctor_addr
+        // as the mov, so the re-armed HLT would never trap again — the hook would fire
+        // once and silently die (the bug that let the corruption persist). Keeping the
+        // HLT means the block stays cached as a halt and traps on every construction.
+        static unsigned long long s_ctor_hits = 0;
+        if ((++s_ctor_hits % 50000ULL) == 1)
+            WG_LOGW(TAG, "WG_CTOR_HOOK: %llu constructions serialized", s_ctor_hits);
+        uint64_t crsp = wg_blink_get_reg(engine->blink, 4);
+        uint64_t crbx = wg_blink_get_reg(engine->blink, 3);
+        wg_blink_write_mem(engine->blink, (uint32_t)(crsp + 8), &crbx, 8);
+        wg_blink_set_rip(engine->blink, (uint32_t)(rip + 5));
+        (void)s_ctor_orig;
+        return true;
+    }
+
     // Real-threads: handle the FUNCTIONAL cipher-list max_ver trap here (not just
     // in the main tick) because the ClientHello is built on whichever thread runs
     // the SSL — often a worker. Without it the cipher list is empty -> NO_CIPHERS
@@ -3214,6 +3421,70 @@ static bool handle_blink_thunk(WGEngine *engine) {
     if (entry) {
         const char *fn = entry->func_name;
 
+        // WG_POLLYIELD: general busy-wait breaker for the post-swapchain async-load
+        // coordination. The main thread polls a worker-produced buffer/flag through
+        // MANY sites (PeekMessageW empty, memcmp, wcsstr, _wtoi64, ... — each seen as
+        // the SAME thunk called with the SAME args over and over). Holding the GIL
+        // across such a poll starves the very worker that must change the value (the
+        // workers block on their FEvent so they don't count as GIL contenders, so
+        // adaptive slicing keeps the main on huge slices). When the main repeats one
+        // (fn,args) past a threshold, RELEASE the GIL each iteration so the worker
+        // gets a real run window. A genuine (non-poll) call varies its args and
+        // resets the counter, so real work isn't penalized. WG_POLLTHR / WG_POLLYIELD_US tune.
+        // WG_SETEVLOG: one-shot per tid — log the caller of a hot SetEvent so a
+        // livelock (a worker spinning SetEvent on an unwaited event) can be located.
+        if (getenv("WG_SETEVLOG") && !strcmp(fn, "SetEvent")) {
+            static uint32_t s_sel_h[16]; static uint32_t s_sel_t[16]; static int s_sel_n = 0;
+            uint32_t h = args[0]; int seen = 0;
+            for (int i = 0; i < s_sel_n; i++) if (s_sel_h[i]==h && s_sel_t[i]==s_cur_guest_tid) { seen=1; break; }
+            if (!seen && s_sel_n < 16) { s_sel_h[s_sel_n]=h; s_sel_t[s_sel_n]=s_cur_guest_tid; s_sel_n++;
+                WG_LOGW(TAG, "SETEVLOG tid=0x%X SetEvent(0x%X) caller=0x%llX", s_cur_guest_tid, h, (unsigned long long)ret_addr); }
+        }
+        // WG_TASKPROBE: at the task-graph completion livelock, capture the task object
+        // (rdi/rbx, preserved through FEvent::Trigger) on each worker SetEvent from the
+        // 0x9FFF59 completion site, so we can see if it is the SAME task re-processed
+        // (queue-pop that never advances) or different tasks. Also dump the predicate
+        // object [rdi+0x18] and its first qword so a self-loop/closed-list is visible.
+        {
+            static signed char s_tpen = -1;
+            if (s_tpen < 0) s_tpen = getenv("WG_TASKPROBE") ? 1 : 0;
+            if (s_tpen && s_past_init && s_cur_guest_tid != 1 && fn[0]=='S' && !strcmp(fn, "SetEvent")) {
+                // Detect the SPIN post-init: count SetEvents per (tid,handle); once one
+                // crosses a threshold it is the livelock — then log its task pointer
+                // (rdi) across a window. Constant rdi => the SAME task re-processed
+                // (queue/subsequents that never advances). Counting is cheap; guest mem
+                // is read only in the log window.
+                static uint32_t s_h[64], s_t[64]; static unsigned s_c[64]; static int s_n=0;
+                uint32_t h=args[0]; int idx=-1;
+                for (int i=0;i<s_n;i++) if(s_h[i]==h && s_t[i]==s_cur_guest_tid){idx=i;break;}
+                if (idx<0 && s_n<64){ idx=s_n++; s_h[idx]=h; s_t[idx]=s_cur_guest_tid; s_c[idx]=0; }
+                if (idx>=0){ s_c[idx]++;
+                    if (s_c[idx] >= 3000 && s_c[idx] <= 3040) {
+                        uint64_t rdi = wg_blink_get_reg(engine->blink, 7);
+                        uint32_t f18=0, f20=0, sub0=0, f28=0, pfn=0;
+                        wg_blink_read_mem(engine->blink,(uint32_t)rdi+0x18,&f18,4);
+                        wg_blink_read_mem(engine->blink,(uint32_t)rdi+0x20,&f20,4);
+                        wg_blink_read_mem(engine->blink,(uint32_t)rdi+0x28,&f28,4);
+                        if(f18){ wg_blink_read_mem(engine->blink,f18,&sub0,4);      // predicate vtable
+                                 if(sub0) wg_blink_read_mem(engine->blink,sub0,&pfn,4); } // vtable[0] fn
+                        WG_LOGW(TAG,"TASKSPIN tid=0x%X h=0x%X cnt=%u rdi=0x%llX [+0x18]=0x%X vt=0x%X vt[0]=0x%X [+0x20]=0x%X [+0x28]=0x%X",
+                            s_cur_guest_tid,h,s_c[idx],(unsigned long long)rdi,f18,sub0,pfn,f20,f28);
+                    }
+                }
+            }
+        }
+        if (s_use_real_threads && s_cur_guest_tid == 1 && getenv("WG_POLLYIELD")) {
+            static const char *s_lfn = 0; static uint32_t s_la0=0,s_la1=0,s_la2=0; static int s_prep=0;
+            if (fn == s_lfn && args[0]==s_la0 && args[1]==s_la1 && args[2]==s_la2) {
+                if (s_prep < 1000000) s_prep++;
+            } else { s_lfn = fn; s_la0=args[0]; s_la1=args[1]; s_la2=args[2]; s_prep = 0; }
+            long thr = getenv("WG_POLLTHR") ? atol(getenv("WG_POLLTHR")) : 8;
+            if (s_prep >= thr) {
+                long us = getenv("WG_POLLYIELD_US") ? atol(getenv("WG_POLLYIELD_US")) : 150;
+                wg_thunk_block_begin(); usleep((useconds_t)us); wg_thunk_block_end();
+            }
+        }
+
         // [VIEWER heartbeat] every N registered-thunk calls, print a liveness/phase
         // line to stderr (visible at WG_LOG_LEVEL=E). The guest caller addr reveals
         // the phase (0x9xxxxx config-init, 0xA/0xBxxxxx shader/UObject grind). Lets a
@@ -3289,6 +3560,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 }
             }
         } else if (strcmp(fn, "ShowWindow") == 0) {
+            s_past_init = 1;   // window shown => past registration; ungate pool workers
             wg_wm_show(args[0], args[1]);
             ret_val = 1;
         } else if (strcmp(fn, "DestroyWindow") == 0) {
@@ -4384,6 +4656,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 ret_val = 1;
             } else {
                 ret_val = 0;
+                // WG_PEEKYIELD: an EMPTY PeekMessageW is the main's idle game-loop
+                // tick — it is spin-waiting for background async-load/task-graph
+                // workers to finish loading the next package. Those workers BLOCK on
+                // their FEvent (not counted as GIL-contenders), so adaptive slicing
+                // keeps the main on huge 48M-instruction slices and STARVES them, so
+                // the drain never resumes (the post-swapchain task-graph stall).
+                // Release the GIL here so a load worker gets a guaranteed run window,
+                // then re-acquire. WG_PEEKYIELD_US tunes the window (default 200us).
+                if (s_use_real_threads && cur_tid == 1 && getenv("WG_PEEKYIELD")) {
+                    long us = getenv("WG_PEEKYIELD_US") ? atol(getenv("WG_PEEKYIELD_US")) : 200;
+                    wg_thunk_block_begin();
+                    usleep((useconds_t)us);
+                    wg_thunk_block_end();
+                }
             }
         } else if (strcmp(fn, "CharNextW") == 0) {
             // CharNextW(LPCWSTR p) — advance to next char, don't go past null
@@ -5268,6 +5554,7 @@ static bool handle_blink_thunk(WGEngine *engine) {
             if (strcmp(fn, "TryEnterCriticalSection") == 0) {
                 uint32_t r = m ? wg_sync_wait_single(m, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
                 ret_val = (r == WG_WAIT_OBJECT_0) ? 1 : 0;
+                if (ret_val) s_cs_held++;   // GIL-pin: hold the lock atomically
             } else {
                 // Lock atomicity fix: try to acquire WITHOUT releasing the GIL; only
                 // release (letting other guest threads run) if the CS is CONTENDED.
@@ -5281,11 +5568,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
                     wg_sync_wait_single(m, WG_SYNC_INFINITE, s_cur_guest_tid);
                     wg_thunk_block_end();
                 }
+                s_cs_held++;   // GIL-pin: keep the whole locked region atomic vs other guest threads
                 ret_val = 1;
             }
         } else if (s_use_real_threads && strcmp(fn, "LeaveCriticalSection") == 0) {
             uint32_t m = wg_cs_mutex_for(args[0]);
             if (m) wg_sync_release_mutex(m, s_cur_guest_tid);
+            if (s_cs_held > 0) s_cs_held--;   // release the GIL-pin
             ret_val = 1;
         } else if (s_use_real_threads &&
                    (strcmp(fn, "InitializeCriticalSection") == 0 ||
@@ -5302,15 +5591,44 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 wg_synctrace(args[1] ? "CreateEvtM" : "CreateEvtA", s_cur_guest_tid, (uint32_t)ret_val, ret_addr);
             } else {
             uint32_t handle = 0;
-            if (s_event_next < WG_MAX_EVENTS) {
-                uint32_t idx = s_event_next++;
+            uint32_t idx = 0xFFFFFFFFu;
+            if (s_event_free_n > 0) idx = s_event_free[--s_event_free_n]; // recycle a closed slot
+            else if (s_event_next < WG_MAX_EVENTS) idx = s_event_next++;
+            if (idx != 0xFFFFFFFFu) {
                 s_event_signalled[idx] = (args[2] != 0);
                 s_event_manual[idx] = (args[1] != 0); // bManualReset
                 handle = WG_EVENT_BASE + idx;
+            } else {
+                WG_LOGW(TAG, "CreateEvent: event table FULL (%d) — returning 0", WG_MAX_EVENTS);
             }
             WG_LOGI(TAG, "CreateEvent(manualReset=%u, initState=%u) -> h=0x%X",
                     args[1], args[2], handle);
             ret_val = handle;
+            }
+        } else if (strcmp(fn, "CreateEventExW") == 0 || strcmp(fn, "CreateEventExA") == 0) {
+            // CreateEventEx(lpEventAttributes, lpName, dwFlags, dwDesiredAccess).
+            // dwFlags: CREATE_EVENT_MANUAL_RESET=0x1, CREATE_EVENT_INITIAL_SET=0x2.
+            // UE4's FEventWin uses CreateEventExW (NOT CreateEventW) — it was UNHANDLED,
+            // so the FEvent got a null handle and threads waited on it forever (the
+            // cooperative 0x9FDA6F/null-event deadlock). Map to the same event table.
+            uint32_t dwFlags = args[2];
+            bool manual = (dwFlags & 0x1u) != 0;
+            bool initset = (dwFlags & 0x2u) != 0;
+            if (s_use_real_threads) {
+                ret_val = wg_sync_create_event(manual, initset);
+                wg_synctrace(manual ? "CreateEvtExM" : "CreateEvtExA", s_cur_guest_tid, (uint32_t)ret_val, ret_addr);
+            } else {
+                uint32_t handle = 0, idx = 0xFFFFFFFFu;
+                if (s_event_free_n > 0) idx = s_event_free[--s_event_free_n];
+                else if (s_event_next < WG_MAX_EVENTS) idx = s_event_next++;
+                if (idx != 0xFFFFFFFFu) {
+                    s_event_signalled[idx] = initset;
+                    s_event_manual[idx] = manual;
+                    handle = WG_EVENT_BASE + idx;
+                }
+                WG_LOGI(TAG, "CreateEventEx(flags=0x%X manual=%u initSet=%u) -> h=0x%X",
+                        dwFlags, manual, initset, handle);
+                ret_val = handle;
             }
         } else if (strcmp(fn, "SetEvent") == 0) {
             uint32_t h = args[0];
@@ -5520,6 +5838,23 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (strcmp(fn, "WaitForSingleObject") == 0) {
             uint32_t h = args[0];
             uint32_t timeout = args[1];
+            // NULL-EVENT PROBE: the cooperative deadlock is a thread busy-polling
+            // WFSO(h=0). Dump the wait object (rbx) + its fields ONCE so we can see
+            // why the FEvent handle [rbx+0x18] is 0 (uncreated) vs a bad/zero param.
+            if (h == 0 && getenv("WG_NULLPROBE")) {
+                static int s_np = 0;
+                if (s_np < 6) { s_np++;
+                    uint64_t rbx = wg_blink_get_reg(engine->blink, 3);
+                    uint32_t f08=0,f10=0,f18=0,f40=0;
+                    wg_blink_read_mem(engine->blink, (uint32_t)rbx + 0x08, &f08, 4);
+                    wg_blink_read_mem(engine->blink, (uint32_t)rbx + 0x10, &f10, 4);
+                    wg_blink_read_mem(engine->blink, (uint32_t)rbx + 0x18, &f18, 4);
+                    wg_blink_read_mem(engine->blink, (uint32_t)rbx + 0x40, &f40, 4);
+                    WG_LOGW(TAG, "NULLPROBE tid=0x%X rbx=0x%llX [+8]=0x%X [+0x10]=0x%X [+0x18]=0x%X [+0x40]=0x%X caller=0x%llX",
+                            engine->scheduler ? wg_sched_current_tid(engine->scheduler) : 0,
+                            (unsigned long long)rbx, f08, f10, f18, f40, (unsigned long long)ret_addr);
+                }
+            }
             if (getenv("WG_WAITLOG")) {
                 uint32_t _t = engine->scheduler ? wg_sched_current_tid(engine->scheduler) : 0;
                 static uint32_t s_sh[8], s_st[8]; static int s_sn = 0;
@@ -5532,7 +5867,13 @@ static bool handle_blink_thunk(WGEngine *engine) {
             }
             // Check if the handle is already signalled
             bool signalled = false;
-            if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
+            // NULL handle: the guest waits on h=0 (an FEvent whose creation didn't
+            // store a handle) in a tight loop that only exits on WAIT_OBJECT_0, so it
+            // spins forever (the 0x9FDA6F 62M-call stall in cooperative mode). A null
+            // wait can't ever be signalled — treat it as already-signalled so the
+            // thread proceeds instead of deadlocking. WG_NO_NULLWAIT disables.
+            if (h == 0 && getenv("WG_NULLWAIT")) signalled = true;   // opt-in: proceed past null-handle waits
+            else if (h >= WG_EVENT_BASE && h < WG_EVENT_BASE + WG_MAX_EVENTS)
                 signalled = s_event_signalled[h - WG_EVENT_BASE];
             // Check if it's a thread handle that has exited
             WGThread *wt = wg_sched_find(engine->scheduler, h);
@@ -5559,6 +5900,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
                 if (s_real_timeouts && cur) cur->wait_handle = 0; // reset timeout tracking
                 ret_val = 0; // WAIT_OBJECT_0
             } else if (timeout == 0) {
+                // Poll (WAIT_TIMEOUT). BUT a guest BUSY-POLL — WFSO(h, 0) in a tight
+                // loop waiting for a WORKER to signal h — starves the worker if we
+                // just return immediately (the poller never yields, so the signaller
+                // never runs → infinite spin, e.g. the 62M-call stall at 0x9FDA6F).
+                // If another guest thread is READY, YIELD to it first (it runs, maybe
+                // signals h), THEN the poll returns WAIT_TIMEOUT when we resume — poll
+                // semantics preserved, but the producer gets to run. WG_NO_POLLYIELD
+                // disables.
+                if (!getenv("WG_NO_POLLYIELD") && engine->scheduler &&
+                    wg_sched_other_ready(engine->scheduler)) {
+                    if (cur) { cur->wait_handle = h; cur->wait_timeout = 0; }
+                    bool sw = wg_sched_yield(engine->scheduler, engine->blink, WG_THREAD_READY);
+                    if (sw) return true;   // ran another thread; guest re-polls on resume
+                }
                 ret_val = 258; // WAIT_TIMEOUT
             } else {
                 // Finite timeout → cooperative POLL with a REAL wall-clock deadline
@@ -5848,17 +6203,20 @@ static bool handle_blink_thunk(WGEngine *engine) {
         } else if (s_use_real_threads && strcmp(fn, "AcquireSRWLockExclusive") == 0) {
             if (s_srw_log < 0) { const char *e = getenv("WG_SRW_LOG"); s_srw_log = e ? atoi(e) : 0; }
             wg_srw_acquire_exclusive(args[0], s_cur_guest_tid);
+            s_cs_held++;   // GIL-pin: exclusive lock holds the construction atomic
             ret_val = 0;
         } else if (s_use_real_threads && strcmp(fn, "ReleaseSRWLockShared") == 0) {
             wg_srw_release_shared(args[0]);
             ret_val = 0;
         } else if (s_use_real_threads && strcmp(fn, "ReleaseSRWLockExclusive") == 0) {
             wg_srw_release_exclusive(args[0], s_cur_guest_tid);
+            if (s_cs_held > 0) s_cs_held--;   // release the GIL-pin
             ret_val = 0;
         } else if (s_use_real_threads && strcmp(fn, "TryAcquireSRWLockShared") == 0) {
             ret_val = wg_srw_try_shared(args[0], s_cur_guest_tid);
         } else if (s_use_real_threads && strcmp(fn, "TryAcquireSRWLockExclusive") == 0) {
             ret_val = wg_srw_try_exclusive(args[0], s_cur_guest_tid);
+            if (ret_val) s_cs_held++;   // GIL-pin on successful exclusive acquire
         } else if (s_use_real_threads && strcmp(fn, "InitializeSRWLock") == 0) {
             ret_val = 0;   // RW-lock state lazily created on first Acquire
         } else if (s_use_real_threads && (strcmp(fn, "_Mtx_lock") == 0 ||
@@ -5868,16 +6226,19 @@ static bool handle_blink_thunk(WGEngine *engine) {
             // the FMallocBinned2/vtable UAF corruption under real-threads+JIT).
             uint32_t mtx = wg_cs_mutex_for(args[0]);
             if (mtx && wg_sync_wait_single(mtx, 0, s_cur_guest_tid) != WG_WAIT_OBJECT_0) { wg_thunk_block_begin(); wg_sync_wait_single(mtx, WG_SYNC_INFINITE, s_cur_guest_tid); wg_thunk_block_end(); }
+            s_cs_held++;   // GIL-pin: std::mutex-protected region atomic vs other guest threads
             ret_val = 0;   // _Thrd_success
         } else if (s_use_real_threads && (strcmp(fn, "_Mtx_unlock") == 0 ||
                    strcmp(fn, "mtx_unlock") == 0)) {
             uint32_t mtx = wg_cs_mutex_for(args[0]);
             if (mtx) wg_sync_release_mutex(mtx, s_cur_guest_tid);
+            if (s_cs_held > 0) s_cs_held--;   // release the GIL-pin
             ret_val = 0;
         } else if (s_use_real_threads && (strcmp(fn, "_Mtx_trylock") == 0 ||
                    strcmp(fn, "mtx_trylock") == 0)) {
             uint32_t mtx = wg_cs_mutex_for(args[0]);
             uint32_t r = mtx ? wg_sync_wait_single(mtx, 0, s_cur_guest_tid) : WG_WAIT_TIMEOUT;
+            if (r == WG_WAIT_OBJECT_0) s_cs_held++;   // GIL-pin on successful acquire
             ret_val = (r == WG_WAIT_OBJECT_0) ? 0 : 3;   // _Thrd_success / _Thrd_busy
         } else if (s_use_real_threads && (strcmp(fn, "_Mtx_init") == 0 ||
                    strcmp(fn, "_Mtx_destroy") == 0 || strcmp(fn, "mtx_init") == 0 ||
@@ -6716,6 +7077,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             ret_val = 1; // TRUE
         } else if (strcmp(fn, "CloseHandle") == 0) {
             if (s_use_real_threads && wg_sync_is_known(args[0])) wg_sync_close(args[0]);
+            // Cooperative events: recycle the closed slot so the 256->3584 table can't
+            // leak to overflow (the null-event deadlock). Only free real event handles.
+            if (!s_use_real_threads && args[0] >= WG_EVENT_BASE &&
+                args[0] < WG_EVENT_BASE + WG_MAX_EVENTS && s_event_free_n < WG_MAX_EVENTS) {
+                s_event_free[s_event_free_n++] = args[0] - WG_EVENT_BASE;
+            }
             wg_files_close(args[0]);
             ret_val = 1;
         } else if (strcmp(fn, "FindClose") == 0) {
@@ -6794,7 +7161,12 @@ static bool handle_blink_thunk(WGEngine *engine) {
             uint32_t nbytes = args[2];
             uint32_t bytes_read_addr = args[3];
             uint32_t overlapped_addr = args[4];
-            if (nbytes > 0x100000) nbytes = 0x100000;
+            // Cap per-read to bound the temp malloc, but 1MB was TOO SMALL: the SM5
+            // global shader cache is ~5.7MB and UE4 reads it in one call — truncating
+            // to 1MB dropped every shader past the first ~1MB, so the game reported
+            // "Missing global shader ..._ES2..." and LowLevelFatalError'd before it
+            // could render. Allow up to 128MB (malloc failure is handled below).
+            if (nbytes > 0x8000000) nbytes = 0x8000000;
             // UE4's Windows file handle passes the read position via
             // OVERLAPPED.Offset/OffsetHigh (it never calls SetFilePointer).
             // Honor it — otherwise every read defaults to sequential-from-0 and
@@ -8052,6 +8424,43 @@ typedef struct {
     uint32_t flags;      // CreateThread flags (bit 0x4 = CREATE_SUSPENDED)
 } WGWorkerArgs;
 
+// CONSTRUCT-PIN (WG_CONSTRUCT_PIN): the UObject register fn at runtime 0xA58060
+// PUBLISHES the freshly-allocated object (0xA580B5 `mov [r14],rax`) BEFORE it
+// constructs/links the object's fields — a recursion-safety pattern that is only
+// correct SINGLE-THREADED. Under real threads a WORKER reads the early-published,
+// half-built object via the LOCK-FREE getter 0xB40690 and walks its not-yet-linked
+// TIntrusiveLinkedList (nodes init to next=self) -> the self-loop / O(N^2) name scan
+// that blocks the render. Fix: while ANY guest thread is inside 0xA58060's call tree
+// (its code range appears as a return address on the thread's stack, or the RIP is
+// in it), PIN the GIL (reuse s_spin_pin) so no other guest thread runs during the
+// construction — honoring the single-threaded assumption. Scoped to 0xA58060 ONLY,
+// so it does NOT freeze the 2.618M coordination (which is different code).
+static _Thread_local int s_construct_win = -1;
+static signed char s_construct_on = -1;
+static uint64_t s_construct_lo = 0, s_construct_hi = 0;
+static void wg_update_construct_pin(WGEngine *engine) {
+    if (s_construct_on < 0) {
+        s_construct_on = getenv("WG_CONSTRUCT_PIN") ? 1 : 0;
+        const char *lo = getenv("WG_CONSTRUCT_LO"), *hi = getenv("WG_CONSTRUCT_HI");
+        s_construct_lo = lo ? strtoull(lo, 0, 16) : 0xA58060ULL;
+        s_construct_hi = hi ? strtoull(hi, 0, 16) : 0xA58200ULL;
+    }
+    if (!s_construct_on || !s_use_real_threads) return;
+    uint64_t rip = wg_blink_get_rip(engine->blink);
+    int in_c = (rip >= s_construct_lo && rip <= s_construct_hi);
+    if (!in_c) {
+        uint32_t sp = (uint32_t)wg_blink_get_reg(engine->blink, 4);
+        for (int w = 0; w < 200; w++) {
+            uint32_t v = 0; wg_blink_read_mem(engine->blink, sp + (uint32_t)w * 8, &v, 4);
+            if ((uint64_t)v >= s_construct_lo && (uint64_t)v <= s_construct_hi) { in_c = 1; break; }
+        }
+    }
+    if (in_c) {
+        if (s_construct_win < 0) { const char *e = getenv("WG_SPIN_WINDOW"); s_construct_win = e ? atoi(e) : 24; }
+        s_spin_pin = s_construct_win;   // dir_unlock pins the GIL while s_spin_pin > 0
+    }
+}
+
 static void *wg_worker_thread_entry(void *arg) {
     WGWorkerArgs wa = *(WGWorkerArgs *)arg;
     free(arg);
@@ -8106,7 +8515,34 @@ static void *wg_worker_thread_entry(void *arg) {
             wa.teb, g64 ? "x64" : "x86");
 
     uint32_t exit_code = 0;
+    // WG_BLOCK_WORKERS gate config (see s_main_rip_stall). Only the UE4 task-graph
+    // pool workers (start 0x9FFC70) are gated; the named/render thread (0x9EA6B0)
+    // and any other threads run normally.
+    static signed char s_blockw = -1;
+    if (s_blockw < 0) s_blockw = getenv("WG_BLOCK_WORKERS") ? 1 : 0;
+    long blockw_stall = getenv("WG_BLOCKW_STALL") ? atol(getenv("WG_BLOCKW_STALL")) : 8;
     for (;;) {
+        // Park this pool worker while the main is making forward progress, so boot
+        // registration/loading runs single-threaded (no construction race). Holds NO
+        // GIL while parked. Released the moment the main's RIP pins (waiting for us).
+        // WG_BLOCKW_STAYON: keep gating through BOTH registration phases (the early
+        // engine-init AND the post-swapchain level load) instead of ungating at
+        // ShowWindow — turning off at ShowWindow re-exposed the level-load
+        // registration to the construction race (the O(N^2) scan returned post-
+        // swapchain). With STAYON, workers stay gated whenever the main is making
+        // progress and are released only via the RIP-stall/block valve (so the
+        // swapchain's brief worker needs are still met). Lower WG_BLOCKW_STALL makes
+        // the valve fire sooner (better for reaching the swapchain).
+        static signed char s_stayon = -1;
+        if (s_stayon < 0) s_stayon = getenv("WG_BLOCKW_STAYON") ? 1 : 0;
+        int gate_off = s_stayon ? 0 : s_past_init;
+        if (s_blockw && !gate_off && wa.start == 0x9FFC70) {
+            // Park until the main genuinely BLOCKS (s_main_blocked — waiting on a
+            // worker) OR, as a rare fallback, its RIP stalls for blockw_stall slices
+            // (keep this HIGH so it doesn't misfire on registration/scan compute).
+            while (!s_main_blocked && s_main_rip_stall < (unsigned)blockw_stall
+                   && !(s_stayon ? 0 : s_past_init)) usleep(300);
+        }
         // GIL: blink's System (guest memory / page tables) is NOT thread-safe
         // (built --disable-threads), so no two guest threads may execute at
         // once. Serialize ALL execution on s_thunk_lock — thunk dispatch below
@@ -8114,7 +8550,29 @@ static void *wg_worker_thread_entry(void *arg) {
         // wg_thunk_block_begin so other threads make progress. sched_yield after
         // each slice keeps the lock fair (no single thread hogs it).
         wg_thunk_lock();
-        WGBlinkResult r = wg_blink_run(engine->blink, engine->instructions_per_tick);
+        // DECOUPLED + ADAPTIVE WORKER SLICE (WG_SLICEMULT): a worker runs a BIG atomic
+        // slice by DEFAULT so its own UObject constructions complete under one GIL
+        // hold and no other thread interleaves a half-built class (the drain
+        // corruption). But a worker also spins in the task-graph "get-next-task" loop;
+        // holding the GIL for a full big slice while spinning starves the thread that
+        // would produce work (the 0xB40735 livelock). So — exactly like the main —
+        // shrink this worker to the small base after a SUSTAINED pin (WG_PINTHR slices
+        // at one RIP = a spin/busy-wait, never a construction, which advances the RIP).
+        // Default mult=1 (no change).
+        int wmult = getenv("WG_SLICEMULT") ? atoi(getenv("WG_SLICEMULT")) : 1;
+        if (wmult < 1) wmult = 1;
+        if (wmult > 1 && getenv("WG_ADASLICE")) {
+            static __thread uint64_t w_prevrip = 0; static __thread int w_pin = 0;
+            uint64_t wr = wg_blink_get_rip(engine->blink);
+            uint64_t wd = wr >= w_prevrip ? wr - w_prevrip : w_prevrip - wr;
+            w_prevrip = wr;
+            long pinthr = getenv("WG_PINTHR") ? atol(getenv("WG_PINTHR")) : 20;
+            if (wd < 0x1000) { if (w_pin < 1000000) ++w_pin; } else w_pin = 0;
+            int wcontended = getenv("WG_NOCONTEND") ? 1 : (s_gil_waiters > 0);
+            if (w_pin >= pinthr && wcontended) wmult = 1;  // pinned + contended => spin => small
+        }
+        wg_update_construct_pin(engine);   // GIL-pin while this worker is mid UObject construction
+        WGBlinkResult r = wg_blink_run(engine->blink, engine->instructions_per_tick * wmult);
         wg_thunk_unlock();
         sched_yield();
         // Busy-wait breaker (same as the main tick): a run of thunk-less slices =
@@ -8285,6 +8743,11 @@ static bool load_pe_blink(WGEngine *engine) {
         wg_thunk_lock_init();
         wg_sync_init();
         s_cur_guest_tid = 1;
+        if (wg_spinpin_on() || getenv("WG_SPINLOG")) {
+            wg_spinlock_acquire_hook = wg_on_guest_spinlock;   // blink -> GIL-pin / logging on guest spinlock acquire
+            WG_LOGW(TAG, "[realthr] guest-spinlock hook installed (pin=%d window=%ld)",
+                    wg_spinpin_on(), s_spin_window < 0 ? 24 : s_spin_window);
+        }
         WG_LOGW(TAG, "[realthr] REAL-THREADS mode ENABLED");
     }
 
@@ -8361,6 +8824,22 @@ static bool load_pe_blink(WGEngine *engine) {
             uint8_t patch[3] = { 0x31, 0xDB, 0x90 };
             wg_blink_write_mem(engine->blink, 0x691a91, patch, 3);
             WG_LOGW(TAG, "WG_UPROJ_PATCH: forced LoadProjectFile success @0x691a91");
+        }
+    }
+
+    // WG_CTOR_HOOK: arm the UObject base-constructor serialization hook (see the
+    // s_ctor_* declarations + the handler in handle_blink_thunk). Writes a 1-byte HLT
+    // over the ctor entry so every construction traps and GIL-pins its thread.
+    s_ctor_armed = false;
+    if (pe->is_64bit && getenv("WG_CTOR_HOOK")) {
+        const char *a = getenv("WG_CTOR_ADDR");
+        s_ctor_addr = a ? strtoull(a, 0, 16) : 0x9E36E0ULL;
+        if (wg_blink_read_mem(engine->blink, s_ctor_addr, &s_ctor_orig, 1)) {
+            uint8_t hlt = 0xF4;
+            wg_blink_write_mem(engine->blink, s_ctor_addr, &hlt, 1);
+            s_ctor_armed = true;
+            WG_LOGW(TAG, "WG_CTOR_HOOK: armed UObject-ctor serialization @0x%llX (orig=0x%02X)",
+                    (unsigned long long)s_ctor_addr, s_ctor_orig);
         }
     }
 
@@ -8950,6 +9429,13 @@ void wg_engine_tick(WGEngine *engine) {
 
     engine->tick_count++;
 
+    if (getenv("WG_SPINLOG") && (engine->tick_count % 2000) == 0) {
+        extern unsigned long long wg_lockcas_total, wg_lockcas_acq, wg_cx16_total, wg_cx16_ok, wg_store_total;
+        WG_LOGW("Engine", "LOCKCAS=%llu acq=%llu | CX16=%llu | STORES=%llu (sanity)",
+                wg_lockcas_total, wg_lockcas_acq, wg_cx16_total, wg_store_total);
+        wg_dump_spinrips();
+    }
+
     // Diagnostic: sample the guest RIP periodically to locate a slow tight loop
     // (the post-Slate compute/busy-wait phase). WG_RIPSAMPLE=1.
     if (getenv("WG_RIPSAMPLE") && (engine->tick_count % 2000) == 0) {
@@ -9015,10 +9501,25 @@ void wg_engine_tick(WGEngine *engine) {
             uint64_t next = 0;
             if (rbx) wg_blink_read_mem(engine->blink, rbx + 0x28, &next, 8);
             if (rbx != 0 && next == rbx) {
-                uint64_t zero = 0;
-                wg_blink_write_mem(engine->blink, rbx + 0x28, &zero, 8);
-                WG_LOGW(TAG, "BREAK_SELFLOOP: node 0x%llX next->self; forced next=0",
-                        (unsigned long long)rbx);
+                // RETRY instead of truncate: next==self is the UNLINKED state — a
+                // concurrent constructor (a worker) simply hasn't LINKED this node
+                // yet when our walk reached it. Truncating (next=0) corrupts the
+                // list (loses the tail) -> the downstream garbage-name scans. So
+                // instead YIELD here (the GIL is free at this point in the tick) so
+                // the constructor runs and sets next=successor, then re-check next
+                // tick. Only truncate if the SAME node stays self across many retries
+                // (genuinely dead, not just in-flight).
+                static uint64_t s_rn = 0; static int s_rc = 0;
+                if (rbx == s_rn) ++s_rc; else { s_rn = rbx; s_rc = 1; }
+                if (s_rc < 400 && !getenv("WG_NO_SELFLOOP_RETRY")) {
+                    usleep(300);   // let the constructor link this node
+                } else {
+                    uint64_t zero = 0;
+                    wg_blink_write_mem(engine->blink, rbx + 0x28, &zero, 8);
+                    WG_LOGW(TAG, "BREAK_SELFLOOP: node 0x%llX stayed self %d retries; truncated",
+                            (unsigned long long)rbx, s_rc);
+                    s_rn = 0; s_rc = 0;
+                }
             }
         }
         // STALLPROBE: dump the state at the post-drain 0xA5C7E7 stall (string scan /
@@ -9059,7 +9560,29 @@ void wg_engine_tick(WGEngine *engine) {
         // WG_NO_BIGSLICE disables.
         static int s_okstreak = 0;
         int slice = engine->instructions_per_tick;
-        if (s_use_real_threads && getenv("WG_RSSSLICE")) {
+        if (s_use_real_threads && getenv("WG_DIVSLICE")) {
+            // DIVERSITY-ADAPTIVE SLICE: a CONSTRUCTION visits MANY distinct code
+            // addresses across recent slices (10+); a BUSY-WAIT (even one spanning
+            // a wide address range, e.g. the 2.7MB main<->worker handshake) cycles
+            // only a FEW distinct RIPs (3-4). Distinct-COUNT separates them where
+            // RIP-range/pinned/RSS could not. Many distinct => big atomic slice
+            // (worker can't interleave the construction). Few distinct => small base
+            // slice => frequent handoffs => the mutual busy-wait resolves.
+            static uint64_t s_ring[32]; static int s_ri = 0;
+            uint64_t cr = wg_blink_get_rip(engine->blink);
+            s_ring[s_ri % 32] = cr & ~0xFFFULL;  /* page-granular so a loop's body counts once */
+            ++s_ri;
+            int nfill = s_ri < 32 ? s_ri : 32, ndist = 0;
+            for (int _i = 0; _i < nfill; ++_i) {
+                int seen = 0;
+                for (int _j = 0; _j < _i; ++_j) if (s_ring[_j] == s_ring[_i]) { seen = 1; break; }
+                if (!seen) ++ndist;
+            }
+            long thr = getenv("WG_DIVTHR") ? atol(getenv("WG_DIVTHR")) : 6;
+            if (s_ri < 32 || ndist > thr) slice *= 48;  /* diverse => construction => big */
+            /* else few distinct => busy-wait => small base slice */
+            (void)s_okstreak;
+        } else if (s_use_real_threads && getenv("WG_RSSSLICE")) {
             // RSS-ADAPTIVE SLICE (the clean fix for construction-vs-coordination): a
             // UObject CONSTRUCTION allocates (process RSS grows) -> BIG atomic slice so
             // no worker interleaves BETWEEN slices and uses the half-built class (the
@@ -9100,12 +9623,49 @@ void wg_engine_tick(WGEngine *engine) {
             if (s_pinned < 3) slice *= 32;   // advancing => construction => big atomic
             // else pinned => busy-wait => small base slice (frequent handoffs)
             (void)s_okstreak;
+        } else if (s_use_real_threads && getenv("WG_ADASLICE")) {
+            // ADAPTIVE, DECOUPLED (the coordination-vs-construction resolution the 7
+            // slice heuristics missed). The main runs a BIG atomic slice by DEFAULT
+            // (mult*base) so ITS constructions are atomic, and shrinks to the small
+            // base ONLY after a SUSTAINED pin — WG_PINTHR consecutive slices at one
+            // RIP. A construction ADVANCES the RIP every slice (never sustains a pin),
+            // so it always gets the big slice; only a real coordination BUSY-WAIT
+            // sustains a pin, and a pinned main is NOT constructing, so shrinking there
+            // is safe. Workers ALWAYS run big (WG_SLICEMULT above), so the main going
+            // small at a coordination point can't corrupt a worker's construction
+            // (the GIL still serializes; the worker's big slice stays atomic). Small
+            // main slices at the busy-wait => many fast GIL handoffs => the worker the
+            // main waits on runs a full slice and produces => the 2.618M stall clears.
+            static uint64_t s_prevrip2 = 0; static int s_pin2 = 0;
+            uint64_t crip = wg_blink_get_rip(engine->blink);
+            uint64_t dd = crip >= s_prevrip2 ? crip - s_prevrip2 : s_prevrip2 - crip;
+            s_prevrip2 = crip;
+            long pinthr = getenv("WG_PINTHR") ? atol(getenv("WG_PINTHR")) : 20;
+            long mult = getenv("WG_SLICEMULT") ? atol(getenv("WG_SLICEMULT")) : 32;
+            if (mult < 1) mult = 1;
+            if (dd < 0x1000) { if (s_pin2 < 1000000) ++s_pin2; } else s_pin2 = 0;
+            // Shrink ONLY when pinned AND another thread is contending for the GIL (a
+            // starved worker the main is busy-waiting on). A pinned main with no
+            // contender is a tight construction loop (workers blocked on events) —
+            // keep it BIG so it races to the SetEvent that wakes them. WG_NOCONTEND
+            // reverts to pin-only shrinking.
+            int contended = getenv("WG_NOCONTEND") ? 1 : (s_gil_waiters > 0);
+            if (s_pin2 < pinthr || !contended) slice *= (int)mult;  // big atomic
+            // else sustained pin + contended => busy-wait => small base => fast handoffs
+            (void)s_okstreak;
         } else if (s_use_real_threads && s_okstreak >= 4 && !getenv("WG_NO_BIGSLICE"))
             slice *= 12;
         // GIL (real-threads): serialize guest execution with the workers — see
         // wg_worker_thread_entry. No-op in cooperative mode (lock is a no-op).
         wg_thunk_lock();
+        wg_update_construct_pin(engine);   // GIL-pin while the main is mid UObject construction
         WGBlinkResult r = wg_blink_run(engine->blink, slice);
+        // Publish the main's RIP for the WG_BLOCK_WORKERS gate: a PINNED main (same
+        // RIP across slices) means it is waiting for a worker -> release the gated
+        // workers; an ADVANCING RIP means productive single-threaded boot work.
+        { uint64_t mr = wg_blink_get_rip(engine->blink);
+          if (mr == s_main_rip_pub) { if (s_main_rip_stall < 1000000) s_main_rip_stall++; }
+          else { s_main_rip_pub = mr; s_main_rip_stall = 0; } }
         wg_thunk_unlock();
         s_okstreak = (r == WG_BLINK_OK) ? s_okstreak + 1 : 0;
         // Fairness (real-threads): the main guest thread runs here; without a yield

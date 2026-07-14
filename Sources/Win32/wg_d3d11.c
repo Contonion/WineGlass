@@ -209,12 +209,19 @@ static bool handle_iunknown(struct WGEngine *engine, WGComObj *o, int method,
 static void write_adapter_desc(struct WGEngine *engine, uint32_t at, bool desc1) {
     if (!at) return;
     uint8_t d[0xB0]; memset(d, 0, sizeof(d));
-    // Description[128] wchar_t at +0
-    const char *name = wg_gpu_available() ? wg_gpu_device_name(NULL) : "WineGlass Metal Adapter";
+    // Description[128] wchar_t at +0. MUST look like a real discrete GPU: UE4's D3D11
+    // RHI classifies the adapter by VendorId — the old 0x1414 is MICROSOFT's Basic
+    // Render Driver (WARP software rasterizer) ID, so UE4 treated us as a software
+    // adapter and dropped to the ES2 feature level → the game then tried to load ES2
+    // global shaders that aren't cooked in this SM5 PC build → LowLevelFatalError
+    // "Missing global shader ..._ES2_0" and the boot never renders. Report NVIDIA +
+    // an RTX device id + an NVIDIA GPU name so device-profile matching picks a desktop
+    // SM5 profile and the cooked SM5 shaders are used.
+    const char *name = "NVIDIA GeForce RTX 3070";
     for (int i = 0; name[i] && i < 100; i++) { uint16_t w = (uint8_t)name[i]; memcpy(d + i*2, &w, 2); }
     uint32_t v;
-    v = 0x1414; memcpy(d + 0x80, &v, 4);   // VendorId (Microsoft-ish placeholder)
-    v = 0x8888; memcpy(d + 0x84, &v, 4);   // DeviceId
+    v = 0x10DE; memcpy(d + 0x80, &v, 4);   // VendorId = NVIDIA (real discrete GPU, not WARP)
+    v = 0x2484; memcpy(d + 0x84, &v, 4);   // DeviceId = RTX 3070
     // DedicatedVideoMemory (SIZE_T at +0x90): report ~1GB.
     uint64_t vram = 0x40000000ULL; memcpy(d + 0x90, &vram, 8);
     uint64_t shared = 0x40000000ULL; memcpy(d + 0xA0, &shared, 8);
@@ -750,6 +757,19 @@ uint32_t wg_d3d11_D3D11CreateDevice(struct WGEngine *engine, uint32_t *args, boo
     uint32_t d = com_new(engine, IF_D3D11DEVICE, dev, 0);
     put_ptr(engine, dev_out, d);
 
+    // Log the game's requested feature levels (pFeatureLevels array) so we can see
+    // if/why it lands on ES2. args[4]=pFeatureLevels, args[5]=FeatureLevels count.
+    {
+        uint32_t pfl = args[4], nfl = args[5];
+        char buf[128] = {0}; int bi = 0;
+        if (pfl && nfl && nfl <= 16) {
+            for (uint32_t i = 0; i < nfl; i++) { uint32_t lvl = 0;
+                wg_blink_read_mem(B(engine), pfl + i*4, &lvl, 4);
+                bi += snprintf(buf+bi, sizeof(buf)-bi, "0x%X ", lvl); }
+        }
+        WG_LOGW(TAG, "D3D11CreateDevice: requested FLs=[%s] count=%u fl_out=0x%X -> writing 0xB000",
+                buf, nfl, fl_out);
+    }
     if (fl_out) { uint32_t fl = 0xB000; wg_blink_write_mem(B(engine), fl_out, &fl, 4); } // 11_0
 
     if (ctx_out) {
